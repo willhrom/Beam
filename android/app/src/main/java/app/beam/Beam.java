@@ -188,7 +188,7 @@ final class Beam {
       case "error":
         if ("offline".equals(m.optString("code"))) {
           Transfer t = tx.get(m.optString("ref"));
-          if (t != null) t.fail("Device went offline");
+          if (t != null) t.peerUnreachable();
         }
         break;
       case "pair-code":
@@ -216,13 +216,28 @@ final class Beam {
     if ("offer".equals(k)) { onOffer(from, d); return; }
     Transfer t = tx.get(d.optString("tid"));
     switch (k) {
-      case "answer":
-        if (t == null || t.incoming || !t.peerId.equals(from) || !Transfer.WAITING.equals(t.state)) return;
+      case "answer": {
+        if (t == null || t.incoming || !t.peerId.equals(from)) return;
+        if (!Transfer.WAITING.equals(t.state) && !Transfer.RECONNECTING.equals(t.state)) return;
         String pub = d.optString("pub");
         if (!trusted(from, pub)) { t.fail("Device key didn't match"); return; }
         String sdp = d.optString("sdp");
         if (!Crypto.verify(pub, d.optString("sig"), "beam-answer|" + t.tid + "|" + me.id + "|" + sdp)) { t.fail("Signature check failed"); return; }
-        t.onAnswer(sdp);
+        t.onAnswer(sdp, d.optInt("gen", -1));
+        break;
+      }
+      case "resume": {
+        // The sender lost the connection part-way and is reconnecting to carry on.
+        if (t == null || !t.incoming || !t.peerId.equals(from)) return;
+        String pub = d.optString("pub"), sdp = d.optString("sdp");
+        if (!trusted(from, pub)) return;
+        if (!Crypto.verify(pub, d.optString("sig"), "beam-resume|" + t.tid + "|" + me.id + "|" + sdp)) return;
+        if (Transfer.DONE.equals(t.state)) { signal(from, new JSONObject().put("k", "complete").put("tid", t.tid)); return; }
+        t.onResume(sdp, d.optInt("gen", 0));
+        break;
+      }
+      case "complete":
+        if (t != null && !t.incoming && t.peerId.equals(from)) t.finish();
         break;
       case "decline":
       case "cancel":
@@ -285,6 +300,7 @@ final class Beam {
     String name = pp != null ? pp.name : trim(d.optString("name", "Device"));
     Transfer t = new Transfer(this, tid, true, from, name, d.optString("kind", "web"), pp != null, items);
     t.offerSdp = sdp;
+    t.gen = d.optInt("gen", 0);
     tx.put(tid, t);
     if (pp != null && prefs.autoAccept) {
       t.accept();
@@ -324,7 +340,7 @@ final class Beam {
   void cancel(String tid) {
     Transfer t = tx.get(tid);
     if (t == null) return;
-    if (Transfer.WAITING.equals(t.state) || Transfer.PREPARING.equals(t.state)) {
+    if (Transfer.WAITING.equals(t.state) || Transfer.PREPARING.equals(t.state) || Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state)) {
       try { signal(t.peerId, new JSONObject().put("k", "cancel").put("tid", tid)); } catch (Exception ignored) {}
     }
     t.fail("Cancelled");

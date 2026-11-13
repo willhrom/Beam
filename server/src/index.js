@@ -197,8 +197,12 @@ export class Hub extends DurableObject {
       const to = String(m.to || "");
       const target = this.sockets().find((s) => s.a.id === to);
       // Only relay between devices that can see each other, plus pairing replies.
-      const pairing = m.data && (m.data.k === "pair-ok" || m.data.k === "pair-no") && a.pairWith === to;
-      if (!target || (!this.visible(a, target.a) && !pairing)) {
+      const k = m.data && m.data.k;
+      const pairing = (k === "pair-ok" || k === "pair-no") && a.pairWith === to;
+      // A transfer already under way may continue after one side changes network (and so
+      // stops being "nearby"); new offers still need the devices to see each other.
+      const ongoing = k === "resume" || k === "answer" || k === "complete" || k === "cancel" || k === "decline";
+      if (!target || (!this.visible(a, target.a) && !pairing && !ongoing)) {
         send(ws, { t: "error", code: "offline", to, ref: m.data && m.data.tid });
         return;
       }

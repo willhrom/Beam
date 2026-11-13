@@ -82,13 +82,14 @@ final class Notify {
 
   void transfer(Transfer t) {
     int id = idFor(t) + 70000;
-    boolean moving = Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state) || Transfer.CONNECTING.equals(t.state);
+    boolean paused = Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state);
+    boolean moving = paused || Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state) || Transfer.CONNECTING.equals(t.state);
     if (moving) {
       int pct = t.total > 0 ? (int) (100 * t.done / t.total) : 0;
       Notification n = new Notification.Builder(c, CH_PROGRESS)
           .setSmallIcon(R.drawable.ic_stat)
           .setContentTitle((t.incoming ? "Receiving from " : "Sending to ") + t.peerName)
-          .setContentText(t.describe())
+          .setContentText(paused ? "Connection lost — reconnecting…" : t.describe())
           .setProgress(100, pct, Transfer.CONNECTING.equals(t.state))
           .setOngoing(true)
           .setOnlyAlertOnce(true)

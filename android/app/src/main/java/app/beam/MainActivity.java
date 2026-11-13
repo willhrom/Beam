@@ -170,6 +170,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       if (t.incoming || !t.peerId.equals(p.id)) continue;
       if (Transfer.WAITING.equals(t.state)) return "Waiting…";
       if (Transfer.CONNECTING.equals(t.state)) return "Connecting…";
+      if (Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state)) return "Reconnecting…";
       if (Transfer.SENDING.equals(t.state)) return (t.total > 0 ? (int) (100 * t.done / t.total) : 0) + "%";
     }
     return null;
@@ -203,7 +204,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     top.addView(btns);
     c.addView(top);
 
-    if (Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state)) {
+    if (Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state) || Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state)) {
       ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
       bar.setMax(1000);
       bar.setProgress(t.total > 0 ? (int) (1000 * t.done / t.total) : 0);
@@ -253,6 +254,8 @@ public class MainActivity extends Activity implements Beam.Listener {
       case Transfer.SENDING: return "Sending";
       case Transfer.RECEIVING: return "Receiving";
       case Transfer.FINISHING: return "Finishing…";
+      case Transfer.PAUSED: return "Connection lost — will resume";
+      case Transfer.RECONNECTING: return "Reconnecting…";
       default: return s;
     }
   }

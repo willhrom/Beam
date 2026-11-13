@@ -158,7 +158,11 @@ async function onServer(m) {
       await onSignal(m.from, m.data || {});
       break;
     case "error":
-      if (m.code === "offline" && m.ref && S.tx.has(m.ref)) fail(S.tx.get(m.ref), "Device went offline");
+      if (m.code === "offline" && m.ref && S.tx.has(m.ref)) {
+        const t = S.tx.get(m.ref);
+        if (t.state === "reconnecting") dropped(t, t.gen); // keep trying until the resume window runs out
+        else if (!["paused", "done", "failed"].includes(t.state)) fail(t, "Device went offline");
+      }
       break;
     case "pair-code":
       if (S.pairing && S.pairing.mode === "show") { S.pairing.code = m.code; showPairShow(); }
@@ -179,20 +183,27 @@ async function onServer(m) {
 function updateServer() { wsSend({ t: "update", name: S.name, nearby: S.nearby, watch: Object.keys(S.paired) }); }
 
 // ---------- signaling between devices ----------
+const RESUME_WINDOW = 15 * 60 * 1000; // how long a dropped transfer waits to pick back up
+const BIG = 100 * 1024 * 1024;        // above this, browsers that can save straight to disk do so
+
 async function onSignal(from, d) {
   if (d.k === "offer") return onOffer(from, d);
+  if (d.k === "resume") return onResume(from, d);
+  const t = S.tx.get(d.tid);
   if (d.k === "answer") {
-    const t = S.tx.get(d.tid);
-    if (!t || t.dir !== "out" || t.peer.id !== from || t.state !== "waiting") return;
+    if (!t || t.dir !== "out" || t.peer.id !== from || !["waiting", "reconnecting"].includes(t.state) || d.gen !== t.gen) return;
     if (!(await trustedKey(from, d.pub))) return fail(t, "Device key didn't match");
     if (!(await verifySig(d.pub, d.sig, `beam-answer|${t.tid}|${Id.id}|${d.sdp}`))) return fail(t, "Signature check failed");
-    t.state = "connecting";
+    if (t.state === "waiting") t.state = "connecting";
     renderTx(t);
     await t.pc.setRemoteDescription({ type: "answer", sdp: d.sdp });
     return;
   }
+  if (d.k === "complete") {
+    if (t && t.dir === "out" && t.peer.id === from) finish(t);
+    return;
+  }
   if (d.k === "decline" || d.k === "cancel") {
-    const t = S.tx.get(d.tid);
     if (t && t.peer.id === from && !["done", "failed"].includes(t.state)) fail(t, d.k === "decline" ? "Declined" : "Cancelled");
     if (t && t.dir === "in") closePrompt(t.tid);
     return;
@@ -234,6 +245,12 @@ function gathered(pc, ms = 2500) {
   });
 }
 
+function closePc(t) {
+  try { t.pc && t.pc.close(); } catch {}
+  t.pc = null;
+  t.dc = null;
+}
+
 // ---------- sending ----------
 async function sendItems(peer, files, text) {
   const items = files.map((f) => ({ name: cleanName(f.name), size: f.size, type: f.type || "application/octet-stream" }));
@@ -244,45 +261,68 @@ async function sendItems(peer, files, text) {
     blobs.push(b);
   }
   if (!items.length) return;
-  const t = { tid: randId(), dir: "out", peer, items, blobs, total: items.reduce((a, b) => a + b.size, 0), done: 0, state: "preparing", started: Date.now() };
+  const t = { tid: randId(), dir: "out", peer, items, blobs, total: items.reduce((a, b) => a + b.size, 0), done: 0, state: "preparing", gen: 0 };
   S.tx.set(t.tid, t);
   renderTx(t);
+  await connectOut(t, "offer");
+  setTimeout(() => { if (t.state === "waiting") { wsSend({ t: "signal", to: peer.id, data: { k: "cancel", tid: t.tid } }); fail(t, "No response"); } }, OFFER_TIMEOUT);
+}
+
+// Opens a new connection for a transfer: the first offer, or a resume after a drop.
+async function connectOut(t, mode) {
+  const gen = ++t.gen;
+  closePc(t);
+  const live = () => t.gen === gen && !["done", "failed"].includes(t.state);
   const pc = (t.pc = new RTCPeerConnection({ iceServers: S.ice }));
   const dc = (t.dc = pc.createDataChannel("beam", { ordered: true }));
   dc.binaryType = "arraybuffer";
   dc.bufferedAmountLowThreshold = 1024 * 1024;
-  dc.onopen = () => pump(t).catch((e) => fail(t, e.message || "Transfer failed"));
   dc.onmessage = (e) => {
-    if (typeof e.data !== "string") return;
+    if (!live() || typeof e.data !== "string") return;
     const m = JSON.parse(e.data);
-    if (m.t === "ok") finish(t);
-    if (m.t === "cancel") fail(t, "Cancelled");
+    if (m.t === "from") {
+      if (t.pumping === gen) return; // one sender loop per connection
+      t.pumping = gen;
+      pump(t, gen, m.i | 0, Math.max(0, Number(m.off) || 0)).catch(() => { if (live()) dropped(t, gen); });
+    }
+    else if (m.t === "ok") finish(t);
+    else if (m.t === "cancel") fail(t, "Cancelled");
   };
-  dc.onclose = () => { if (t.state === "sending") fail(t, "Connection lost"); };
-  pc.onconnectionstatechange = () => { if (pc.connectionState === "failed") fail(t, "Couldn't connect"); };
+  dc.onclose = () => { if (live()) dropped(t, gen); };
+  pc.onconnectionstatechange = () => { if (live() && pc.connectionState === "failed") dropped(t, gen); };
   await pc.setLocalDescription(await pc.createOffer());
   await gathered(pc);
+  if (!live()) return;
   const sdp = pc.localDescription.sdp;
-  const sig = await Id.sign(`beam-offer|${t.tid}|${peer.id}|${sdp}`);
-  t.state = "waiting";
+  const data = { k: mode, tid: t.tid, gen, sdp, sig: await Id.sign(`beam-${mode}|${t.tid}|${t.peer.id}|${sdp}`), pub: Id.pub };
+  if (mode === "offer") Object.assign(data, { name: S.name, kind, files: t.items });
+  if (t.state === "preparing") t.state = "waiting";
   renderTx(t);
-  wsSend({ t: "signal", to: peer.id, data: { k: "offer", tid: t.tid, sdp, sig, pub: Id.pub, name: S.name, kind, files: items } });
-  setTimeout(() => { if (t.state === "waiting") { wsSend({ t: "signal", to: peer.id, data: { k: "cancel", tid: t.tid } }); fail(t, "No response"); } }, OFFER_TIMEOUT);
+  wsSend({ t: "signal", to: t.peer.id, data });
+  if (mode === "resume") setTimeout(() => { if (t.gen === gen && t.state === "reconnecting") dropped(t, gen); }, 20000);
 }
 
-async function pump(t) {
-  t.state = "sending";
-  renderTx(t);
+async function pump(t, gen, i0, off0) {
+  if (i0 > t.items.length || (i0 < t.items.length && off0 > t.items[i0].size)) throw new Error("bad resume point");
   const dc = t.dc;
+  const live = () => t.gen === gen && t.state === "sending" && dc.readyState === "open";
+  t.state = "sending";
+  t.everOpen = true;
+  t.pausedAt = null;
+  t.done = off0;
+  for (let k = 0; k < i0; k++) t.done += t.items[k].size;
+  renderTx(t);
   const waitLow = () => new Promise((res) => { dc.onbufferedamountlow = () => { dc.onbufferedamountlow = null; res(); }; });
-  for (let i = 0; i < t.items.length; i++) {
-    dc.send(JSON.stringify({ t: "file", i }));
+  for (let i = i0; i < t.items.length; i++) {
     const blob = t.blobs[i];
-    for (let off = 0; off < blob.size; ) {
+    let off = i === i0 ? off0 : 0;
+    dc.send(JSON.stringify({ t: "file", i, off }));
+    while (off < blob.size) {
       const slab = new Uint8Array(await blob.slice(off, off + 16 * CHUNK).arrayBuffer());
       for (let p = 0; p < slab.length; p += CHUNK) {
-        if (t.state !== "sending") return;
+        if (!live()) return;
         if (dc.bufferedAmount > HIGH_WATER) await waitLow();
+        if (!live()) return;
         const part = slab.subarray(p, p + CHUNK);
         dc.send(part);
         t.done += part.length;
@@ -297,6 +337,27 @@ async function pump(t) {
   renderTx(t);
 }
 
+// The connection dropped (WiFi blip, walked out of range, switched networks…).
+function dropped(t, gen) {
+  if (t.gen !== gen || ["done", "failed", "asking"].includes(t.state)) return;
+  if (t.dir === "out" && !t.everOpen) return fail(t, "Couldn't connect");
+  closePc(t);
+  t.state = "paused";
+  t.pausedAt = t.pausedAt || Date.now();
+  renderTx(t);
+  if (t.dir === "out") setTimeout(() => retry(t), 2000 + Math.random() * 1000);
+  else setTimeout(() => { if (t.state === "paused" && Date.now() - t.pausedAt >= RESUME_WINDOW) fail(t, "Connection lost"); }, RESUME_WINDOW + 1000);
+}
+
+function retry(t) {
+  if (t.state !== "paused") return;
+  if (Date.now() - t.pausedAt > RESUME_WINDOW) return fail(t, "Connection lost");
+  if (!S.online) return setTimeout(() => retry(t), 3000);
+  t.state = "reconnecting";
+  renderTx(t);
+  connectOut(t, "resume").catch(() => dropped(t, t.gen));
+}
+
 // ---------- receiving ----------
 async function onOffer(from, d) {
   if (S.tx.has(d.tid)) return;
@@ -308,9 +369,13 @@ async function onOffer(from, d) {
   if (!items.length) return;
   const paired = !!S.paired[from];
   const peerName = paired ? S.paired[from].name : String(d.name || "Device").slice(0, 40);
-  const t = { tid: d.tid, dir: "in", peer: { id: from, name: peerName, kind: d.kind, paired }, items, total: items.reduce((a, b) => a + b.size, 0), done: 0, state: "asking", sdp: d.sdp, received: [] };
+  const t = {
+    tid: d.tid, dir: "in", peer: { id: from, name: peerName, kind: d.kind, paired }, items, total: items.reduce((a, b) => a + b.size, 0),
+    done: 0, state: "asking", sdp: d.sdp, gen: d.gen | 0, received: [], cur: -1, curDone: true, got: 0, q: Promise.resolve(),
+  };
   S.tx.set(t.tid, t);
-  if (paired && S.autoAccept) return accept(t);
+  // Auto-accept from my devices, unless it's big and this browser would have to hold it in memory.
+  if (paired && S.autoAccept && (native || t.total < BIG || (await savedFolder(false)))) return accept(t, false);
   renderTx(t);
   promptIncoming(t);
 }
@@ -321,20 +386,65 @@ function describeItems(items) {
   return items.length + (photos ? " photos" : " files");
 }
 
-async function accept(t) {
+// Chrome and Edge can write straight into a folder on disk, so size is only limited by disk space.
+const canSaveToDisk = !native && "showDirectoryPicker" in window;
+async function savedFolder(ask) {
+  if (!canSaveToDisk) return null;
+  const h = await idbGet("saveDir");
+  if (!h) return null;
+  let p = await h.queryPermission({ mode: "readwrite" });
+  if (p !== "granted" && ask) p = await h.requestPermission({ mode: "readwrite" }).catch(() => "denied");
+  return p === "granted" ? h : null;
+}
+async function pickFolder() {
+  const h = await window.showDirectoryPicker({ id: "beam-save", mode: "readwrite", startIn: "downloads" });
+  await idbSet("saveDir", h);
+  store.set("saveDirName", h.name);
+  return h;
+}
+
+// `gesture` = the person just clicked Accept, so we may show a folder picker.
+async function accept(t, gesture) {
   closePrompt(t.tid);
   if (t.state !== "asking") return;
   t.state = "connecting";
   renderTx(t);
+  t.sink = "memory";
+  if (native) t.sink = "native";
+  else if (canSaveToDisk) {
+    let dir = await savedFolder(gesture).catch(() => null);
+    if (!dir && gesture && t.total >= BIG) dir = await pickFolder().catch(() => null);
+    if (dir) { t.sink = "fs"; t.dirHandle = dir; }
+  }
+  await answerConn(t, t.sdp, t.gen);
+}
+
+async function answerConn(t, sdp, gen) {
+  t.gen = gen;
+  closePc(t);
+  const live = () => t.gen === gen && !["done", "failed"].includes(t.state);
   const pc = (t.pc = new RTCPeerConnection({ iceServers: S.ice }));
-  pc.onconnectionstatechange = () => { if (pc.connectionState === "failed") fail(t, "Couldn't connect"); };
-  pc.ondatachannel = (e) => setupReceive(t, e.channel);
-  await pc.setRemoteDescription({ type: "offer", sdp: t.sdp });
+  pc.onconnectionstatechange = () => { if (live() && pc.connectionState === "failed") dropped(t, gen); };
+  pc.ondatachannel = (e) => setupReceive(t, e.channel, gen);
+  await pc.setRemoteDescription({ type: "offer", sdp });
   await pc.setLocalDescription(await pc.createAnswer());
   await gathered(pc);
-  const sdp = pc.localDescription.sdp;
-  const sig = await Id.sign(`beam-answer|${t.tid}|${t.peer.id}|${sdp}`);
-  wsSend({ t: "signal", to: t.peer.id, data: { k: "answer", tid: t.tid, sdp, sig, pub: Id.pub } });
+  if (!live()) return;
+  const mine = pc.localDescription.sdp;
+  wsSend({ t: "signal", to: t.peer.id, data: { k: "answer", tid: t.tid, gen, sdp: mine, sig: await Id.sign(`beam-answer|${t.tid}|${t.peer.id}|${mine}`), pub: Id.pub } });
+}
+
+async function onResume(from, d) {
+  const t = S.tx.get(d.tid);
+  if (!t || t.dir !== "in" || t.peer.id !== from) return;
+  if (!(await trustedKey(from, d.pub))) return;
+  if (!(await verifySig(d.pub, d.sig, `beam-resume|${d.tid}|${Id.id}|${d.sdp}`))) return;
+  if (t.state === "done") return wsSend({ t: "signal", to: from, data: { k: "complete", tid: t.tid } });
+  if (!["paused", "receiving", "connecting", "reconnecting"].includes(t.state)) return;
+  t.state = "reconnecting";
+  t.pausedAt = t.pausedAt || Date.now();
+  renderTx(t);
+  await answerConn(t, d.sdp, d.gen | 0);
 }
 
 function decline(t) {
@@ -346,53 +456,106 @@ function decline(t) {
   renderTxList();
 }
 
-function setupReceive(t, dc) {
-  t.dc = dc;
+// Where a received file goes: memory (then a Save link), a folder on disk, or the Mac/Windows app.
+function makeWriter(t, it, index) {
+  if (it.text || t.sink === "memory") {
+    let parts = [];
+    return {
+      write: (b) => parts.push(b),
+      close: async () => {
+        const blob = new Blob(parts, { type: it.type });
+        parts = [];
+        if (it.text) t.received.push({ text: await blob.text() });
+        else t.received.push({ name: it.name, url: URL.createObjectURL(blob), size: it.size });
+      },
+      abort: () => { parts = []; },
+    };
+  }
+  if (t.sink === "native") {
+    const nid = t.tid + ":" + index;
+    native.postMessage({ op: "saveBegin", id: nid, name: it.name });
+    return {
+      write: (b) => native.postMessage({ op: "saveChunk", id: nid, b64: b64(b) }),
+      close: () => t.received.push({ name: it.name, nid }) && native.postMessage({ op: "saveEnd", id: nid }),
+      abort: () => native.postMessage({ op: "saveAbort", id: nid }),
+    };
+  }
+  // straight to disk
+  let ws = null, name = it.name;
+  const ready = (async () => {
+    const dot = it.name.lastIndexOf(".");
+    const base = dot > 0 ? it.name.slice(0, dot) : it.name, ext = dot > 0 ? it.name.slice(dot) : "";
+    for (let n = 2; ; n++) {
+      try { await t.dirHandle.getFileHandle(name); name = `${base} (${n})${ext}`; } catch { break; }
+    }
+    const fh = await t.dirHandle.getFileHandle(name, { create: true });
+    ws = await fh.createWritable();
+  })();
+  return {
+    write: async (b) => { await ready; await ws.write(b); },
+    close: async () => { await ready; await ws.close(); t.received.push({ name, folder: t.dirHandle.name }); },
+    abort: async () => { try { await ready; await ws.abort(); await t.dirHandle.removeEntry(name); } catch {} },
+  };
+}
+
+function setupReceive(t, dc, gen) {
+  const live = () => t.gen === gen && !["done", "failed"].includes(t.state);
   dc.binaryType = "arraybuffer";
-  let cur = -1, got = 0, parts = [], nid = null;
-  dc.onopen = () => { t.state = "receiving"; renderTx(t); };
-  if (dc.readyState === "open") { t.state = "receiving"; renderTx(t); }
-  dc.onclose = () => { if (t.state === "receiving") fail(t, "Connection lost"); };
+  let sentFrom = false;
+  const opened = () => {
+    if (!live() || sentFrom) return;
+    sentFrom = true;
+    t.state = "receiving";
+    t.pausedAt = null;
+    renderTx(t);
+    // Tell the sender where to start: the beginning, or wherever we got to before a drop.
+    dc.send(JSON.stringify(t.curDone ? { t: "from", i: t.cur + 1, off: 0 } : { t: "from", i: t.cur, off: t.got }));
+  };
+  dc.onopen = opened;
+  if (dc.readyState === "open") opened();
+  dc.onclose = () => { if (live() && ["receiving", "reconnecting", "connecting"].includes(t.state)) dropped(t, gen); };
+  // Counters update immediately (so a resume point is always right); disk writes run in order behind them.
+  const later = (fn) => { t.q = t.q.then(fn).catch((e) => fail(t, e && e.message ? e.message : "Couldn't save")); };
   dc.onmessage = (e) => {
+    if (!live()) return;
     if (typeof e.data === "string") {
       const m = JSON.parse(e.data);
       if (m.t === "file") {
-        if (m.i !== cur + 1 || m.i >= t.items.length) return fail(t, "Bad data");
-        cur = m.i; got = 0; parts = [];
-        if (native && !t.items[cur].text) { nid = t.nid = t.tid + ":" + cur; native.postMessage({ op: "saveBegin", id: nid, name: t.items[cur].name }); }
-        else nid = t.nid = null;
+        if (m.i === t.cur && !t.curDone && m.off === t.got) return; // resuming the same file
+        if (!(t.curDone && m.i === t.cur + 1 && m.off === 0 && m.i < t.items.length)) return fail(t, "Bad data");
+        t.cur = m.i; t.got = 0; t.curDone = false;
+        const it = t.items[t.cur], idx = t.cur;
+        t.w = makeWriter(t, it, idx);
       } else if (m.t === "eof") {
-        const it = t.items[cur];
-        if (m.i !== cur || got !== it.size) return fail(t, "File was incomplete");
-        if (nid) { native.postMessage({ op: "saveEnd", id: nid }); t.received.push({ name: it.name, nid }); nid = t.nid = null; }
-        else {
-          const blob = new Blob(parts, { type: it.type });
-          if (it.text) blob.text().then((s) => { t.received.push({ text: s }); renderTx(t); });
-          else t.received.push({ name: it.name, url: URL.createObjectURL(blob), size: it.size });
-        }
-        parts = [];
+        const it = t.items[t.cur];
+        if (m.i !== t.cur || t.curDone || t.got !== it.size) return fail(t, "File was incomplete");
+        t.curDone = true;
+        const w = t.w;
+        t.w = null;
+        later(() => w.close());
+        later(() => renderTx(t));
       } else if (m.t === "done") {
-        try { dc.send(JSON.stringify({ t: "ok" })); } catch {}
-        finish(t);
+        if (!t.curDone || t.cur !== t.items.length - 1) return fail(t, "File was incomplete");
+        later(() => { try { dc.send(JSON.stringify({ t: "ok" })); } catch {} finish(t); });
       } else if (m.t === "cancel") fail(t, "Cancelled");
       return;
     }
-    if (cur < 0) return fail(t, "Bad data");
-    const it = t.items[cur];
-    got += e.data.byteLength;
+    if (t.curDone || !t.w) return fail(t, "Bad data");
+    const it = t.items[t.cur];
+    t.got += e.data.byteLength;
     t.done += e.data.byteLength;
-    if (got > it.size) return fail(t, "Too much data");
-    if (nid) native.postMessage({ op: "saveChunk", id: nid, b64: b64(e.data) });
-    else parts.push(e.data);
+    if (t.got > it.size) return fail(t, "Too much data");
+    const w = t.w, buf = e.data;
+    later(() => w.write(buf));
     renderProgress(t);
   };
 }
 
 function finish(t) {
-  if (t.state === "done") return;
+  if (t.state === "done" || t.state === "failed") return;
   t.state = "done";
   renderTx(t);
-  setTimeout(() => { try { t.pc && t.pc.close(); } catch {} }, 1500);
+  setTimeout(() => { if (t.state === "done") closePc(t); }, 1500);
   if (t.dir === "in") {
     const texts = t.received.filter((r) => r.text);
     notify(t.tid, "From " + t.peer.name, texts.length && t.items.length === 1 ? "Text received" : "Received " + describeItems(t.items), false);
@@ -403,12 +566,12 @@ function fail(t, why) {
   if (t.dc && t.dc.readyState === "open") try { t.dc.send(JSON.stringify({ t: "cancel" })); } catch {}
   t.state = "failed";
   t.reason = why;
-  try { t.pc && t.pc.close(); } catch {}
-  if (t.nid) native.postMessage({ op: "saveAbort", id: t.nid });
+  closePc(t);
+  if (t.w) { const w = t.w; t.w = null; t.q = t.q.then(() => w.abort()).catch(() => {}); }
   renderTx(t);
 }
 function cancelTx(t) {
-  if (t.state === "waiting" || t.state === "preparing") wsSend({ t: "signal", to: t.peer.id, data: { k: "cancel", tid: t.tid } });
+  if (["waiting", "preparing", "paused", "reconnecting"].includes(t.state)) wsSend({ t: "signal", to: t.peer.id, data: { k: "cancel", tid: t.tid } });
   fail(t, "Cancelled");
 }
 
@@ -424,7 +587,7 @@ window.beamNative = {
   action(tag, act) {
     const t = S.tx.get(tag);
     if (!t) return;
-    if (act === "accept") accept(t);
+    if (act === "accept") accept(t, false);
     else if (act === "decline") decline(t);
   },
   saved(id, path) {
@@ -489,12 +652,12 @@ function render() {
 function renderRing(t) {
   const el = document.querySelector(`.peer[data-id="${t.peer.id}"] .ring circle`);
   if (!el) return;
-  const active = ["waiting", "connecting", "sending", "finishing"].includes(t.state);
+  const active = ["waiting", "connecting", "sending", "finishing", "paused", "reconnecting"].includes(t.state);
   const frac = active ? (t.total ? t.done / t.total : 0) : 0;
   el.style.strokeDashoffset = String(238.8 * (1 - (t.state === "waiting" ? 0.04 : frac)));
 }
 
-const STATE_TEXT = { preparing: "Preparing…", waiting: "Waiting for them to accept…", asking: "Wants to send you this", connecting: "Connecting…", sending: "Sending", receiving: "Receiving", finishing: "Finishing…", done: "Done", failed: "" };
+const STATE_TEXT = { paused: "Connection lost — will resume", reconnecting: "Reconnecting…", preparing: "Preparing…", waiting: "Waiting for them to accept…", asking: "Wants to send you this", connecting: "Connecting…", sending: "Sending", receiving: "Receiving", finishing: "Finishing…", done: "Done", failed: "" };
 
 function renderTxList() {
   const box = $("#transfers");
@@ -517,7 +680,7 @@ function renderTx(t) {
   const title = (t.dir === "out" ? "To " : "From ") + t.peer.name;
   const sub = t.state === "failed" ? t.reason : t.state === "done" ? (t.dir === "out" ? "Sent " : "Received ") + what : STATE_TEXT[t.state] + " · " + what + (t.total ? " · " + fmtSize(t.total) : "");
   let body = "";
-  if (t.state === "sending" || t.state === "receiving") body += `<div class="bar"><i style="width:${t.total ? (100 * t.done) / t.total : 0}%"></i></div>`;
+  if (["sending", "receiving", "paused", "reconnecting"].includes(t.state)) body += `<div class="bar"><i style="width:${t.total ? (100 * t.done) / t.total : 0}%"></i></div>`;
   if (t.received && t.received.length) {
     body += '<div class="files">';
     for (const r of t.received) {
@@ -528,6 +691,8 @@ function renderTx(t) {
           `<button class="btn ghost small" data-copy="${esc(r.text)}">Copy</button></div>`;
       } else if (r.url) {
         body += `<div class="file"><span>${esc(r.name)}</span><a class="btn ghost small" href="${r.url}" download="${esc(r.name)}">Save</a></div>`;
+      } else if ("folder" in r) {
+        body += `<div class="file"><span>${esc(r.name)}</span><span class="sub">Saved${r.folder ? " in " + esc(r.folder) : ""}</span></div>`;
       } else if (r.nid) {
         body += `<div class="file"><span>${esc(r.name)}</span>${r.path ? `<button class="btn ghost small" data-reveal="${esc(r.path)}">${revealLabel}</button>` : '<span class="sub">Saving…</span>'}</div>`;
       }
@@ -544,7 +709,7 @@ function renderTx(t) {
     el.dataset.html = html;
     el.querySelectorAll("[data-act]").forEach((b) => (b.onclick = () => {
       const a = b.dataset.act;
-      if (a === "accept") accept(t);
+      if (a === "accept") accept(t, true);
       else if (a === "decline") decline(t);
       else if (a === "cancel") cancelTx(t);
       else if (a === "clear") { for (const r of t.received || []) if (r.url) URL.revokeObjectURL(r.url); S.tx.delete(t.tid); renderTxList(); }
@@ -624,12 +789,20 @@ function promptIncoming(t) {
     (t.items.length > 6 ? `<div class="item"><span class="sub">and ${t.items.length - 6} more</span></div>` : "");
   openSheet(`<h2>${esc(t.peer.name)}</h2><p>wants to send you ${esc(describeItems(t.items))}${t.total ? " (" + fmtSize(t.total) + ")" : ""}</p>
     <p><small>Device ${shortId(t.peer.id)}${t.peer.paired ? " · My device" : ""}</small></p>
-    <div class="list">${list}</div>
+    <div class="list">${list}</div>${sizeNote(t)}
     <div class="actions"><button class="btn ghost" id="dec">Decline</button><button class="btn primary" id="acc">Accept</button></div>`);
   $("#sheet").dataset.tid = t.tid;
-  $("#acc").onclick = () => accept(t);
+  $("#acc").onclick = () => accept(t, true);
   $("#dec").onclick = () => decline(t);
 }
+// Browsers without save-to-disk keep the whole file in memory until you tap Save.
+function sizeNote(t) {
+  if (native) return "";
+  if (canSaveToDisk) return t.total >= BIG ? `<p><small>Large transfer: you'll pick a folder and it saves straight to disk.</small></p>` : "";
+  const limit = /iPhone|iPad|Android/.test(navigator.userAgent) ? 300 * 1048576 : 1500 * 1048576;
+  return t.total > limit ? `<p style="color:var(--bad)"><small>This is a lot for a browser tab and may fail. The Beam app, Chrome or Edge can receive any size.</small></p>` : "";
+}
+
 function closePrompt(tid) {
   prompts.delete(tid);
   if (native) native.postMessage({ op: "unnotify", tag: tid });
@@ -645,6 +818,7 @@ function showSettings() {
     <label class="opt"><span>Everyone nearby can see me<small>Off = only your paired devices</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
     <label class="opt"><span>Auto-accept from my devices<small>Files from paired devices arrive without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>
     ${!native && "Notification" in window && Notification.permission !== "granted" ? '<label class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></label>' : ""}
+    ${canSaveToDisk ? `<label class="opt"><span>Save received files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Downloads via Save buttons · big transfers ask for a folder"}</small></span><button class="btn ghost small" id="sf">Choose…</button></label>` : ""}
     <p><small>Device code ${shortId(Id.id)}</small></p>
     <h3>My devices</h3>
     <p>Paired devices find each other anywhere, not just on the same WiFi.</p>
@@ -654,6 +828,8 @@ function showSettings() {
   $("#done").onclick = closeSheet;
   $("#pShow").onclick = () => { saveSettings(); S.pairing = { mode: "show" }; wsSend({ t: "pair-code" }); showPairShow(); };
   $("#pJoin").onclick = () => { saveSettings(); S.pairing = { mode: "join" }; showPairJoin(); };
+  const sf = $("#sf");
+  if (sf) sf.onclick = () => pickFolder().then(() => { saveSettings(); sheetOnClose = null; showSettings(); }).catch(() => {});
   const nt = $("#nt");
   if (nt) nt.onclick = () => Notification.requestPermission().then(() => showSettings());
   document.querySelectorAll("[data-unpair]").forEach((b) => (b.onclick = () => {

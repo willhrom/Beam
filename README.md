@@ -49,6 +49,15 @@ Server WebSocket `/ws`: server sends `{t:"challenge", nonce}`; client replies `{
 Signals relayed as `{t:"signal", to, data}`:
 - `offer {tid, sdp, sig, pub, name, kind, files:[{name,size,type,text?}]}`, signed over `beam-offer|<tid>|<receiverId>|<sdp>`
 - `answer {tid, sdp, sig, pub}`, signed over `beam-answer|<tid>|<senderId>|<sdp>`
+- `resume {tid, gen, sdp, sig, pub}`, signed over `beam-resume|<tid>|<receiverId>|<sdp>`: the sender reconnecting after a drop (allowed for 15 minutes)
+- `complete {tid}`: the receiver already has everything
 - `decline`, `cancel`, `pair`, `pair-ok`, `pair-no`
 
-Data channel `beam`: `{t:"file",i}` → binary chunks (64 KB) → `{t:"eof",i}` … `{t:"done"}`; the receiver answers `{t:"ok"}`. Either side may send `{t:"cancel"}`.
+Data channel `beam`: on open the receiver sends `{t:"from", i, off}` (where to start: `0,0` for a new transfer, or the file and byte it reached before a drop). The sender then sends `{t:"file", i, off}` → binary chunks (64 KB) → `{t:"eof", i}` … `{t:"done"}`; the receiver answers `{t:"ok"}`. Either side may send `{t:"cancel"}`.
+
+## Size limits
+
+- Android, Mac and Windows apps write to disk as data arrives: any size.
+- Chrome and Edge tabs save straight into a folder you pick (asked once, for transfers over 100 MB): any size.
+- Safari and Firefox tabs hold the file in memory until you tap Save: roughly 1–2 GB on a computer, a few hundred MB on a phone.
+- A dropped connection resumes from the last byte received, for up to 15 minutes.
