@@ -1,0 +1,39 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+    paths: ["windows/**", ".github/workflows/windows.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build
+        shell: bash
+        env:
+          BEAM_URL: ${{ vars.BEAM_URL }}
+        run: |
+          URL="${BEAM_URL:-https://beam.wahromyk.workers.dev}"
+          sed -i "s#__BEAM_URL__#$URL#" windows/Program.cs
+          dotnet publish windows/Beam.csproj -c Release -p:Version=1.0.${{ github.run_number }} -o out
+          cp out/Beam.exe Beam.exe
+      - name: Publish the download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows
+          name: Beam for Windows (always the newest)
+          body: |
+            Download Beam.exe and run it. It lives in the system tray and starts with Windows.
+            Windows SmartScreen may warn because the app isn't signed: click "More info" → "Run anyway".
+          files: Beam.exe
+          overwrite_files: true
+          make_latest: false

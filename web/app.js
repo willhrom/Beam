@@ -5,7 +5,11 @@
 const CHUNK = 64 * 1024;
 const HIGH_WATER = 4 * 1024 * 1024;
 const OFFER_TIMEOUT = 120000;
-const native = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.beam;
+// Native hosts: the Mac app (WKWebView) or the Windows app (WebView2).
+const native = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.beam) ||
+  (window.chrome && window.chrome.webview && new URLSearchParams(location.search).get("app") === "windows" ? { postMessage: (o) => window.chrome.webview.postMessage(o) } : null);
+const nativeKind = native ? (window.webkit ? "mac" : "windows") : null;
+const revealLabel = nativeKind === "windows" ? "Show in folder" : "Show in Finder";
 const $ = (s) => document.querySelector(s);
 
 // ---------- small utils ----------
@@ -31,7 +35,7 @@ const store = {
 };
 
 function guessKind() {
-  if (native) return "mac";
+  if (nativeKind) return nativeKind;
   const ua = navigator.userAgent;
   if (/iPhone|iPod/.test(ua)) return "iphone";
   if (/iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return "ipad";
@@ -525,7 +529,7 @@ function renderTx(t) {
       } else if (r.url) {
         body += `<div class="file"><span>${esc(r.name)}</span><a class="btn ghost small" href="${r.url}" download="${esc(r.name)}">Save</a></div>`;
       } else if (r.nid) {
-        body += `<div class="file"><span>${esc(r.name)}</span>${r.path ? `<button class="btn ghost small" data-reveal="${esc(r.path)}">Show in Finder</button>` : '<span class="sub">Saving…</span>'}</div>`;
+        body += `<div class="file"><span>${esc(r.name)}</span>${r.path ? `<button class="btn ghost small" data-reveal="${esc(r.path)}">${revealLabel}</button>` : '<span class="sub">Saving…</span>'}</div>`;
       }
     }
     body += "</div>";
@@ -727,7 +731,7 @@ function pairDone(ok, why) {
   await Id.load();
   const q = new URLSearchParams(location.search);
   const shared = [q.get("title"), q.get("text"), q.get("url")].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join("\n");
-  if (shared) { S.pendingText = shared; history.replaceState(null, "", "/"); }
+  if (shared) { S.pendingText = shared; history.replaceState(null, "", location.pathname + (nativeKind ? "?app=" + nativeKind : "")); }
   if ("serviceWorker" in navigator && !native) navigator.serviceWorker.register("/sw.js").catch(() => {});
   render();
   connect();
