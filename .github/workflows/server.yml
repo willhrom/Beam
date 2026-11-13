@@ -1,0 +1,36 @@
+name: Deploy server and web app (Cloudflare)
+
+# The handshake server and the web app at https://beam.wahromyk.workers.dev
+on:
+  push:
+    branches: [main]
+    paths: ["server/**", "web/**", ".github/workflows/server.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Bundle the web app
+        run: rm -rf server/public && cp -r web server/public
+      - name: Deploy
+        working-directory: server
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TURN_KEY_ID: ${{ secrets.TURN_KEY_ID }}
+          TURN_KEY_API_TOKEN: ${{ secrets.TURN_KEY_API_TOKEN }}
+        run: |
+          npx --yes wrangler@4.162.0 deploy
+          # Optional relay for devices that can't reach each other directly (Cloudflare Realtime TURN)
+          if [ -n "$TURN_KEY_ID" ]; then
+            echo "$TURN_KEY_ID" | npx --yes wrangler@4.162.0 secret put TURN_KEY_ID
+            echo "$TURN_KEY_API_TOKEN" | npx --yes wrangler@4.162.0 secret put TURN_KEY_API_TOKEN
+          fi

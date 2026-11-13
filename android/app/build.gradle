@@ -1,0 +1,40 @@
+plugins { id 'com.android.application' }
+
+def run = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+def server = System.getenv("BEAM_URL") ?: "https://beam.wahromyk.workers.dev"
+
+android {
+  namespace 'app.beam'
+  compileSdk 34
+  defaultConfig {
+    applicationId 'app.beam'
+    minSdk 29
+    targetSdk 34
+    versionCode run
+    versionName "1.0.${run}"
+    buildConfigField "String", "SERVER_URL", "\"${server}\""
+  }
+  buildFeatures { buildConfig true }
+  // The signing key lives in GitHub secrets, never in the repo.
+  signingConfigs {
+    release {
+      def ks = System.getenv("ANDROID_KEYSTORE_PATH")
+      if (ks) {
+        storeFile file(ks)
+        storeType "pkcs12"
+        storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+        keyAlias System.getenv("ANDROID_KEY_ALIAS") ?: "weather"
+        keyPassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+      }
+    }
+  }
+  buildTypes {
+    release { minifyEnabled false; signingConfig signingConfigs.release }
+  }
+  compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
+}
+
+dependencies {
+  implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+  implementation 'io.github.webrtc-sdk:android:125.6422.07'
+}

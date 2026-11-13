@@ -1,0 +1,44 @@
+name: Build Mac app
+
+on:
+  push:
+    branches: [main]
+    paths: ["mac/**", ".github/workflows/mac.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          BEAM_URL: ${{ vars.BEAM_URL }}
+        run: |
+          URL="${BEAM_URL:-https://beam.wahromyk.workers.dev}"
+          sed "s#__BEAM_URL__#$URL#" mac/main.swift > "$RUNNER_TEMP/main.swift"
+          swiftc -O -swift-version 5 -target arm64-apple-macos13 -o "$RUNNER_TEMP/beam-arm64" "$RUNNER_TEMP/main.swift"
+          swiftc -O -swift-version 5 -target x86_64-apple-macos13 -o "$RUNNER_TEMP/beam-x86" "$RUNNER_TEMP/main.swift"
+          APP=Beam.app
+          mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
+          lipo -create "$RUNNER_TEMP/beam-arm64" "$RUNNER_TEMP/beam-x86" -output $APP/Contents/MacOS/Beam
+          sed -e "s#__VERSION__#1.0.${{ github.run_number }}#" -e "s#__BUILD__#${{ github.run_number }}#" mac/Info.plist > $APP/Contents/Info.plist
+          iconutil -c icns mac/AppIcon.iconset -o $APP/Contents/Resources/AppIcon.icns
+          codesign --force --deep --sign - $APP
+          ditto -c -k --keepParent $APP Beam-mac.zip
+      - name: Publish the download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mac
+          name: Beam for Mac (always the newest)
+          body: |
+            Download Beam-mac.zip, unzip it, and drag Beam to Applications.
+            The first time, macOS will block it because it isn't from the App Store. Run this once in Terminal:
+            xattr -cr /Applications/Beam.app
+            then open Beam. It lives in the menu bar.
+          files: Beam-mac.zip
+          overwrite_files: true
+          make_latest: false
