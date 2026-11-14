@@ -283,17 +283,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
   }
 
   func share(_ urls: [URL]) {
-    let files = urls.filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }
+    // Folders are sent as their files, each tagged with its path inside the folder.
+    var files: [(URL, String)] = []
+    let fm = FileManager.default
+    for u in urls {
+      let v = try? u.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
+      if v?.isRegularFile == true { files.append((u, "")) }
+      else if v?.isDirectory == true, let e = fm.enumerator(at: u, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+        let baseLen = u.deletingLastPathComponent().path.count + 1
+        for case let f as URL in e {
+          if files.count >= 5000 { break }
+          guard (try? f.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+          let rel = String(f.deletingLastPathComponent().path.dropFirst(baseLen))
+          files.append((f, rel))
+        }
+      }
+    }
     guard !files.isEmpty else { return }
     showWindow()
-    if !pageReady { pendingShare += files; return }
+    if !pageReady { pendingShare += urls; return }
     var list: [[String: Any]] = []
-    for u in files {
+    for (u, rel) in files {
       let fid = UUID().uuidString
       shared[fid] = u
       let size = (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
       let type = UTType(filenameExtension: u.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-      list.append(["fid": fid, "name": u.lastPathComponent, "size": size, "type": type])
+      list.append(["fid": fid, "name": u.lastPathComponent, "size": size, "type": type, "path": rel])
     }
     if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
       js("beamNative.share(\(json))")
@@ -490,7 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     case "show":
       showWindow()
     case "saveBegin":
-      startSave(id: id, name: d["name"] as? String ?? "file")
+      startSave(id: id, name: d["name"] as? String ?? "file", path: d["path"] as? String ?? "")
     case "saveChunk":
       guard let s = saves[id], let b64 = d["b64"] as? String, let data = Data(base64Encoded: b64) else { return }
       do { try s.handle.write(contentsOf: data) } catch { abortSave(id: id); js("beamNative.saveFailed(\(q(id)))") }
@@ -511,16 +526,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     }
   }
 
-  func startSave(id: String, name: String) {
+  /// One safe path component: no slashes, no leading dots, never "." or "..".
+  func safeName(_ s: String) -> String {
+    var n = (s as NSString).lastPathComponent.replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
+    while n.hasPrefix(".") { n.removeFirst() }
+    return n.isEmpty ? "file" : n
+  }
+
+  /// `path` is the folder inside the transfer this file belongs to ("Trip/Day 1"), recreated under Downloads.
+  func startSave(id: String, name: String, path: String) {
     let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-    var safe = (name as NSString).lastPathComponent.replacingOccurrences(of: ":", with: "_")
-    while safe.hasPrefix(".") { safe.removeFirst() }
-    if safe.isEmpty { safe = "file" }
+    var folder = downloads
+    for part in path.split(separator: "/").map(String.init).filter({ !$0.isEmpty && $0 != "." && $0 != ".." }).prefix(20) {
+      folder = folder.appendingPathComponent(safeName(part))
+    }
+    if folder != downloads { try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+    let safe = safeName(name)
     let base = (safe as NSString).deletingPathExtension, ext = (safe as NSString).pathExtension
-    var url = downloads.appendingPathComponent(safe)
+    var url = folder.appendingPathComponent(safe)
     var n = 2
     while FileManager.default.fileExists(atPath: url.path) {
-      url = downloads.appendingPathComponent(ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
+      url = folder.appendingPathComponent(ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
       n += 1
     }
     guard FileManager.default.createFile(atPath: url.path, contents: nil), let h = try? FileHandle(forWritingTo: url) else {

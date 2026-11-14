@@ -30,10 +30,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends Activity implements Beam.Listener {
-  private static final int PICK = 1;
+  private static final int PICK = 1, PICK_FOLDER = 3;
   private Beam beam;
   private GridLayout peersGrid;
   private TextView status, empty;
+  private android.widget.Button manyBtn;
   private LinearLayout transfers;
   private String peersKey = "";
   private boolean updateOffered;
@@ -131,6 +132,9 @@ public class MainActivity extends Activity implements Beam.Listener {
 
     status = Ui.text(this, "", 13, Ui.DIM, false);
     root.addView(status, Ui.margins(this, -1, -2, 0, 6, 0, 0));
+    manyBtn = Ui.button(this, "Send to several devices", 0x18FFFFFF, Ui.TEXT, v -> chooseWhatMany());
+    manyBtn.setVisibility(View.GONE);
+    root.addView(manyBtn, Ui.margins(this, -2, -2, 0, 10, 0, 0));
 
     peersGrid = new GridLayout(this);
     peersGrid.setColumnCount(3);
@@ -182,6 +186,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       }
     }
     empty.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
+    manyBtn.setVisibility(all.size() > 1 ? View.VISIBLE : View.GONE);
     empty.setText(beam.online || beam.nearby.usable() ? "Looking for devices…\nOpen Beam on another device on this WiFi,\nor pair one in Settings." : "");
 
     // transfers, newest first
@@ -301,15 +306,74 @@ public class MainActivity extends Activity implements Beam.Listener {
     Beam.Peer p = beam.peer(peerId);
     if (p == null) return;
     Ui.dialog(this).setTitle("Send to " + p.name)
-        .setItems(new String[] { "Files or photos", "Text or link" }, (d, which) -> {
+        .setItems(new String[] { "Files or photos", "A folder", "Text or link" }, (d, which) -> {
           if (which == 0) {
             pickFor = peerId;
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*").putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
             startActivityForResult(i, PICK);
+          } else if (which == 1) {
+            pickFor = peerId;
+            startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), PICK_FOLDER);
           } else {
             askText(peerId);
           }
         }).show();
+  }
+
+  /** "Send to several devices": pick what to send, then tick the devices. */
+  private void chooseWhatMany() {
+    Ui.dialog(this).setTitle("Send to several devices")
+        .setItems(new String[] { "Files or photos", "A folder", "Text or link" }, (d, which) -> {
+          pickFor = null; // null = ask which devices afterwards
+          if (which == 0) startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*").putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true), PICK);
+          else if (which == 1) startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), PICK_FOLDER);
+          else askTextMany();
+        }).show();
+  }
+
+  private void askTextMany() {
+    EditText e = new EditText(this);
+    e.setHint("Paste a link or type something");
+    e.setMinLines(3);
+    Ui.dialog(this).setTitle("Send text to several devices").setView(pad(e))
+        .setPositiveButton("Next", (d, w) -> {
+          String s = e.getText().toString();
+          if (!s.trim().isEmpty()) Items.build(this, new ArrayList<>(), s, false, (items, err) -> { if (items != null) pickRecipients(items); });
+        })
+        .setNegativeButton("Cancel", null).show();
+  }
+
+  /** The device list with checkboxes: pick any number, then one Send. */
+  private void pickRecipients(final List<Transfer.Item> items) {
+    final List<Beam.Peer> peers = beam.allPeers();
+    if (peers.isEmpty()) { Toast.makeText(this, "No devices around right now", Toast.LENGTH_SHORT).show(); return; }
+    String[] names = new String[peers.size()];
+    final boolean[] on = new boolean[peers.size()];
+    for (int i = 0; i < peers.size(); i++) names[i] = peers.get(i).name + (beam.prefs.paired.containsKey(peers.get(i).id) || peers.get(i).mine ? "  ·  my device" : "");
+    long total = 0;
+    for (Transfer.Item it : items) total += it.size;
+    String what = items.size() == 1 ? (items.get(0).text ? "text" : items.get(0).name) : items.size() + " items";
+    final AlertDialog[] dlg = new AlertDialog[1];
+    dlg[0] = Ui.dialog(this).setTitle("Send " + what + (total > 0 ? " (" + fmtSize(total) + ")" : ""))
+        .setMultiChoiceItems(names, on, (d, which, checked) -> {
+          on[which] = checked;
+          int n = 0;
+          for (boolean b : on) if (b) n++;
+          android.widget.Button go = dlg[0].getButton(AlertDialog.BUTTON_POSITIVE);
+          go.setEnabled(n > 0);
+          go.setText(n > 1 ? "Send to " + n : "Send");
+        })
+        .setPositiveButton("Send", (d, w) -> {
+          List<Beam.Peer> chosen = new ArrayList<>();
+          for (int i = 0; i < peers.size(); i++) if (on[i] && beam.peer(peers.get(i).id) != null) chosen.add(peers.get(i));
+          if (chosen.isEmpty()) { for (Transfer.Item it : items) if (it.temp != null) it.temp.delete(); return; }
+          beam.sendToMany(chosen, items);
+          if (chosen.size() > 1) Toast.makeText(this, "Sending to " + chosen.size() + " devices", Toast.LENGTH_SHORT).show();
+        })
+        .setNegativeButton("Cancel", (d, w) -> { for (Transfer.Item it : items) if (it.temp != null) it.temp.delete(); })
+        .create();
+    dlg[0].setOnShowListener(x -> dlg[0].getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false));
+    dlg[0].show();
   }
 
   private void askText(String peerId) {
@@ -344,7 +408,23 @@ public class MainActivity extends Activity implements Beam.Listener {
 
   @Override protected void onActivityResult(int req, int res, Intent data) {
     super.onActivityResult(req, res, data);
-    if (req != PICK || res != RESULT_OK || data == null) return;
+    if (res != RESULT_OK || data == null) return;
+    if (req == PICK_FOLDER) {
+      final Uri tree = data.getData();
+      if (tree == null) return;
+      final String peerId = pickFor;
+      Toast.makeText(this, "Reading the folder…", Toast.LENGTH_SHORT).show();
+      Items.buildFolder(this, tree, (items, err) -> {
+        if (err != null) { Toast.makeText(this, err, Toast.LENGTH_LONG).show(); return; }
+        if (items.isEmpty()) { Toast.makeText(this, "That folder is empty", Toast.LENGTH_SHORT).show(); return; }
+        if (peerId == null) { pickRecipients(items); return; }
+        Beam.Peer p = beam.peer(peerId);
+        if (p == null) Toast.makeText(this, "That device went away", Toast.LENGTH_SHORT).show();
+        else beam.send(p, items);
+      });
+      return;
+    }
+    if (req != PICK) return;
     List<Uri> uris = new ArrayList<>();
     if (data.getClipData() != null) for (int i = 0; i < data.getClipData().getItemCount(); i++) uris.add(data.getClipData().getItemAt(i).getUri());
     else if (data.getData() != null) uris.add(data.getData());
@@ -353,7 +433,8 @@ public class MainActivity extends Activity implements Beam.Listener {
     }
     final String peerId = pickFor;
     Items.build(this, uris, null, false, (items, err) -> {
-      Beam.Peer p = beam.peer(peerId);
+      if (err == null && peerId == null) { pickRecipients(items); return; }
+      Beam.Peer p = peerId == null ? null : beam.peer(peerId);
       if (err != null) Toast.makeText(this, err, Toast.LENGTH_LONG).show();
       else if (p == null) Toast.makeText(this, "That device went away", Toast.LENGTH_SHORT).show();
       else if (!items.isEmpty()) beam.send(p, items);

@@ -94,6 +94,11 @@ Signals relayed as `{t:"signal", to, data}`:
 
 Data channel `beam`: on open the receiver sends `{t:"from", i, off}` (where to start: `0,0` for a new transfer, or the file and byte it reached before a drop). The sender then sends `{t:"file", i, off}` → binary chunks (64 KB) → `{t:"eof", i}` … `{t:"done"}`; the receiver answers `{t:"ok"}`. Either side may send `{t:"cancel"}`.
 
+## Folders and several devices
+
+- **Folders** travel as their files, each with a `path` inside the folder (`"Trip/Day 1"`). Receivers recreate the structure: Android under Downloads/Beam (photos and videos still go to the gallery, in a matching sub-album), Mac and Windows under Downloads, Chrome/Edge inside the save folder you picked. Browsers that hold files in memory offer the whole folder as one .zip.
+- **Several devices**: tick any number of devices and send once. Each device gets its own transfer (web: "Send to several devices" under your name, or drop files anywhere on the screen; Android: the button under the status line, or tap several devices in the share sheet; Windows: tap several in the "Send to…" card; Mac: the device list that opens from Finder).
+
 ## Size limits
 
 - Android, Mac and Windows apps write to disk as data arrives: any size.

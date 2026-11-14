@@ -35,6 +35,7 @@ public class ShareActivity extends Activity implements Beam.Listener {
   private String target;      // device chosen from the share sheet's top row
   private boolean busy;
   private Transfer sending;   // our transfer, once started
+  private List<Transfer> sendingAll;
   private long opened;
 
   @Override protected void onCreate(Bundle s) {
@@ -70,6 +71,9 @@ public class ShareActivity extends Activity implements Beam.Listener {
     row.setGravity(Gravity.CENTER);
     hs.addView(row);
     box.addView(hs, Ui.margins(this, -1, -2, 0, 12, 0, 4));
+    sendBtn = Ui.button(this, "Send", Ui.ACCENT, android.graphics.Color.WHITE, v -> send());
+    sendBtn.setVisibility(android.view.View.GONE);
+    box.addView(sendBtn, Ui.margins(this, -1, -2, 0, 8, 0, 4));
     String what = !uris.isEmpty() ? (uris.size() == 1 ? "1 item" : uris.size() + " items") : "text";
     String title = target != null ? "Beam " + what + " to " + targetName() : "Beam " + what + " to…";
     dialog = Ui.dialog(this).setTitle(title).setView(box).setNegativeButton("Cancel", null).create();
@@ -109,7 +113,9 @@ public class ShareActivity extends Activity implements Beam.Listener {
 
   @Override public void onChange() {
     if (sending != null) {
-      if (!sending.active()) finish(); // done or failed: we no longer need access to the files
+      boolean any = false;
+      for (Transfer t : sendingAll) if (t.active()) any = true;
+      if (!any) finish(); // all done or failed: we no longer need access to the files
       return;
     }
     render();
@@ -122,11 +128,11 @@ public class ShareActivity extends Activity implements Beam.Listener {
     List<Beam.Peer> all = beam.allPeers();
     if (target != null) {
       Beam.Peer p = beam.peer(target);
-      if (p != null) { send(p.id); return; }
+      if (p != null) { chosen.add(p.id); send(); return; }
       boolean gaveUp = System.currentTimeMillis() - opened > WAIT_FOR_DEVICE;
       hint.setText(gaveUp ? targetName() + " isn't reachable right now. Pick another device, or open Beam on it." : "Looking for " + targetName() + "…");
     } else {
-      hint.setText(all.isEmpty() ? (beam.online || beam.nearby.usable() ? "Looking for devices… Open Beam on the other device." : "Connecting…") : "Tap a device");
+      hint.setText(all.isEmpty() ? (beam.online || beam.nearby.usable() ? "Looking for devices… Open Beam on the other device." : "Connecting…") : chosen.isEmpty() ? "Tap a device, or several" : "Tap more to add, then Send");
     }
     StringBuilder k = new StringBuilder();
     for (Beam.Peer p : all) k.append(p.id).append(p.name).append(beam.isOfflineOnly(p.id)).append('|');
@@ -134,28 +140,48 @@ public class ShareActivity extends Activity implements Beam.Listener {
     key = k.toString();
     row.removeAllViews();
     for (Beam.Peer p : all) {
-      LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id), null, beam.isOfflineOnly(p.id));
-      b.setOnClickListener(v -> send(p.id));
+      LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id), chosen.contains(p.id) ? "Selected" : null, beam.isOfflineOnly(p.id));
+      b.setOnClickListener(v -> toggle(p.id));
       row.addView(b);
     }
   }
 
-  private void send(String peerId) {
+  // Tap a device: it's selected. Tap another to add it. "Send" goes to all of them.
+  private final java.util.LinkedHashSet<String> chosen = new java.util.LinkedHashSet<>();
+  private android.widget.Button sendBtn;
+
+  private void toggle(String peerId) {
     if (busy) return;
+    if (!chosen.remove(peerId)) chosen.add(peerId);
+    if (chosen.size() == 1 && target != null) { send(); return; } // picked from the share sheet's top row: go
+    key = ""; // redraw selection rings
+    render();
+    if (sendBtn != null) {
+      sendBtn.setVisibility(chosen.isEmpty() ? android.view.View.GONE : android.view.View.VISIBLE);
+      sendBtn.setText(chosen.size() > 1 ? "Send to " + chosen.size() + " devices" : "Send");
+    }
+  }
+
+  private void send() {
+    if (busy || chosen.isEmpty()) return;
     busy = true;
     hint.setText("Preparing…");
     row.setAlpha(0.4f);
+    final List<String> ids = new ArrayList<>(chosen);
     Items.build(this, uris, text, false, (items, err) -> {
-      Beam.Peer p = beam.peer(peerId);
       if (err != null) { Toast.makeText(this, err, Toast.LENGTH_LONG).show(); finish(); return; }
-      if (p == null) {
+      List<Beam.Peer> peers = new ArrayList<>();
+      for (String id : ids) { Beam.Peer p = beam.peer(id); if (p != null) peers.add(p); }
+      if (peers.isEmpty()) {
         for (Transfer.Item it : items) if (it.temp != null) it.temp.delete();
         Toast.makeText(this, "That device went away", Toast.LENGTH_SHORT).show();
         finish();
         return;
       }
-      sending = beam.send(p, items);
-      Toast.makeText(this, "Sending to " + p.name + " — progress is in your notifications", Toast.LENGTH_SHORT).show();
+      List<Transfer> started = peers.size() == 1 ? java.util.Collections.singletonList(beam.send(peers.get(0), items)) : beam.sendToMany(peers, items);
+      sending = started.get(0);
+      sendingAll = started;
+      Toast.makeText(this, "Sending to " + (peers.size() == 1 ? peers.get(0).name : peers.size() + " devices") + " — progress is in your notifications", Toast.LENGTH_SHORT).show();
       dialog.setOnDismissListener(null);
       dialog.dismiss();
       // Step out of the way but stay alive, so we can keep reading the shared files.

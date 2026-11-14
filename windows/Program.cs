@@ -40,7 +40,7 @@ namespace Beam
             // "Send with Beam" from Explorer runs: Beam.exe --send <file> [<file> ...]
             var files = new List<string>();
             int si = Array.IndexOf(args, "--send");
-            if (si >= 0) for (int i = si + 1; i < args.Length; i++) if (File.Exists(args[i])) files.Add(Path.GetFullPath(args[i]));
+            if (si >= 0) for (int i = si + 1; i < args.Length; i++) if (File.Exists(args[i]) || Directory.Exists(args[i])) files.Add(Path.GetFullPath(args[i]));
             // Opened from the Windows Share window: collect what was shared.
             string shareText = null;
             var shared = ShareMenu.ReadActivation();
@@ -307,6 +307,18 @@ namespace Beam
             catch { }
             try
             {
+                // Right-click a folder → "Send with Beam"
+                using (var k = Registry.CurrentUser.CreateSubKey(@"Software\Classes\Directory\shell\Beam"))
+                {
+                    k.SetValue("", "Send with Beam");
+                    k.SetValue("Icon", $"\"{exe}\",0");
+                    using var c = k.CreateSubKey("command");
+                    c.SetValue("", $"\"{exe}\" --send \"%1\"");
+                }
+            }
+            catch { }
+            try
+            {
                 // Right-click → Send to → Beam (handles many files at once)
                 Installer.CreateLink(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SendTo), "Beam.lnk"), exe, "--send", "Send with Beam");
             }
@@ -316,6 +328,7 @@ namespace Beam
         void RemoveExplorerMenus()
         {
             try { Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\*\shell\Beam", false); } catch { }
+            try { Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\Directory\shell\Beam", false); } catch { }
             try { File.Delete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SendTo), "Beam.lnk")); } catch { }
         }
 
@@ -340,7 +353,7 @@ namespace Beam
                             {
                                 try { text = Encoding.UTF8.GetString(Convert.FromBase64String(line.Substring(5))); } catch { }
                             }
-                            else if (File.Exists(line)) got.Add(line);
+                            else if (File.Exists(line) || Directory.Exists(line)) got.Add(line);
                         }
                         if (got.Count > 0 || text != null) BeginInvoke(new Action(() => QueueShare(got, text)));
                     }
@@ -370,14 +383,14 @@ namespace Beam
         {
             if (shareQueue.Count == 0 && shareTextQueue == null) return;
             long bytes = 0;
-            foreach (var p in shareQueue) { try { bytes += new FileInfo(p).Length; } catch { } }
-            string what = shareQueue.Count == 1 ? Path.GetFileName(shareQueue[0])
+            foreach (var p in shareQueue) { try { if (File.Exists(p)) bytes += new FileInfo(p).Length; } catch { } }
+            string what = shareQueue.Count == 1 ? (Directory.Exists(shareQueue[0]) ? "the folder \"" + Path.GetFileName(shareQueue[0]) + "\"" : Path.GetFileName(shareQueue[0]))
                 : shareQueue.Count > 1 ? $"{shareQueue.Count} items"
                 : Uri.TryCreate(shareTextQueue?.Trim(), UriKind.Absolute, out var u) && (u.Scheme == "http" || u.Scheme == "https") ? "a link" : "some text";
             if (picker == null || picker.IsDisposed)
             {
                 picker = new SharePicker();
-                picker.Picked += id => { FlushShare(id); };
+                picker.Picked += ids => { FlushShare(ids); };
                 picker.Cancelled += () => { shareQueue.Clear(); shareTextQueue = null; };
                 picker.OpenBeam += () => { ShowMain(); FlushShare(null); };
             }
@@ -389,17 +402,22 @@ namespace Beam
         static string FormatSize(long n) =>
             n < 1024 ? n + " B" : n < 1048576 ? (n / 1024) + " KB" : n < 1073741824 ? (n / 1048576.0).ToString("0.0") + " MB" : (n / 1073741824.0).ToString("0.00") + " GB";
 
-        /// <param name="to">The device picked in the "Send to…" card, or null to choose in Beam's window.</param>
-        void FlushShare(string to)
+        /// <param name="to">The devices picked in the "Send to…" card, or null to choose in Beam's window.</param>
+        void FlushShare(List<string> to)
         {
             if (!pageReady || env == null || web.CoreWebView2 == null || (shareQueue.Count == 0 && shareTextQueue == null)) return;
             var handles = new List<object>();
             foreach (var p in shareQueue)
             {
-                try { handles.Add(env.CreateWebFileSystemFileHandle(p, CoreWebView2FileSystemHandlePermission.ReadOnly)); } catch { }
+                try
+                {
+                    if (Directory.Exists(p)) handles.Add(env.CreateWebFileSystemDirectoryHandle(p, CoreWebView2FileSystemHandlePermission.Read));
+                    else handles.Add(env.CreateWebFileSystemFileHandle(p, CoreWebView2FileSystemHandlePermission.ReadOnly));
+                }
+                catch { }
             }
             shareQueue.Clear();
-            var msg = JsonSerializer.Serialize(new { op = "share", text = shareTextQueue, to });
+            var msg = JsonSerializer.Serialize(new { op = "share", text = shareTextQueue, to = to != null && to.Count > 0 ? to : null });
             shareTextQueue = null;
             if (handles.Count > 0) web.CoreWebView2.PostWebMessageAsJson(msg, handles);
             else web.CoreWebView2.PostWebMessageAsJson(msg);
@@ -516,7 +534,7 @@ namespace Beam
                     ShowMain();
                     break;
                 case "saveBegin":
-                    StartSave(id, Str("name") ?? "file");
+                    StartSave(id, Str("name") ?? "file", Str("path") ?? "");
                     break;
                 case "saveChunk":
                     if (saves.TryGetValue(id, out var sv))
@@ -562,13 +580,25 @@ namespace Beam
             return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
         }
 
-        void StartSave(string id, string name)
+        static string SafeName(string s)
         {
-            var safe = Path.GetFileName(name ?? "");
+            var safe = Path.GetFileName(s ?? "");
             foreach (var c in Path.GetInvalidFileNameChars()) safe = safe.Replace(c, '_');
             safe = safe.TrimStart('.').Trim();
-            if (safe.Length == 0) safe = "file";
+            return safe.Length == 0 ? "file" : safe;
+        }
+
+        /// <param name="relPath">The folder inside the transfer this file belongs to ("Trip\Day 1"), recreated under Downloads.</param>
+        void StartSave(string id, string name, string relPath)
+        {
+            var safe = SafeName(name);
             var dir = Downloads();
+            foreach (var part in (relPath ?? "").Split('/', '\\'))
+            {
+                if (part.Length == 0 || part == "." || part == "..") continue;
+                dir = Path.Combine(dir, SafeName(part));
+            }
+            if (!Path.GetFullPath(dir).StartsWith(Downloads(), StringComparison.OrdinalIgnoreCase)) dir = Downloads();
             Directory.CreateDirectory(dir);
             var baseName = Path.GetFileNameWithoutExtension(safe);
             var ext = Path.GetExtension(safe);
@@ -755,6 +785,7 @@ namespace Beam
                     var temp = Path.Combine(Path.GetTempPath(), "Beam share", Guid.NewGuid().ToString("N"));
                     foreach (var item in items)
                     {
+                        if (item is Windows.Storage.StorageFolder folder && Directory.Exists(folder.Path)) { files.Add(folder.Path); continue; }
                         if (item is not Windows.Storage.StorageFile f) continue;
                         if (!string.IsNullOrEmpty(f.Path) && File.Exists(f.Path)) { files.Add(f.Path); continue; }
                         // Some apps share files that aren't on disk; keep a copy we can read.
@@ -787,7 +818,9 @@ namespace Beam
     /// </summary>
     sealed class SharePicker : Form
     {
-        public event Action<string> Picked;
+        public event Action<List<string>> Picked;
+        readonly HashSet<string> chosen = new();
+        Rectangle sendR;
         public event Action Cancelled;
         public event Action OpenBeam;
         static readonly Color Raised = Color.FromArgb(23, 33, 54), Raised2 = Color.FromArgb(31, 44, 71), Line = Color.FromArgb(42, 55, 82),
@@ -799,6 +832,7 @@ namespace Beam
         Rectangle cancelR, openR;
         string hover;
         int focusIndex = -1;
+        bool multiTouched; // the person has toggled selections (so a tap no longer sends immediately)
 
         public SharePicker()
         {
@@ -866,6 +900,7 @@ namespace Beam
             for (int i = 0; i < devices.Count; i++)
                 hits.Add((new Rectangle(x0 + (i % Cols) * (tileW + gap), top + (i / Cols) * (tileH + gap), tileW, tileH), devices[i].Id));
             cancelR = new Rectangle(w - pad - S(84), h - S(50), S(84), S(34));
+            sendR = new Rectangle(cancelR.X - S(8) - S(chosen.Count > 1 ? 130 : 84), h - S(50), S(chosen.Count > 1 ? 130 : 84), S(34));
             openR = new Rectangle(pad - S(8), h - S(50), S(120), S(34));
             if (Size != new Size(w, h))
             {
@@ -914,7 +949,7 @@ namespace Beam
             using var mid = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
 
             g.DrawString("Send " + what, h1, paper, new RectangleF(pad, S(18), Width - pad * 2, S(24)), one);
-            g.DrawString(size != null ? size + ". Choose a device." : "Choose a device.", body, dim, new RectangleF(pad, S(44), Width - pad * 2, S(20)), one);
+            g.DrawString((size != null ? size + ". " : "") + (chosen.Count == 0 ? "Pick one device or several." : "Pick more, or Send."), body, dim, new RectangleF(pad, S(44), Width - pad * 2, S(20)), one);
 
             if (devices.Count == 0)
             {
@@ -926,11 +961,21 @@ namespace Beam
             {
                 var (r, id) = hits[i];
                 var d = devices[i];
-                bool hot = hover == id || focusIndex == i;
+                bool hot = hover == id || focusIndex == i || chosen.Contains(id);
                 float dia = S(60);
                 var circle = new RectangleF(r.X + (r.Width - dia) / 2, r.Y + S(4), dia, dia);
                 using (var fill = new SolidBrush(hot ? Raised2 : Color.FromArgb(19, 28, 46))) g.FillEllipse(fill, circle);
-                using (var ring = new Pen(hot ? Signal : d.Mine ? Color.FromArgb(140, Signal) : Line, S(1.5f))) g.DrawEllipse(ring, circle);
+                using (var ring = new Pen(chosen.Contains(id) ? Signal : hot ? Color.FromArgb(180, Signal) : d.Mine ? Color.FromArgb(140, Signal) : Line, S(chosen.Contains(id) ? 2.5f : 1.5f))) g.DrawEllipse(ring, circle);
+                if (chosen.Contains(id))
+                {
+                    // tick badge
+                    var badge = new RectangleF(circle.Right - S(18), circle.Bottom - S(18), S(18), S(18));
+                    using var bb = new SolidBrush(Beam);
+                    g.FillEllipse(bb, badge);
+                    using var tp = new Pen(Color.White, S(2)) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+                    float bx = badge.X, by = badge.Y, bs = S(18);
+                    g.DrawLines(tp, new[] { new PointF(bx + bs * 0.28f, by + bs * 0.52f), new PointF(bx + bs * 0.45f, by + bs * 0.7f), new PointF(bx + bs * 0.74f, by + bs * 0.34f) });
+                }
                 g.DrawString(Glyph(d.Kind), iconFont, paper, circle, mid);
                 g.DrawString(d.Name, bold, paper, new RectangleF(r.X, circle.Bottom + S(8), r.Width, S(18)), center);
                 using var tag = new SolidBrush(d.Mine ? Signal : Dim);
@@ -949,6 +994,14 @@ namespace Beam
                 g.DrawPath(p, path);
             }
             g.DrawString("Cancel", bold, paper, cancelR, mid);
+            if (chosen.Count > 0)
+            {
+                using var path = Pill(sendR, S(8));
+                using var b = new SolidBrush(hover == "send" ? Color.FromArgb(74, 128, 255) : Beam);
+                g.FillPath(b, path);
+                using var white = new SolidBrush(Color.White);
+                g.DrawString(chosen.Count > 1 ? $"Send to {chosen.Count} devices" : "Send", bold, white, sendR, mid);
+            }
         }
 
         static GraphicsPath Pill(Rectangle r, int radius)
@@ -967,6 +1020,7 @@ namespace Beam
         {
             foreach (var (r, id) in hits) if (r.Contains(pt)) return id;
             if (cancelR.Contains(pt)) return "cancel";
+            if (chosen.Count > 0 && sendR.Contains(pt)) return "send";
             if (openR.Contains(pt)) return "open";
             return null;
         }
@@ -983,8 +1037,16 @@ namespace Beam
         {
             var h = HitTest(e.Location);
             if (h == "cancel") Finish(null);
+            else if (h == "send") Finish(new List<string>(chosen));
             else if (h == "open") { done = true; Hide(); OpenBeam?.Invoke(); }
-            else if (h != null) Finish(h);
+            else if (h != null)
+            {
+                // tap = select (tap again to unselect); a single tap with nothing else chosen sends straight away
+                if (!chosen.Remove(h)) chosen.Add(h);
+                if (chosen.Count == 1 && !multiTouched) { Finish(new List<string>(chosen)); return; }
+                multiTouched = true;
+                Relayout();
+            }
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
@@ -993,7 +1055,8 @@ namespace Beam
             if (devices.Count == 0) return;
             if (e.KeyCode == Keys.Right || e.KeyCode == Keys.Tab) focusIndex = (focusIndex + 1) % devices.Count;
             else if (e.KeyCode == Keys.Left) focusIndex = (focusIndex - 1 + devices.Count) % devices.Count;
-            else if ((e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && focusIndex >= 0) { Finish(devices[focusIndex].Id); return; }
+            else if (e.KeyCode == Keys.Space && focusIndex >= 0) { var id = devices[focusIndex].Id; if (!chosen.Remove(id)) chosen.Add(id); multiTouched = true; Relayout(); return; }
+            else if (e.KeyCode == Keys.Enter) { if (chosen.Count > 0) Finish(new List<string>(chosen)); else if (focusIndex >= 0) Finish(new List<string> { devices[focusIndex].Id }); return; }
             else return;
             Invalidate();
         }
@@ -1011,13 +1074,15 @@ namespace Beam
             if (Visible && !done) Finish(null);
         }
 
-        void Finish(string id)
+        void Finish(List<string> ids)
         {
             if (done) return;
             done = true;
             Hide();
             focusIndex = -1;
-            if (id != null) Picked?.Invoke(id);
+            chosen.Clear();
+            multiTouched = false;
+            if (ids != null && ids.Count > 0) Picked?.Invoke(ids);
             else Cancelled?.Invoke();
         }
 
@@ -1404,6 +1469,7 @@ namespace Beam
             void Try(Action a) { try { a(); } catch { } }
             Try(() => { using var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true); k?.DeleteValue("Beam", false); });
             Try(() => Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\*\shell\Beam", false));
+            Try(() => Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\Directory\shell\Beam", false));
             Try(() => Registry.CurrentUser.DeleteSubKeyTree(@"Software\Beam", false));
             Try(() => Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false));
             Try(() => File.Delete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SendTo), "Beam.lnk")));

@@ -18,6 +18,53 @@ import java.util.List;
 final class Items {
   interface Done { void run(List<Transfer.Item> items, String error); }
 
+  /** Everything inside a folder picked with the system folder picker, each file tagged with its path inside it. */
+  static void buildFolder(Context c, Uri tree, Done done) {
+    final Beam beam = Beam.get(c);
+    new Thread(() -> {
+      List<Transfer.Item> out = new ArrayList<>();
+      String err = null;
+      try {
+        ContentResolver cr = c.getContentResolver();
+        String rootDoc = android.provider.DocumentsContract.getTreeDocumentId(tree);
+        String rootName = null;
+        try (Cursor cur = cr.query(android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, rootDoc),
+            new String[] { android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME }, null, null, null)) {
+          if (cur != null && cur.moveToFirst()) rootName = cur.getString(0);
+        }
+        if (rootName == null || rootName.isEmpty()) rootName = "Folder";
+        walk(cr, tree, rootDoc, Transfer.cleanName(rootName), out);
+      } catch (Exception e) {
+        err = e.getMessage() != null ? e.getMessage() : "Couldn't read the folder";
+      }
+      final String e2 = err;
+      beam.main.post(() -> done.run(e2 == null ? out : null, e2));
+    }, "beam-folder").start();
+  }
+
+  private static void walk(ContentResolver cr, Uri tree, String docId, String path, List<Transfer.Item> out) {
+    if (out.size() >= 5000) return;
+    Uri children = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId);
+    String[] cols = { android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID, android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE, android.provider.DocumentsContract.Document.COLUMN_SIZE };
+    try (Cursor cur = cr.query(children, cols, null, null, null)) {
+      while (cur != null && cur.moveToNext()) {
+        String id = cur.getString(0), name = cur.getString(1), mime = cur.getString(2);
+        long size = cur.isNull(3) ? -1 : cur.getLong(3);
+        if (name == null || name.startsWith(".")) continue;
+        if (android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+          walk(cr, tree, id, path + "/" + Transfer.cleanName(name), out);
+        } else {
+          Transfer.Item it = new Transfer.Item(Transfer.cleanName(name), Math.max(0, size), mime != null ? mime : "application/octet-stream", false);
+          it.uri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, id);
+          it.path = path;
+          out.add(it);
+          if (out.size() >= 5000) return;
+        }
+      }
+    }
+  }
+
   /**
    * @param copy make a private copy of each file first. Needed for the share sheet, because the
    *             permission to read shared files ends when the share screen closes.

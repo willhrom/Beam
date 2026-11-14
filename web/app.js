@@ -2,8 +2,8 @@
 // (window.webkit.messageHandlers.beam) for notifications and saving to Downloads.
 "use strict";
 
-const CHUNK = 64 * 1024;
-const HIGH_WATER = 4 * 1024 * 1024;
+const CHUNK = 256 * 1024;            // the largest message every browser accepts
+const HIGH_WATER = 8 * 1024 * 1024;  // how far ahead of the network we read
 const OFFER_TIMEOUT = 120000;
 // Native hosts: the Mac app (WKWebView) or the Windows app (WebView2).
 const native = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.beam) ||
@@ -30,6 +30,10 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 const fmtSize = (n) => (n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(0) + " KB" : n < 1073741824 ? (n / 1048576).toFixed(1) + " MB" : (n / 1073741824).toFixed(2) + " GB");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const cleanName = (n) => String(n || "file").replace(/[\/\\:\u0000-\u001f]/g, "_").replace(/^\.+/, "").slice(0, 180) || "file";
+// A folder path inside a transfer, like "Trip/Day 1": each part cleaned, nothing that climbs out.
+const cleanPath = (p) => String(p || "").split(/[\/\\]+/).filter((x) => x && x !== "." && x !== "..").map((x) => cleanName(x)).slice(0, 20).join("/");
+// The relative path a browser gives a file picked or dropped as part of a folder.
+const relPathOf = (f) => (f.beamPath !== undefined ? f.beamPath : f.webkitRelativePath || "").split("/").slice(0, -1).join("/");
 const store = {
   get: (k, d) => { try { const v = localStorage.getItem("beam." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem("beam." + k, JSON.stringify(v)); } catch {} },
@@ -172,6 +176,7 @@ async function onServer(m) {
     case "peers":
       S.peers = m.peers || [];
       autoPairMine();
+      if (S.pickOpen && S.pickRefresh) S.pickRefresh();
       // keep paired names fresh
       for (const p of S.peers) if (S.paired[p.id] && S.paired[p.id].pub === p.pub && S.paired[p.id].name !== p.name) { S.paired[p.id].name = p.name; savePaired(); }
       render();
@@ -308,7 +313,7 @@ function closePc(t) {
 
 // ---------- sending ----------
 async function sendItems(peer, files, text) {
-  const items = files.map((f) => ({ name: cleanName(f.name), size: f.size, type: f.type || "application/octet-stream" }));
+  const items = files.map((f) => { const it = { name: cleanName(f.name), size: f.size, type: f.type || "application/octet-stream" }; const p = cleanPath(relPathOf(f)); if (p) it.path = p; return it; });
   const blobs = files.slice();
   if (text) {
     const b = new Blob([text], { type: "text/plain" });
@@ -331,7 +336,7 @@ async function connectOut(t, mode) {
   const pc = (t.pc = new RTCPeerConnection({ iceServers: S.ice }));
   const dc = (t.dc = pc.createDataChannel("beam", { ordered: true }));
   dc.binaryType = "arraybuffer";
-  dc.bufferedAmountLowThreshold = 1024 * 1024;
+  dc.bufferedAmountLowThreshold = 2 * 1024 * 1024;
   dc.onmessage = (e) => {
     if (!live() || typeof e.data !== "string") return;
     const m = JSON.parse(e.data);
@@ -422,6 +427,7 @@ async function onOffer(from, d) {
   if (!(await verifySig(d.pub, d.sig, `beam-offer|${d.tid}|${Id.id}|${d.sdp}`))) return;
   const items = (Array.isArray(d.files) ? d.files : []).slice(0, 500).map((f) => ({
     name: cleanName(f.name), size: Math.max(0, Number(f.size) || 0), type: String(f.type || "application/octet-stream").slice(0, 100), text: !!f.text,
+    path: cleanPath(f.path) || undefined,
   }));
   if (!items.length) return;
   const paired = !!S.paired[from];
@@ -438,9 +444,16 @@ async function onOffer(from, d) {
 }
 
 function describeItems(items) {
+  const tops = new Set(items.filter((i) => i.path).map((i) => i.path.split("/")[0]));
+  if (tops.size === 1 && items.every((i) => i.path)) return `the folder "${[...tops][0]}"`;
+  if (tops.size > 1 && items.every((i) => i.path)) return tops.size + " folders";
   if (items.length === 1) return items[0].text ? "some text" : items[0].name;
   const photos = items.every((i) => /^image\//.test(i.type));
-  return items.length + (photos ? " photos" : " files");
+  return items.length + (photos ? " photos" : " files") + (tops.size ? " and folders" : "");
+}
+function topFolder(items) {
+  const tops = new Set(items.filter((i) => i.path).map((i) => i.path.split("/")[0]));
+  return tops.size === 1 && items.every((i) => i.path) ? [...tops][0] : null;
 }
 
 // Chrome and Edge can write straight into a folder on disk, so size is only limited by disk space.
@@ -470,7 +483,7 @@ async function accept(t, gesture) {
   if (native) t.sink = "native";
   else if (canSaveToDisk) {
     let dir = await savedFolder(gesture).catch(() => null);
-    if (!dir && gesture && t.total >= BIG) dir = await pickFolder().catch(() => null);
+    if (!dir && gesture && (t.total >= BIG || topFolder(t.items))) dir = await pickFolder().catch(() => null);
     if (dir) { t.sink = "fs"; t.dirHandle = dir; }
   }
   await answerConn(t, t.sdp, t.gen);
@@ -523,34 +536,53 @@ function makeWriter(t, it, index) {
         const blob = new Blob(parts, { type: it.type });
         parts = [];
         if (it.text) t.received.push({ text: await blob.text() });
-        else t.received.push({ name: it.name, url: URL.createObjectURL(blob), size: it.size });
+        else t.received.push({ name: it.name, path: it.path, url: URL.createObjectURL(blob), size: it.size });
       },
       abort: () => { parts = []; },
     };
   }
   if (t.sink === "native") {
     const nid = t.tid + ":" + index;
-    native.postMessage({ op: "saveBegin", id: nid, name: it.name });
+    native.postMessage({ op: "saveBegin", id: nid, name: it.name, path: it.path || "" });
+    // Batch chunks into ~1 MB messages: far fewer hops across the bridge.
+    let pend = [], pendBytes = 0;
+    const flush = () => {
+      if (!pendBytes) return;
+      const all = new Uint8Array(pendBytes);
+      let o = 0;
+      for (const p of pend) { all.set(new Uint8Array(p), o); o += p.byteLength; }
+      pend = []; pendBytes = 0;
+      native.postMessage({ op: "saveChunk", id: nid, b64: b64(all.buffer) });
+    };
     return {
-      write: (b) => native.postMessage({ op: "saveChunk", id: nid, b64: b64(b) }),
-      close: () => t.received.push({ name: it.name, nid }) && native.postMessage({ op: "saveEnd", id: nid }),
-      abort: () => native.postMessage({ op: "saveAbort", id: nid }),
+      write: (b) => { pend.push(b); pendBytes += b.byteLength; if (pendBytes >= 1048576) flush(); },
+      close: () => { flush(); t.received.push({ name: it.name, nid }); native.postMessage({ op: "saveEnd", id: nid }); },
+      abort: () => { pend = []; pendBytes = 0; native.postMessage({ op: "saveAbort", id: nid }); },
     };
   }
-  // straight to disk
+  // straight to disk (inside the item's folder path, created as needed)
   let ws = null, name = it.name;
   const ready = (async () => {
+    let dir = t.dirHandle;
+    for (const part of (it.path || "").split("/").filter(Boolean)) dir = await dir.getDirectoryHandle(part, { create: true });
     const dot = it.name.lastIndexOf(".");
     const base = dot > 0 ? it.name.slice(0, dot) : it.name, ext = dot > 0 ? it.name.slice(dot) : "";
     for (let n = 2; ; n++) {
-      try { await t.dirHandle.getFileHandle(name); name = `${base} (${n})${ext}`; } catch { break; }
+      try { await dir.getFileHandle(name); name = `${base} (${n})${ext}`; } catch { break; }
     }
-    const fh = await t.dirHandle.getFileHandle(name, { create: true });
+    const fh = await dir.getFileHandle(name, { create: true });
     ws = await fh.createWritable();
   })();
+  let pend = [], pendBytes = 0;
+  const flush = async () => {
+    if (!pendBytes) return;
+    const parts = pend; pend = []; pendBytes = 0;
+    await ready;
+    await ws.write(parts.length === 1 ? parts[0] : new Blob(parts));
+  };
   return {
-    write: async (b) => { await ready; await ws.write(b); },
-    close: async () => { await ready; await ws.close(); t.received.push({ name, folder: t.dirHandle.name }); },
+    write: async (b) => { pend.push(b); pendBytes += b.byteLength; if (pendBytes >= 1048576) await flush(); },
+    close: async () => { await flush(); await ready; await ws.close(); t.received.push({ name, folder: t.dirHandle.name }); },
     abort: async () => { try { await ready; await ws.abort(); await t.dirHandle.removeEntry(name); } catch {} },
   };
 }
@@ -580,7 +612,26 @@ function setupReceive(t, dc, gen) {
   if (dc.readyState === "open") opened();
   dc.onclose = () => { if (live() && ["receiving", "reconnecting", "connecting"].includes(t.state)) dropped(t, gen); };
   // Counters update immediately (so a resume point is always right); disk writes run in order behind them.
-  const later = (fn) => { t.q = t.q.then(fn).catch((e) => fail(t, e && e.message ? e.message : "Couldn't save")); };
+  // Work is queued without a promise per chunk: one loop drains the queue as fast as the sink allows.
+  const queue = [];
+  let draining = false;
+  const drain = async () => {
+    if (draining) return;
+    draining = true;
+    try {
+      while (queue.length) {
+        const fn = queue.shift();
+        const r = fn();
+        if (r && typeof r.then === "function") await r;
+      }
+    } catch (e) {
+      fail(t, e && e.message ? e.message : "Couldn't save");
+    } finally {
+      draining = false;
+      if (queue.length) drain();
+    }
+  };
+  const later = (fn) => { queue.push(fn); if (!draining) drain(); };
   dc.onmessage = (e) => {
     if (!live()) return;
     if (typeof e.data === "string") {
@@ -673,7 +724,19 @@ if (nativeKind === "windows") {
   window.chrome.webview.addEventListener("message", async (e) => {
     if (!e.data || e.data.op !== "share") return;
     const files = [];
-    for (const h of e.additionalObjects || []) { try { files.push(await h.getFile()); } catch {} }
+    const walk = async (dir, prefix) => {
+      if (files.length >= 5000) return;
+      for await (const [name, h] of dir) {
+        if (h.kind === "file") { try { const f = await h.getFile(); f.beamPath = prefix + "/" + f.name; files.push(f); } catch {} }
+        else await walk(h, prefix + "/" + name);
+      }
+    };
+    for (const h of e.additionalObjects || []) {
+      try {
+        if (h.kind === "directory") await walk(h, h.name);
+        else files.push(await h.getFile());
+      } catch {}
+    }
     shareFromDesktop(files, e.data.text || null, e.data.to || null);
   });
 }
@@ -741,6 +804,7 @@ const ICONS = {
   pause: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" d="M9 7v10m6-10v10"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zm4 18H6V4h7v5h5z"/></svg>',
   text: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M5 4v3h5.5v12h3V7H19V4z"/></svg>',
+  folder: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8z"/></svg>',
 };
 const iconFor = (k) => ({ android: ICONS.phone, iphone: ICONS.phone, mac: ICONS.laptop, windows: ICONS.desktop, chromebook: ICONS.laptop, ipad: ICONS.tablet })[k] || ICONS.globe;
 
@@ -769,10 +833,14 @@ function render() {
       el.ondrop = (e) => {
         e.preventDefault();
         el.classList.remove("drop");
-        const peer = S.peers.find((x) => x.id === p.id);
-        const files = [...(e.dataTransfer.files || [])];
-        const text = !files.length && (e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain"));
-        if (peer && (files.length || text)) sendItems(peer, files, text || null);
+        const text = !(e.dataTransfer.files || []).length && (e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain"));
+        const entries = [...(e.dataTransfer.items || [])].map((i) => (i.kind === "file" && i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
+        const plain = [...(e.dataTransfer.files || [])];
+        (async () => {
+          const files = entries.some(Boolean) ? await filesFromEntries(entries.filter(Boolean)) : plain;
+          const peer = S.peers.find((x) => x.id === p.id);
+          if (peer && (files.length || text)) sendItems(peer, files, text || null);
+        })();
       };
       box.appendChild(el);
     }
@@ -784,7 +852,9 @@ function render() {
     ? "Looking for devices<small>Open Beam on another device that's signed in as you, or on this WiFi.</small>"
     : "Connecting to Beam…";
   $("#me").innerHTML = S.pending ? `<b>Choose a device to send ${esc(pendingLabel())}</b><a href="#" id="pcx">Cancel</a>`
-    : `<b>${esc(S.name)}</b><span>${S.nearby ? "Visible to everyone nearby" : "Visible to your devices only"}</span>`;
+    : `<b>${esc(S.name)}</b><span>${S.nearby ? "Visible to everyone nearby" : "Visible to your devices only"}</span>${S.peers.length > 1 ? `<a href="#" id="many">Send to several devices</a>` : ""}`;
+  const many = $("#many");
+  if (many) many.onclick = (e) => { e.preventDefault(); chooseWhatMany(); };
   const pcx = $("#pcx");
   if (pcx) pcx.onclick = (e) => { e.preventDefault(); S.pending = null; render(); };
   for (const t of S.tx.values()) if (t.dir === "out") renderRing(t);
@@ -796,28 +866,63 @@ function pendingLabel() {
   if (!p) return "";
   const n = (p.files || []).length;
   if (!n) return "what you shared";
+  const tops = new Set(p.files.map((f) => cleanPath(relPathOf(f)).split("/")[0]).filter(Boolean));
+  if (tops.size === 1 && p.files.every((f) => relPathOf(f))) return `the folder "${[...tops][0]}"`;
   if (n === 1) return p.files[0].name;
   return n + ((p.files || []).every((f) => /^video\//.test(f.type)) ? " videos" : (p.files || []).every((f) => /^image\//.test(f.type)) ? " photos" : " files");
 }
 
 // Files handed over by the Mac or Windows app ("Send with Beam"): pick a device and go.
+// The device list with checkboxes: pick any number, then one Send. Used whenever something is
+// ready to go but no device has been chosen yet (desktop share, drag-drop onto the stage, "Send to several").
+function showRecipients(files, text, title) {
+  S.pending = { files, text: text || null };
+  render();
+  const list = () => S.peers.map((p) => `<label class="item pick"><span>${iconFor(p.kind)}<span>${esc(p.name)}<small class="sub">${S.paired[p.id] || p.mine ? "My device" : "Nearby"}</small></span></span><input type="checkbox" class="check" value="${p.id}" ${S.pickSel && S.pickSel.has(p.id) ? "checked" : ""}></label>`).join("")
+    || '<div class="item"><span class="sub">Looking for devices… Open Beam on the other device.</span></div>';
+  openSheet(`<h2>${esc(title || "Send " + pendingLabel())}</h2>
+    <p>${files.length ? fmtSize(files.reduce((a, f) => a + f.size, 0)) + ". " : ""}Pick one device or several.</p>
+    <div class="list" id="pickList">${list()}</div>
+    <div class="actions"><button class="btn ghost" id="cx">Cancel</button><button class="btn primary" id="go" disabled>Send</button></div>`, () => { S.pickOpen = false; S.pickSel = null; });
+  S.pickOpen = true;
+  S.pickSel = S.pickSel || new Set();
+  const wire = () => {
+    document.querySelectorAll("#pickList .check").forEach((c) => (c.onchange = () => { if (c.checked) S.pickSel.add(c.value); else S.pickSel.delete(c.value); update(); }));
+    update();
+  };
+  const update = () => {
+    for (const id of [...S.pickSel]) if (!S.peers.some((p) => p.id === id)) S.pickSel.delete(id);
+    const n = S.pickSel.size, go = $("#go");
+    if (go) { go.disabled = !n; go.textContent = n > 1 ? `Send to ${n} devices` : "Send"; }
+  };
+  S.pickRefresh = () => { const box = $("#pickList"); if (box && S.pickOpen) { box.innerHTML = list(); wire(); } };
+  wire();
+  $("#cx").onclick = () => { S.pending = null; closeSheet(); render(); };
+  $("#go").onclick = () => {
+    const ids = [...S.pickSel], v = S.pending;
+    S.pending = null;
+    closeSheet();
+    render();
+    sendToMany(ids, v.files, v.text);
+  };
+}
+
+// One send to several devices: a separate transfer to each, from the same files.
+function sendToMany(ids, files, text) {
+  const peers = ids.map((id) => S.peers.find((p) => p.id === id)).filter(Boolean);
+  for (const p of peers) sendItems(p, files, text || null);
+  if (peers.length > 1) toast(`Sending to ${peers.length} devices`);
+}
+
 function shareFromDesktop(files, text, to) {
   if (!files.length && !text) return;
   // Picked from the app's quick "Send to…" card: send straight away, no need to open Beam.
   if (to) {
-    const peer = S.peers.find((p) => p.id === to);
-    if (peer) { S.pending = null; render(); sendItems(peer, files, text || null); return; }
+    const ids = Array.isArray(to) ? to : [to];
+    if (ids.some((id) => S.peers.some((p) => p.id === id))) { S.pending = null; render(); sendToMany(ids, files, text); return; }
   }
-  S.pending = { files, text: text || null };
-  render();
   if (native) native.postMessage({ op: "show" });
-  const others = S.peers;
-  openSheet(`<h2>Send ${esc(pendingLabel())}</h2>
-    <p>${files.length ? fmtSize(files.reduce((a, f) => a + f.size, 0)) + ". " : ""}Choose a device.</p>
-    <div class="list">${others.map((p) => `<div class="item"><span>${esc(p.name)} <span class="sub">${S.paired[p.id] ? "My device" : "Nearby"}</span></span><button class="btn primary small" data-to="${p.id}">Send</button></div>`).join("") || '<div class="item"><span class="sub">Looking for devices… they\'ll also appear on the main screen.</span></div>'}</div>
-    <div class="actions"><button class="btn ghost" id="cx">Cancel</button></div>`);
-  $("#cx").onclick = () => { S.pending = null; closeSheet(); render(); };
-  document.querySelectorAll("[data-to]").forEach((b) => (b.onclick = () => chooseWhat(b.dataset.to)));
+  showRecipients(files, text);
 }
 
 // A file that lives on the Mac: Beam reads it piece by piece from the Mac app as it sends,
@@ -832,7 +937,28 @@ function macFile(f) {
       return unb64(b64s).buffer;
     },
   });
-  return { name: f.name, size: f.size, type: f.type || "application/octet-stream", slice };
+  return { name: f.name, size: f.size, type: f.type || "application/octet-stream", beamPath: f.path ? f.path + "/" + f.name : "", slice };
+}
+
+// Dropped folders come as directory entries; walk them and tag each file with its path inside the drop.
+async function filesFromEntries(entries) {
+  const out = [];
+  const walk = async (entry, prefix) => {
+    if (out.length >= 5000) return;
+    if (entry.isFile) {
+      const f = await new Promise((res, rej) => entry.file(res, rej)).catch(() => null);
+      if (f) { f.beamPath = prefix ? prefix + "/" + f.name : ""; out.push(f); }
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej)).catch(() => []);
+        if (!batch.length) break;
+        for (const e of batch) await walk(e, prefix ? prefix + "/" + entry.name : entry.name);
+      }
+    }
+  };
+  for (const e of entries) await walk(e, "");
+  return out;
 }
 
 function renderRing(t) {
@@ -898,11 +1024,14 @@ function renderTx(t) {
   let body = "";
   if (moving) body += `<div class="bar"><i style="width:${t.total ? (100 * t.done) / t.total : 0}%"></i></div>`;
   const one = t.state === "done" && t.items.length === 1 && t.received && t.received.length === 1 && !t.received[0].text ? t.received[0] : null;
+  const folderZip = t.state === "done" && t.sink === "memory" && topFolder(t.items) && t.received && t.received.length > 1 && t.received.every((r) => r.url);
   let oneBtn = "";
   if (one) {
     oneBtn = one.url ? `<a class="btn ghost small" href="${one.url}" download="${esc(one.name)}">Save</a>`
       : "folder" in one ? `<span class="size">Saved${one.folder ? " in " + esc(one.folder) : ""}</span>`
       : one.path ? `<button class="btn ghost small" data-reveal="${esc(one.path)}">${revealLabel}</button>` : `<span class="size">Saving…</span>`;
+  } else if (folderZip) {
+    body += `<div class="files"><div class="file"><span class="sub">${t.received.length} files</span><button class="btn ghost small" data-zip="${t.tid}">Save as .zip</button></div></div>`;
   } else if (t.received && t.received.length) {
     body += '<div class="files">';
     for (const r of t.received) {
@@ -912,7 +1041,7 @@ function renderTx(t) {
           (isUrl ? `<a class="btn primary small" href="${esc(r.text.trim())}" target="_blank" rel="noopener noreferrer">Open link</a>` : "<span></span>") +
           `<button class="btn ghost small" data-copy="${esc(r.text)}">Copy</button></div>`;
       } else if (r.url) {
-        body += `<div class="file"><span>${esc(r.name)}</span><a class="btn ghost small" href="${r.url}" download="${esc(r.name)}">Save</a></div>`;
+        body += `<div class="file"><span>${r.path ? `<span class="sub">${esc(r.path)}/</span>` : ""}${esc(r.name)}</span><a class="btn ghost small" href="${r.url}" download="${esc(r.name)}">Save</a></div>`;
       } else if ("folder" in r) {
         body += `<div class="file"><span>${esc(r.name)}</span><span class="sub">Saved${r.folder ? " in " + esc(r.folder) : ""}</span></div>`;
       } else if (r.nid) {
@@ -938,6 +1067,7 @@ function renderTx(t) {
       else if (a === "clear") { for (const r of t.received || []) if (r.url) URL.revokeObjectURL(r.url); S.tx.delete(t.tid); renderTxList(); }
     }));
     el.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => { navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")); }));
+    el.querySelectorAll("[data-zip]").forEach((b) => (b.onclick = () => saveFolderZip(t, b)));
     el.querySelectorAll("[data-reveal]").forEach((b) => (b.onclick = () => native && native.postMessage({ op: "reveal", path: b.dataset.reveal })));
   }
   if (t.dir === "out") renderRing(t);
@@ -945,9 +1075,12 @@ function renderTx(t) {
 
 let statusTimer = 0;
 function nativeStatusSoon() { if (native && !statusTimer) statusTimer = setTimeout(() => { statusTimer = 0; nativeStatus(); }, 500); }
-let progressRaf = 0;
+let progressRaf = 0, lastProgress = 0;
 function renderProgress(t) {
   if (progressRaf) return;
+  const now = performance.now();
+  if (now - lastProgress < 120) return;
+  lastProgress = now;
   progressRaf = requestAnimationFrame(() => {
     progressRaf = 0;
     const bar = document.querySelector(`[data-tid="${t.tid}"] .bar i`);
@@ -958,6 +1091,55 @@ function renderProgress(t) {
   });
   // Not tied to drawing: the corner card has to keep moving while Beam's window is hidden.
   nativeProgressSoon();
+}
+
+// A whole received folder as one download (browsers can't save a folder directly). Stored, not compressed.
+async function saveFolderZip(t, btn) {
+  btn.disabled = true;
+  btn.textContent = "Preparing…";
+  try {
+    const files = [];
+    for (const r of t.received) {
+      const blob = await (await fetch(r.url)).blob();
+      files.push({ path: (r.path ? r.path + "/" : "") + r.name, blob });
+    }
+    const zip = await makeZip(files);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(zip);
+    a.download = (topFolder(t.items) || "Beam") + ".zip";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    btn.textContent = "Saved";
+  } catch (e) {
+    btn.textContent = "Couldn't zip";
+  }
+}
+// Minimal ZIP writer (store method), enough for any unzipper.
+async function makeZip(files) {
+  const te = new TextEncoder();
+  const crcTable = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  const crc32 = (u8, crc = 0xffffffff) => { for (let i = 0; i < u8.length; i++) crc = crcTable[(crc ^ u8[i]) & 0xff] ^ (crc >>> 8); return crc; };
+  const parts = [], central = [];
+  let offset = 0;
+  const u16 = (n) => [n & 255, (n >>> 8) & 255], u32 = (n) => [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255];
+  const d = new Date(), dosTime = ((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xffff, dosDate = (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xffff;
+  for (const f of files) {
+    const name = te.encode(f.path.normalize("NFC"));
+    let crc = 0xffffffff, size = 0;
+    const chunks = [];
+    for (let off = 0; off < f.blob.size; off += 8 * 1048576) {
+      const u8 = new Uint8Array(await f.blob.slice(off, off + 8 * 1048576).arrayBuffer());
+      crc = crc32(u8, crc); size += u8.length; chunks.push(u8);
+    }
+    crc = (crc ^ 0xffffffff) >>> 0;
+    const head = new Uint8Array([...u32(0x04034b50), ...u16(20), ...u16(0x0800), ...u16(0), ...u16(dosTime), ...u16(dosDate), ...u32(crc), ...u32(size), ...u32(size), ...u16(name.length), ...u16(0), ...name]);
+    central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...u16(20), ...u16(0x0800), ...u16(0), ...u16(dosTime), ...u16(dosDate), ...u32(crc), ...u32(size), ...u32(size), ...u16(name.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset), ...name]));
+    parts.push(head, ...chunks);
+    offset += head.length + size;
+  }
+  const cdSize = central.reduce((a, c) => a + c.length, 0);
+  const end = new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(cdSize), ...u32(offset), ...u16(0)]);
+  return new Blob([...parts, ...central, end], { type: "application/zip" });
 }
 
 function toast(msg) {
@@ -987,6 +1169,32 @@ function closeSheet() {
 }
 $("#sheet").addEventListener("click", (e) => { if (e.target.id === "sheet") closeSheet(); });
 
+// "Send to several devices": pick what to send, then tick the devices.
+function chooseWhatMany() {
+  openSheet(`<h2>Send to several devices</h2>
+    <div class="big-choice">
+      <button class="btn ghost" id="pickFiles">${ICONS.file}Files or photos</button>
+      <button class="btn ghost" id="pickFolder">${ICONS.folder}A folder</button>
+      <button class="btn ghost" id="pickText">${ICONS.text}Text or link</button>
+    </div>`);
+  const pick = (folder) => () => {
+    closeSheet();
+    const inp = $(folder ? "#folderPick" : "#filePick");
+    inp.value = "";
+    inp.onchange = () => { if (inp.files.length) showRecipients([...inp.files], null); };
+    inp.click();
+  };
+  $("#pickFiles").onclick = pick(false);
+  $("#pickFolder").onclick = pick(true);
+  $("#pickText").onclick = () => {
+    openSheet(`<h2>Send text to several devices</h2><textarea id="txt" placeholder="Paste a link or type something"></textarea>
+      <div class="actions"><button class="btn ghost" id="cx">Cancel</button><button class="btn primary" id="go">Next</button></div>`);
+    $("#txt").focus();
+    $("#cx").onclick = closeSheet;
+    $("#go").onclick = () => { const v = $("#txt").value; if (v.trim()) showRecipients([], v); };
+  };
+}
+
 function chooseWhat(peerId) {
   const p = S.peers.find((x) => x.id === peerId);
   if (!p) return;
@@ -994,15 +1202,18 @@ function chooseWhat(peerId) {
   openSheet(`<h2>Send to ${esc(p.name)}</h2>
     <div class="big-choice">
       <button class="btn ghost" id="pickFiles">${ICONS.file}Files or photos</button>
+      <button class="btn ghost" id="pickFolder">${ICONS.folder}A folder</button>
       <button class="btn ghost" id="pickText">${ICONS.text}Text or link</button>
     </div>`);
-  $("#pickFiles").onclick = () => {
+  const pick = (folder) => () => {
     closeSheet();
-    const inp = $("#filePick");
+    const inp = $(folder ? "#folderPick" : "#filePick");
     inp.value = "";
     inp.onchange = () => { const peer = S.peers.find((x) => x.id === peerId); if (peer && inp.files.length) sendItems(peer, [...inp.files], null); };
     inp.click();
   };
+  $("#pickFiles").onclick = pick(false);
+  $("#pickFolder").onclick = pick(true);
   $("#pickText").onclick = () => {
     openSheet(`<h2>Send text to ${esc(p.name)}</h2><textarea id="txt" placeholder="Paste a link or type something"></textarea>
       <div class="actions"><button class="btn ghost" id="cx">Cancel</button><button class="btn primary" id="go">Send</button></div>`);
@@ -1030,7 +1241,8 @@ function promptIncoming(t) {
 // Browsers without save-to-disk keep the whole file in memory until you tap Save.
 function sizeNote(t) {
   if (native) return "";
-  if (canSaveToDisk) return t.total >= BIG ? `<p><small>Large transfer: you'll pick a folder and it saves straight to disk.</small></p>` : "";
+  if (canSaveToDisk) return t.total >= BIG ? `<p><small>Large transfer: you'll pick a folder and it saves straight to disk.</small></p>`
+    : topFolder(t.items) && !store.get("saveDirName", null) ? `<p><small>You'll pick where to save it, and the folder is recreated there.</small></p>` : "";
   const limit = /iPhone|iPad|Android/.test(navigator.userAgent) ? 300 * 1048576 : 1500 * 1048576;
   return t.total > limit ? `<p style="color:var(--bad)"><small>This is a lot for a browser tab and may fail. The Beam app, Chrome or Edge can receive any size.</small></p>` : "";
 }
@@ -1302,6 +1514,22 @@ function showInvite(m) {
     return;
   }
   await Id.load();
+  // Drop files anywhere on the main screen to choose who gets them.
+  const stage = document.querySelector(".stage");
+  stage.ondragover = (e) => { if (!e.target.closest(".peer")) { e.preventDefault(); stage.classList.add("drop"); } };
+  stage.ondragleave = () => stage.classList.remove("drop");
+  stage.ondrop = (e) => {
+    stage.classList.remove("drop");
+    if (e.target.closest(".peer") || !S.user) return;
+    e.preventDefault();
+    const text = !(e.dataTransfer.files || []).length && (e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain"));
+    const entries = [...(e.dataTransfer.items || [])].map((i) => (i.kind === "file" && i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
+    const plain = [...(e.dataTransfer.files || [])];
+    (async () => {
+      const files = entries.some(Boolean) ? await filesFromEntries(entries.filter(Boolean)) : plain;
+      if (files.length || text) showRecipients(files, text || null);
+    })();
+  };
   const q = new URLSearchParams(location.search);
   const shared = [q.get("title"), q.get("text"), q.get("url")].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join("\n");
   if (shared) { S.pending = { files: [], text: shared }; history.replaceState(null, "", location.pathname + (nativeKind ? "?app=" + nativeKind : "")); }

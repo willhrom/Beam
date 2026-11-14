@@ -161,7 +161,8 @@ textarea { height: auto; min-height: 110px; padding: 10px 12px; resize: vertical
 .safety { color: var(--signal); }
 .list { display: flex; flex-direction: column; }
 .list .item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); gap: 10px; }
-.big-choice { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.big-choice { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 14px; }
+@media (max-width: 380px) { .big-choice { grid-template-columns: 1fr 1fr; } }
 .big-choice .btn { flex-direction: column; height: auto; padding: 20px 10px; gap: 10px; }
 .big-choice svg { width: 24px; height: 24px; color: var(--signal); }
 .toggle { appearance: none; width: 42px; height: 24px; border-radius: 12px; background: #34425f; position: relative; cursor: pointer; flex: none; transition: background .15s; }
@@ -198,3 +199,15 @@ textarea { height: auto; min-height: 110px; padding: 10px 12px; resize: vertical
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* picking several devices */
+.list .item.pick { cursor: pointer; }
+.list .item.pick > span { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.list .item.pick > span > svg { width: 22px; height: 22px; color: var(--signal); flex: none; }
+.list .item.pick small { display: block; font-size: 12px; }
+.check { appearance: none; width: 22px; height: 22px; flex: none; border-radius: 50%; border: 1.5px solid var(--line); background: var(--night); cursor: pointer; display: grid; place-items: center; transition: background .12s, border-color .12s; }
+.check:checked { background: var(--beam); border-color: var(--beam); }
+.check:checked::after { content: ""; width: 6px; height: 11px; border: solid #fff; border-width: 0 2px 2px 0; transform: translateY(-1px) rotate(45deg); }
+.stage.drop { outline: 2px dashed var(--signal); outline-offset: -10px; border-radius: 20px; }
+.you-text a { color: var(--signal); text-decoration: none; margin-top: 4px; font-weight: 600; }
+.you-text a:hover { text-decoration: underline; }

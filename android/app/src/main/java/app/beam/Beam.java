@@ -360,6 +360,7 @@ final class Beam {
     for (int i = 0; i < Math.min(files.length(), 500); i++) {
       JSONObject f = files.getJSONObject(i);
       items.add(new Transfer.Item(Transfer.cleanName(f.optString("name")), Math.max(0, f.optLong("size")), f.optString("type", "application/octet-stream"), f.optBoolean("text")));
+      items.get(items.size() - 1).path = Transfer.cleanPath(f.optString("path"));
     }
     Prefs.Paired pp = prefs.paired.get(from);
     String name = pp != null ? pp.name : trim(d.optString("name", "Device"));
@@ -389,6 +390,24 @@ final class Beam {
   }
 
   // ---------- actions from the UI ----------
+  /** One send to several devices: a separate transfer to each, from the same files. */
+  List<Transfer> sendToMany(List<Peer> peers, List<Transfer.Item> items) {
+    List<Transfer> out = new ArrayList<>();
+    for (int k = 0; k < peers.size(); k++) {
+      // Each transfer reads the files itself, so temp copies must be shared, not deleted twice.
+      List<Transfer.Item> copy = new ArrayList<>();
+      for (Transfer.Item i : items) {
+        Transfer.Item c = new Transfer.Item(i.name, i.size, i.type, i.text);
+        c.path = i.path; c.uri = i.uri; c.textValue = i.textValue;
+        c.temp = i.temp; c.sharedTemp = i.temp != null;
+        copy.add(c);
+      }
+      out.add(send(peers.get(k), copy));
+    }
+    if (items.size() > 0) TempFiles.track(this, items, out);
+    return out;
+  }
+
   Transfer send(Peer p, List<Transfer.Item> items) {
     Transfer t = new Transfer(this, Crypto.randomId(), false, p.id, p.name, p.kind, prefs.paired.containsKey(p.id), items);
     tx.put(t.tid, t);

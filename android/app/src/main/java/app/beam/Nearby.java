@@ -391,6 +391,7 @@ final class Nearby {
           JSONObject f = files.getJSONObject(i);
           items.add(new Transfer.Item(Transfer.cleanName(f.optString("name")), Math.max(0, f.optLong("size")),
               f.optString("type", "application/octet-stream"), f.optBoolean("text")));
+      items.get(items.size() - 1).path = Transfer.cleanPath(f.optString("path"));
         }
         Transfer in = new Transfer(beam, tid, true, l.peerId, l.peerName, l.peerKind, beam.prefs.paired.containsKey(l.peerId), items);
         in.offeredOn = l;

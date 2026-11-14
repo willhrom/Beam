@@ -49,8 +49,10 @@ final class Transfer {
     final String name, type;
     final long size;
     final boolean text;
+    String path = ""; // folder inside the transfer this file belongs to ("Trip/Day 1"), or ""
     Uri uri;          // outgoing file
     File temp;        // outgoing copy we made (deleted after)
+    boolean sharedTemp; // the copy belongs to several transfers; TempFiles deletes it when all are done
     String textValue; // outgoing text, or received text
     Uri saved;        // received file
     Transfer.Place place; // where it was saved
@@ -113,6 +115,20 @@ final class Transfer {
     this.state = incoming ? ASKING : PREPARING;
   }
 
+  /** A folder path inside a transfer: each part cleaned, nothing that climbs out, at most 20 deep. */
+  static String cleanPath(String p) {
+    if (p == null) return "";
+    StringBuilder sb = new StringBuilder();
+    int n = 0;
+    for (String part : p.split("[/\\\\]+")) {
+      if (part.isEmpty() || part.equals(".") || part.equals("..")) continue;
+      if (n++ >= 20) break;
+      if (sb.length() > 0) sb.append('/');
+      sb.append(cleanName(part));
+    }
+    return sb.toString();
+  }
+
   static String cleanName(String n) {
     if (n == null) n = "";
     n = n.replaceAll("[/\\\\:\\u0000-\\u001f]", "_").replaceAll("^\\.+", "");
@@ -120,7 +136,20 @@ final class Transfer {
     return n.isEmpty() ? "file" : n;
   }
 
+  /** The one folder everything belongs to, or null. */
+  String topFolder() {
+    String top = null;
+    for (Item i : items) {
+      if (i.path.isEmpty()) return null;
+      String t = i.path.split("/")[0];
+      if (top == null) top = t; else if (!top.equals(t)) return null;
+    }
+    return top;
+  }
+
   String describe() {
+    String top = topFolder();
+    if (top != null) return "the folder \"" + top + "\"";
     if (items.size() == 1) return items.get(0).text ? "some text" : items.get(0).name;
     boolean photos = true;
     for (Item i : items) if (!i.type.startsWith("image/")) photos = false;
@@ -352,7 +381,7 @@ final class Transfer {
         ContentValues v = new ContentValues();
         v.put(MediaStore.MediaColumns.DISPLAY_NAME, it.name);
         v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-        v.put(MediaStore.MediaColumns.RELATIVE_PATH, (it.place == Place.PHOTOS ? Environment.DIRECTORY_PICTURES : Environment.DIRECTORY_MOVIES) + "/Beam");
+        v.put(MediaStore.MediaColumns.RELATIVE_PATH, (it.place == Place.PHOTOS ? Environment.DIRECTORY_PICTURES : Environment.DIRECTORY_MOVIES) + "/Beam" + (it.path.isEmpty() ? "" : "/" + it.path));
         v.put(MediaStore.MediaColumns.IS_PENDING, 1);
         pendingUri = cr.insert(it.place == Place.PHOTOS
             ? MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
@@ -366,7 +395,7 @@ final class Transfer {
       ContentValues v = new ContentValues();
       v.put(MediaStore.Downloads.DISPLAY_NAME, it.name);
       v.put(MediaStore.Downloads.MIME_TYPE, mime);
-      v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Beam");
+      v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Beam" + (it.path.isEmpty() ? "" : "/" + it.path));
       v.put(MediaStore.Downloads.IS_PENDING, 1);
       pendingUri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
     }
@@ -730,6 +759,7 @@ final class Transfer {
     JSONArray files = new JSONArray();
     for (Item i : items) {
       JSONObject f = new JSONObject().put("name", i.name).put("size", i.size).put("type", i.type);
+      if (!i.path.isEmpty()) f.put("path", i.path);
       if (i.text) f.put("text", true);
       files.put(f);
     }
@@ -869,6 +899,6 @@ final class Transfer {
   }
 
   private void cleanupTemp() {
-    for (Item i : items) if (i.temp != null) { i.temp.delete(); i.temp = null; }
+    for (Item i : items) if (i.temp != null && !i.sharedTemp) { i.temp.delete(); i.temp = null; }
   }
 }
