@@ -34,8 +34,17 @@ jobs:
           # Index the icons (every size Windows asks for), so the Share window can show Beam's icon.
           & "$($kit.FullName)\makepri.exe" createconfig /cf "$env:RUNNER_TEMP\priconfig.xml" /dq en-US /pv 10.0.0 /o
           if ($LASTEXITCODE) { exit 1 }
+          # Keep every icon size in the one resources.pri (no per-scale resource packs).
+          [xml]$cfg = Get-Content "$env:RUNNER_TEMP\priconfig.xml"
+          $packaging = $cfg.SelectSingleNode('//packaging')
+          if ($packaging) { [void]$packaging.ParentNode.RemoveChild($packaging) }
+          $cfg.Save("$env:RUNNER_TEMP\priconfig.xml")
           & "$($kit.FullName)\makepri.exe" new /pr windows\identity /cf "$env:RUNNER_TEMP\priconfig.xml" /mn windows\identity\AppxManifest.xml /of windows\identity\resources.pri /o
           if ($LASTEXITCODE) { exit 1 }
+          Get-ChildItem windows\identity\resources.*.pri -ErrorAction SilentlyContinue | Remove-Item
+          & "$($kit.FullName)\makepri.exe" dump /if windows\identity\resources.pri /of "$env:RUNNER_TEMP\pri.xml" /o | Out-Null
+          $candidates = (Select-String -Path "$env:RUNNER_TEMP\pri.xml" -Pattern 'Square44x44Logo' -AllMatches).Matches.Count
+          Write-Host "Icon entries in resources.pri: $candidates"
           & "$($kit.FullName)\makeappx.exe" pack /d windows\identity /p windows\identity-out\Beam.Share.msix /nv /o
           if ($LASTEXITCODE) { exit 1 }
           & "$($kit.FullName)\signtool.exe" sign /fd SHA256 /f $pfx /p $env:PFX_PASSWORD /tr http://timestamp.digicert.com /td SHA256 windows\identity-out\Beam.Share.msix
