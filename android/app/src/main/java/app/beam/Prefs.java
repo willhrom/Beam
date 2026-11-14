@@ -25,6 +25,7 @@ final class Prefs {
   String name;
   boolean nearby, autoAccept, enabled, offline;
   final Map<String, Paired> paired = new LinkedHashMap<>();
+  final List<String[]> recent = new ArrayList<>(); // {id, name, kind}, most recent first
 
   Prefs(Context c) {
     sp = c.getSharedPreferences("beam", Context.MODE_PRIVATE);
@@ -44,6 +45,20 @@ final class Prefs {
         paired.put(id, new Paired(id, p.getString("pub"), p.optString("name", "Device"), p.optString("kind", "web")));
       }
     } catch (Exception ignored) {}
+    try {
+      org.json.JSONArray a = new org.json.JSONArray(sp.getString("recent", "[]"));
+      for (int i = 0; i < a.length(); i++) {
+        org.json.JSONArray r = a.getJSONArray(i);
+        recent.add(new String[] { r.getString(0), r.getString(1), r.getString(2) });
+      }
+    } catch (Exception ignored) {}
+  }
+
+  void sentTo(String id, String name, String kind) {
+    for (int i = recent.size() - 1; i >= 0; i--) if (recent.get(i)[0].equals(id)) recent.remove(i);
+    recent.add(0, new String[] { id, name, kind });
+    while (recent.size() > 6) recent.remove(recent.size() - 1);
+    save();
   }
 
   void save() {
@@ -51,7 +66,9 @@ final class Prefs {
     try {
       for (Paired p : paired.values()) o.put(p.id, new JSONObject().put("pub", p.pub).put("name", p.name).put("kind", p.kind));
     } catch (Exception ignored) {}
-    sp.edit().putString("name", name).putBoolean("nearby", nearby).putBoolean("autoAccept", autoAccept)
+    org.json.JSONArray rec = new org.json.JSONArray();
+    for (String[] r : recent) rec.put(new org.json.JSONArray().put(r[0]).put(r[1]).put(r[2]));
+    sp.edit().putString("recent", rec.toString()).putString("name", name).putBoolean("nearby", nearby).putBoolean("autoAccept", autoAccept)
         .putBoolean("enabled", enabled).putBoolean("offline", offline).putString("paired", o.toString()).apply();
   }
 

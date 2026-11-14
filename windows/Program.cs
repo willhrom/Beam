@@ -3,6 +3,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO.Pipes;
+using System.Linq;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -24,11 +26,28 @@ namespace Beam
         [STAThread]
         static void Main(string[] args)
         {
+            // "Send with Beam" from Explorer runs: Beam.exe --send <file> [<file> ...]
+            var files = new List<string>();
+            int si = Array.IndexOf(args, "--send");
+            if (si >= 0) for (int i = si + 1; i < args.Length; i++) if (File.Exists(args[i])) files.Add(Path.GetFullPath(args[i]));
+
             using var mutex = new Mutex(true, "Beam.SingleInstance", out bool first);
             using var showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "Beam.ShowWindow");
             if (!first)
             {
-                showSignal.Set(); // Beam is already running: just bring its window up
+                // Beam is already running: hand it the files (if any) and bring its window up.
+                if (files.Count > 0)
+                {
+                    try
+                    {
+                        using var pipe = new NamedPipeClientStream(".", MainForm.PipeName, PipeDirection.Out);
+                        pipe.Connect(3000);
+                        using var w = new StreamWriter(pipe);
+                        foreach (var f in files) w.WriteLine(f);
+                    }
+                    catch { }
+                }
+                showSignal.Set();
                 return;
             }
 
@@ -37,7 +56,8 @@ namespace Beam
             Application.SetCompatibleTextRenderingDefault(false);
 
             bool background = Array.Exists(args, a => a == "--background") || ToastNotificationManagerCompat.WasCurrentProcessToastActivated();
-            var form = new MainForm(!background);
+            var form = new MainForm(!background || files.Count > 0);
+            if (files.Count > 0) form.QueueShare(files);
             new Thread(() =>
             {
                 while (showSignal.WaitOne())
@@ -56,7 +76,11 @@ namespace Beam
         readonly ToolStripMenuItem startupItem = new ToolStripMenuItem("Start with Windows");
         readonly Dictionary<string, (FileStream stream, string path)> saves = new();
         readonly Uri server = new Uri(Program.Server);
-        bool online, quitting;
+        bool online, quitting, pageReady;
+        CoreWebView2Environment env;
+        readonly List<string> shareQueue = new();
+        System.Windows.Forms.Timer shareTimer;
+        public const string PipeName = "Beam.SendFiles";
 
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
@@ -97,6 +121,8 @@ namespace Beam
             }
             if (IsStartup()) SetStartup(true); // keep the path current if the exe moved
             startupItem.Checked = IsStartup();
+            InstallExplorerMenus();
+            StartPipeServer();
 
             // Create the window handles without showing it, so the page loads in the background.
             CreateHandle();
@@ -122,7 +148,7 @@ namespace Beam
             };
             try
             {
-                var env = await CoreWebView2Environment.CreateAsync(null, dataDir, opts);
+                env = await CoreWebView2Environment.CreateAsync(null, dataDir, opts);
                 await web.EnsureCoreWebView2Async(env);
             }
             catch (Exception ex)
@@ -141,8 +167,13 @@ namespace Beam
                 if (!IsOurs(e.Uri)) { e.Cancel = true; OpenExternal(e.Uri); }
             };
             core.NewWindowRequested += (s, e) => { e.Handled = true; OpenExternal(e.Uri); };
-            core.NavigationCompleted += (s, e) => { if (!e.IsSuccess) RetryLater(); };
-            core.ProcessFailed += (s, e) => { try { core.Reload(); } catch { } };
+            core.NavigationCompleted += (s, e) =>
+            {
+                if (!e.IsSuccess) { RetryLater(); return; }
+                pageReady = true;
+                if (shareQueue.Count > 0) { shareTimer?.Stop(); shareTimer?.Start(); }
+            };
+            core.ProcessFailed += (s, e) => { pageReady = false; try { core.Reload(); } catch { } };
             core.Navigate(Program.Server + "/?app=windows");
         }
 
@@ -163,6 +194,95 @@ namespace Beam
             var t = new System.Windows.Forms.Timer { Interval = 5000 };
             t.Tick += (s, e) => { t.Stop(); t.Dispose(); if (!online) web.CoreWebView2?.Reload(); };
             t.Start();
+        }
+
+        // ---------- "Send with Beam" from File Explorer ----------
+        void InstallExplorerMenus()
+        {
+            var exe = Environment.ProcessPath;
+            try
+            {
+                // Right-click a file → "Send with Beam" (Windows 11: under "Show more options")
+                using (var k = Registry.CurrentUser.CreateSubKey(@"Software\Classes\*\shell\Beam"))
+                {
+                    k.SetValue("", "Send with Beam");
+                    k.SetValue("Icon", $"\"{exe}\",0");
+                    using var c = k.CreateSubKey("command");
+                    c.SetValue("", $"\"{exe}\" --send \"%1\"");
+                }
+            }
+            catch { }
+            try
+            {
+                // Right-click → Send to → Beam (handles many files at once)
+                var link = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SendTo), "Beam.lnk");
+                var shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType != null)
+                {
+                    dynamic shell = Activator.CreateInstance(shellType);
+                    dynamic lnk = shell.CreateShortcut(link);
+                    lnk.TargetPath = exe;
+                    lnk.Arguments = "--send";
+                    lnk.IconLocation = exe + ",0";
+                    lnk.Description = "Send with Beam";
+                    lnk.Save();
+                }
+            }
+            catch { }
+        }
+
+        void RemoveExplorerMenus()
+        {
+            try { Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\*\shell\Beam", false); } catch { }
+            try { File.Delete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SendTo), "Beam.lnk")); } catch { }
+        }
+
+        // Other launches of Beam.exe (one per file when several are right-clicked) pass their files here.
+        void StartPipeServer()
+        {
+            new Thread(() =>
+            {
+                while (true)
+                {
+                    try
+                    {
+                        using var pipe = new NamedPipeServerStream(PipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte);
+                        pipe.WaitForConnection();
+                        using var r = new StreamReader(pipe);
+                        var got = new List<string>();
+                        string line;
+                        while ((line = r.ReadLine()) != null) if (File.Exists(line)) got.Add(line);
+                        if (got.Count > 0) BeginInvoke(new Action(() => QueueShare(got)));
+                    }
+                    catch { Thread.Sleep(500); }
+                }
+            }) { IsBackground = true }.Start();
+        }
+
+        // Collect files for a moment (Explorer may launch us once per file), then hand them to the page.
+        public void QueueShare(IEnumerable<string> paths)
+        {
+            foreach (var p in paths) if (!shareQueue.Contains(p)) shareQueue.Add(p);
+            if (shareTimer == null)
+            {
+                shareTimer = new System.Windows.Forms.Timer { Interval = 700 };
+                shareTimer.Tick += (s, e) => { shareTimer.Stop(); FlushShare(); };
+            }
+            shareTimer.Stop();
+            shareTimer.Start();
+            ShowMain();
+        }
+
+        void FlushShare()
+        {
+            if (!pageReady || env == null || web.CoreWebView2 == null || shareQueue.Count == 0) return;
+            var handles = new List<object>();
+            foreach (var p in shareQueue)
+            {
+                try { handles.Add(env.CreateWebFileSystemFileHandle(p, CoreWebView2FileSystemHandlePermission.ReadOnly)); } catch { }
+            }
+            shareQueue.Clear();
+            if (handles.Count > 0) web.CoreWebView2.PostWebMessageAsJson("{\"op\":\"share\"}", handles);
         }
 
         // ---------- window ----------

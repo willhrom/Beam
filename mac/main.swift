@@ -4,11 +4,39 @@ import Cocoa
 import WebKit
 import UserNotifications
 import ServiceManagement
+import UniformTypeIdentifiers
 
 let serverURL = URL(string: "__BEAM_URL__")!
 
+// Lets the page read a shared Finder file piece by piece (so big videos never load all at once).
+final class FileReader: NSObject, WKScriptMessageHandlerWithReply {
+  weak var app: AppDelegate?
+  init(_ app: AppDelegate) { self.app = app }
+  func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage, replyHandler: @escaping (Any?, String?) -> Void) {
+    guard m.frameInfo.isMainFrame, m.frameInfo.securityOrigin.host == serverURL.host,
+          let d = m.body as? [String: Any], let fid = d["fid"] as? String, let url = app?.shared[fid],
+          let off = (d["off"] as? NSNumber)?.uint64Value, let len = (d["len"] as? NSNumber)?.intValue, len > 0, len <= 8 << 20
+    else { replyHandler(nil, "bad request"); return }
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let h = try FileHandle(forReadingFrom: url)
+        defer { try? h.close() }
+        try h.seek(toOffset: off)
+        let data = try h.read(upToCount: len) ?? Data()
+        let b64 = data.base64EncodedString()
+        DispatchQueue.main.async { replyHandler(b64, nil) }
+      } catch {
+        DispatchQueue.main.async { replyHandler(nil, "read failed") }
+      }
+    }
+  }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler, WKUIDelegate,
-  WKNavigationDelegate, UNUserNotificationCenterDelegate {
+  WKNavigationDelegate, UNUserNotificationCenterDelegate, NSDraggingDestination {
+  var shared: [String: URL] = [:]   // files handed to Beam from Finder, by id
+  var pendingShare: [URL] = []
+  var pageReady = false
   var statusItem: NSStatusItem!
   var window: NSWindow!
   var web: WKWebView!
@@ -35,6 +63,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
       showWindow()
     }
     updateLoginItem()
+    // Finder: right-click → Services (or Quick Actions) → "Send with Beam"
+    NSApp.servicesProvider = self
+    NSUpdateDynamicServices()
+  }
+
+  // MARK: - Sending files from Finder
+
+  /// Finder → Services → "Send with Beam"
+  @objc func sendFiles(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+    let urls = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+    share(urls)
+  }
+
+  /// Finder → Open With → Beam, or files dropped on the app
+  func application(_ application: NSApplication, open urls: [URL]) { share(urls) }
+
+  // Files dropped on the menu bar icon
+  func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+  func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+  func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+    share(urls)
+    return !urls.isEmpty
+  }
+
+  func share(_ urls: [URL]) {
+    let files = urls.filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }
+    guard !files.isEmpty else { return }
+    showWindow()
+    if !pageReady { pendingShare += files; return }
+    var list: [[String: Any]] = []
+    for u in files {
+      let fid = UUID().uuidString
+      shared[fid] = u
+      let size = (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+      let type = UTType(filenameExtension: u.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+      list.append(["fid": fid, "name": u.lastPathComponent, "size": size, "type": type])
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
+      js("beamNative.share(\(json))")
+    }
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    pageReady = true
+    if !pendingShare.isEmpty {
+      let p = pendingShare
+      pendingShare = []
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.share(p) }
+    }
   }
 
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -70,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
   func buildWindow() {
     let config = WKWebViewConfiguration()
     config.userContentController.add(self, name: "beam")
+    config.userContentController.addScriptMessageHandler(FileReader(self), contentWorld: .page, name: "beamFile")
     config.websiteDataStore = .default()
     if #available(macOS 14.0, *) {
       config.preferences.inactiveSchedulingPolicy = .none // keep running while hidden
@@ -111,6 +190,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     menu.addItem(withTitle: "Quit Beam", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     for item in menu.items where item.action != #selector(NSApplication.terminate(_:)) { item.target = self }
     statusItem.menu = menu
+    // Accept files dropped onto the menu bar icon.
+    statusItem.button?.window?.registerForDraggedTypes([.fileURL])
+    statusItem.button?.window?.delegate = self
   }
 
   @objc func openFromMenu() { showWindow() }
@@ -136,6 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
 
   // Closing the window only hides it; Beam keeps running in the menu bar.
   func windowShouldClose(_ sender: NSWindow) -> Bool {
+    guard sender === window else { return true }
     window.orderOut(nil)
     return false
   }
@@ -173,7 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
 
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { retryLoad() }
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { retryLoad() }
-  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { webView.reload() }
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { pageReady = false; webView.reload() }
 
   func retryLoad() {
     DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in

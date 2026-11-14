@@ -584,6 +584,8 @@ function notify(tag, title, body, actions) {
   }
 }
 window.beamNative = {
+  // Mac app: files from Finder (Services menu, Open With, or dropped on the menu bar icon)
+  share(list) { shareFromDesktop((list || []).map(macFile)); },
   action(tag, act) {
     const t = S.tx.get(tag);
     if (!t) return;
@@ -597,6 +599,15 @@ window.beamNative = {
     for (const t of S.tx.values()) if (t.dir === "in" && id.startsWith(t.tid + ":")) fail(t, "Couldn't save to Downloads");
   },
 };
+// Windows app: files from Explorer arrive as real file handles, so the browser reads them directly.
+if (nativeKind === "windows") {
+  window.chrome.webview.addEventListener("message", async (e) => {
+    if (!e.data || e.data.op !== "share") return;
+    const files = [];
+    for (const h of e.additionalObjects || []) { try { files.push(await h.getFile()); } catch {} }
+    shareFromDesktop(files);
+  });
+}
 function nativeStatus() { if (native) native.postMessage({ op: "status", online: S.online, peers: S.peers.length }); }
 
 // ---------- UI ----------
@@ -644,9 +655,50 @@ function render() {
   $("#empty").innerHTML = S.online
     ? 'Looking for devices…<br><small>Open Beam on another device on this WiFi, or pair one in Settings.</small>'
     : "Connecting…";
-  $("#me").innerHTML = S.pendingText ? "<b>Tap a device to send what you shared</b>" : `Visible as <b>${esc(S.name)}</b> · ${S.nearby ? "Everyone nearby" : "My devices only"}`;
+  $("#me").innerHTML = S.pending ? `<b>Tap a device to send ${esc(pendingLabel())}</b> · <a href="#" id="pcx">cancel</a>` : `Visible as <b>${esc(S.name)}</b> · ${S.nearby ? "Everyone nearby" : "My devices only"}`;
+  const pcx = $("#pcx");
+  if (pcx) pcx.onclick = (e) => { e.preventDefault(); S.pending = null; render(); };
   for (const t of S.tx.values()) if (t.dir === "out") renderRing(t);
   nativeStatus();
+}
+
+function pendingLabel() {
+  const p = S.pending;
+  if (!p) return "";
+  const n = (p.files || []).length;
+  if (!n) return "what you shared";
+  if (n === 1) return p.files[0].name;
+  return n + ((p.files || []).every((f) => /^video\//.test(f.type)) ? " videos" : (p.files || []).every((f) => /^image\//.test(f.type)) ? " photos" : " files");
+}
+
+// Files handed over by the Mac or Windows app ("Send with Beam"): pick a device and go.
+function shareFromDesktop(files) {
+  if (!files.length) return;
+  S.pending = { files };
+  render();
+  if (native) native.postMessage({ op: "show" });
+  const others = S.peers;
+  openSheet(`<h2>Send ${esc(pendingLabel())}</h2>
+    <p>${fmtSize(files.reduce((a, f) => a + f.size, 0))} · tap a device</p>
+    <div class="list">${others.map((p) => `<div class="item"><span>${esc(p.name)} <span class="sub">${S.paired[p.id] ? "My device" : "Nearby"}</span></span><button class="btn primary small" data-to="${p.id}">Send</button></div>`).join("") || '<div class="item"><span class="sub">Looking for devices… they\'ll also appear on the main screen.</span></div>'}</div>
+    <div class="actions"><button class="btn ghost" id="cx">Cancel</button></div>`);
+  $("#cx").onclick = () => { S.pending = null; closeSheet(); render(); };
+  document.querySelectorAll("[data-to]").forEach((b) => (b.onclick = () => chooseWhat(b.dataset.to)));
+}
+
+// A file that lives on the Mac: Beam reads it piece by piece from the Mac app as it sends,
+// so even huge videos never have to be loaded all at once.
+function macFile(f) {
+  const reader = window.webkit.messageHandlers.beamFile;
+  const slice = (a, b) => ({
+    arrayBuffer: async () => {
+      const end = Math.min(b, f.size);
+      if (end <= a) return new ArrayBuffer(0);
+      const b64s = await reader.postMessage({ op: "read", fid: f.fid, off: a, len: end - a });
+      return unb64(b64s).buffer;
+    },
+  });
+  return { name: f.name, size: f.size, type: f.type || "application/octet-stream", slice };
 }
 
 function renderRing(t) {
@@ -758,7 +810,7 @@ $("#sheet").addEventListener("click", (e) => { if (e.target.id === "sheet") clos
 function chooseWhat(peerId) {
   const p = S.peers.find((x) => x.id === peerId);
   if (!p) return;
-  if (S.pendingText) { const v = S.pendingText; S.pendingText = null; render(); return sendItems(p, [], v); }
+  if (S.pending) { const v = S.pending; S.pending = null; closeSheet(); render(); return sendItems(p, v.files || [], v.text || null); }
   openSheet(`<h2>Send to ${esc(p.name)}</h2>
     <div class="big-choice">
       <button class="btn ghost" id="pickFiles">${ICONS.file}Files or photos</button>
@@ -907,7 +959,7 @@ function pairDone(ok, why) {
   await Id.load();
   const q = new URLSearchParams(location.search);
   const shared = [q.get("title"), q.get("text"), q.get("url")].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join("\n");
-  if (shared) { S.pendingText = shared; history.replaceState(null, "", location.pathname + (nativeKind ? "?app=" + nativeKind : "")); }
+  if (shared) { S.pending = { files: [], text: shared }; history.replaceState(null, "", location.pathname + (nativeKind ? "?app=" + nativeKind : "")); }
   if ("serviceWorker" in navigator && !native) navigator.serviceWorker.register("/sw.js").catch(() => {});
   render();
   connect();

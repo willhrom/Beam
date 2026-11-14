@@ -90,6 +90,7 @@ final class Beam {
     running = true;
     connect();
     nearby.refresh();
+    Shortcuts.update(this);
   }
 
   void stop() {
@@ -342,6 +343,9 @@ final class Beam {
   Transfer send(Peer p, List<Transfer.Item> items) {
     Transfer t = new Transfer(this, Crypto.randomId(), false, p.id, p.name, p.kind, prefs.paired.containsKey(p.id), items);
     tx.put(t.tid, t);
+    prefs.sentTo(p.id, p.name, p.kind);
+    Shortcuts.used(app, p.id);
+    Shortcuts.update(this);
     t.startSend();
     changed();
     return t;
@@ -384,6 +388,7 @@ final class Beam {
     } catch (Exception ignored) {}
     notify.refreshStatus(this);
     if (running) nearby.refresh();
+    Shortcuts.update(this);
     changed();
   }
 
