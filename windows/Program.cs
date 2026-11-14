@@ -61,6 +61,7 @@ namespace Beam
                 // Beam is already running: hand it the files (if any) and bring its window up.
                 if (files.Count > 0 || shareText != null)
                 {
+                    AllowSetForegroundWindow(-1); // let the running Beam bring its "Send to…" card to the front
                     try
                     {
                         using var pipe = new NamedPipeClientStream(".", MainForm.PipeName, PipeDirection.Out);
@@ -81,7 +82,8 @@ namespace Beam
 
             bool background = Array.Exists(args, a => a == "--background") || ToastNotificationManagerCompat.WasCurrentProcessToastActivated();
             if (updated) Updater.CleanUp();
-            var form = new MainForm(!background || files.Count > 0 || shareText != null);
+            // Something to send: just the "Send to…" card, not Beam's window.
+            var form = new MainForm(!background && files.Count == 0 && shareText == null);
             if (files.Count > 0 || shareText != null) form.QueueShare(files, shareText);
             if (Array.Exists(args, a => a == "--installed"))
                 form.Balloon("Beam is installed", "Find it in the Start menu. It also starts with Windows and lives here in the tray.");
@@ -95,6 +97,9 @@ namespace Beam
             Application.Run(new ApplicationContext());
             GC.KeepAlive(mutex);
         }
+
+        [DllImport("user32.dll")]
+        static extern bool AllowSetForegroundWindow(int processId);
     }
 
     sealed class MainForm : Form
@@ -106,6 +111,9 @@ namespace Beam
         readonly Uri server = new Uri(Program.Server);
         bool online, quitting, pageReady;
         public bool Busy;
+        public bool SignedIn;
+        public List<DeviceInfo> Devices = new();
+        SharePicker picker;
         readonly ProgressPopup popup = new ProgressPopup();
         readonly Updater updater;
         readonly ToolStripMenuItem updateItem = new ToolStripMenuItem("Check for updates");
@@ -216,7 +224,7 @@ namespace Beam
             {
                 if (!e.IsSuccess) { RetryLater(); return; }
                 pageReady = true;
-                if (shareQueue.Count > 0) { shareTimer?.Stop(); shareTimer?.Start(); }
+                if (shareQueue.Count > 0 || shareTextQueue != null) { shareTimer?.Stop(); shareTimer?.Start(); }
             };
             core.ProcessFailed += (s, e) => { pageReady = false; try { core.Reload(); } catch { } };
             core.Navigate(Program.Server + "/?app=windows");
@@ -351,14 +359,38 @@ namespace Beam
             if (shareTimer == null)
             {
                 shareTimer = new System.Windows.Forms.Timer { Interval = 700 };
-                shareTimer.Tick += (s, e) => { shareTimer.Stop(); FlushShare(); };
+                shareTimer.Tick += (s, e) => { shareTimer.Stop(); OpenPicker(); };
             }
             shareTimer.Stop();
             shareTimer.Start();
-            ShowMain();
         }
 
-        void FlushShare()
+        // Things to send arrived (Share window, right-click, Send to): show the small "Send to…" card.
+        void OpenPicker()
+        {
+            if (shareQueue.Count == 0 && shareTextQueue == null) return;
+            long bytes = 0;
+            foreach (var p in shareQueue) { try { bytes += new FileInfo(p).Length; } catch { } }
+            string what = shareQueue.Count == 1 ? Path.GetFileName(shareQueue[0])
+                : shareQueue.Count > 1 ? $"{shareQueue.Count} items"
+                : Uri.TryCreate(shareTextQueue?.Trim(), UriKind.Absolute, out var u) && (u.Scheme == "http" || u.Scheme == "https") ? "a link" : "some text";
+            if (picker == null || picker.IsDisposed)
+            {
+                picker = new SharePicker();
+                picker.Picked += id => { FlushShare(id); };
+                picker.Cancelled += () => { shareQueue.Clear(); shareTextQueue = null; };
+                picker.OpenBeam += () => { ShowMain(); FlushShare(null); };
+            }
+            picker.SetWhat(what, bytes > 0 ? FormatSize(bytes) : null);
+            picker.SetDevices(Devices, online, SignedIn);
+            picker.ShowNearCursor();
+        }
+
+        static string FormatSize(long n) =>
+            n < 1024 ? n + " B" : n < 1048576 ? (n / 1024) + " KB" : n < 1073741824 ? (n / 1048576.0).ToString("0.0") + " MB" : (n / 1073741824.0).ToString("0.00") + " GB";
+
+        /// <param name="to">The device picked in the "Send to…" card, or null to choose in Beam's window.</param>
+        void FlushShare(string to)
         {
             if (!pageReady || env == null || web.CoreWebView2 == null || (shareQueue.Count == 0 && shareTextQueue == null)) return;
             var handles = new List<object>();
@@ -367,7 +399,7 @@ namespace Beam
                 try { handles.Add(env.CreateWebFileSystemFileHandle(p, CoreWebView2FileSystemHandlePermission.ReadOnly)); } catch { }
             }
             shareQueue.Clear();
-            var msg = JsonSerializer.Serialize(new { op = "share", text = shareTextQueue });
+            var msg = JsonSerializer.Serialize(new { op = "share", text = shareTextQueue, to });
             shareTextQueue = null;
             if (handles.Count > 0) web.CoreWebView2.PostWebMessageAsJson(msg, handles);
             else web.CoreWebView2.PostWebMessageAsJson(msg);
@@ -415,6 +447,7 @@ namespace Beam
         {
             quitting = true;
             popup.Hide();
+            picker?.Close();
             tray.Visible = false;
             foreach (var s in saves.Values) { try { s.stream.Dispose(); File.Delete(s.path); } catch { } }
             Application.Exit();
@@ -449,6 +482,16 @@ namespace Beam
                 case "status":
                     online = d.TryGetProperty("online", out var o) && o.ValueKind == JsonValueKind.True;
                     Busy = d.TryGetProperty("busy", out var bz) && bz.ValueKind == JsonValueKind.True;
+                    SignedIn = d.TryGetProperty("signedIn", out var si) && si.ValueKind == JsonValueKind.True;
+                    if (d.TryGetProperty("devices", out var dv) && dv.ValueKind == JsonValueKind.Array)
+                    {
+                        var list = new List<DeviceInfo>();
+                        foreach (var x in dv.EnumerateArray())
+                            list.Add(new DeviceInfo(x.GetProperty("id").GetString(), x.GetProperty("name").GetString(),
+                                x.TryGetProperty("kind", out var kd) ? kd.GetString() : "web", x.TryGetProperty("mine", out var mn) && mn.ValueKind == JsonValueKind.True));
+                        Devices = list;
+                    }
+                    if (picker != null && !picker.IsDisposed) picker.SetDevices(Devices, online, SignedIn);
                     int peers = d.TryGetProperty("peers", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
                     tray.Text = online ? $"Beam — {peers} device{(peers == 1 ? "" : "s")} nearby" : "Beam — connecting…";
                     break;
@@ -603,7 +646,7 @@ namespace Beam
     static class ShareMenu
     {
         const string PackageName = "Beam.Share", Publisher = "CN=Beam Share";
-        const string PackageVersion = "1.0.1.0"; // keep in step with identity/AppxManifest.xml
+        const string PackageVersion = "1.0.2.0"; // keep in step with identity/AppxManifest.xml
         public enum Status { Missing, Outdated, Current }
 
         static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Beam", "identity");
@@ -679,9 +722,14 @@ namespace Beam
                     if (!ok || !Trusted(cert)) return "Windows didn't give permission, so Beam can't add itself to the Share menu. You can try again from the Beam icon in the tray.";
                 }
 
-                var options = new AddPackageOptions { ExternalLocationUri = new Uri(Installer.Dir + Path.DirectorySeparatorChar) };
+                var options = new AddPackageOptions
+                {
+                    ExternalLocationUri = new Uri(Installer.Dir + Path.DirectorySeparatorChar),
+                    // Beam itself is running with this identity: finish the update when it next restarts.
+                    DeferRegistrationWhenPackagesAreInUse = true,
+                };
                 var result = await new PackageManager().AddPackageByUriAsync(new Uri(msixPath), options);
-                return result.IsRegistered ? null : "Windows said: " + (result.ErrorText ?? "unknown error");
+                return result.IsRegistered || result.ExtendedErrorCode == null ? null : "Windows said: " + (result.ErrorText ?? "unknown error");
             }
             catch (Exception e)
             {
@@ -729,6 +777,261 @@ namespace Beam
                 return null;
             }
         }
+    }
+
+    public record DeviceInfo(string Id, string Name, string Kind, bool Mine);
+
+    /// <summary>
+    /// The small "Send to…" card for things shared from Windows (Share window, right-click,
+    /// Send to): pick a device and it sends, without opening Beam's window.
+    /// </summary>
+    sealed class SharePicker : Form
+    {
+        public event Action<string> Picked;
+        public event Action Cancelled;
+        public event Action OpenBeam;
+        static readonly Color Raised = Color.FromArgb(23, 33, 54), Raised2 = Color.FromArgb(31, 44, 71), Line = Color.FromArgb(42, 55, 82),
+            Paper = Color.FromArgb(237, 242, 250), Dim = Color.FromArgb(147, 161, 184), Signal = Color.FromArgb(92, 200, 255), Beam = Color.FromArgb(47, 107, 255);
+        string what = "", size;
+        List<DeviceInfo> devices = new();
+        bool online, signedIn, done;
+        readonly List<(Rectangle r, string id)> hits = new();
+        Rectangle cancelR, openR;
+        string hover;
+        int focusIndex = -1;
+
+        public SharePicker()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            KeyPreview = true;
+            BackColor = Raised;
+            Text = "Send with Beam";
+            Icon = SystemIcons.Application;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            int round = 2, border = 0x0052372A, dark = 1;
+            try
+            {
+                DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int));
+                DwmSetWindowAttribute(Handle, 34, ref border, sizeof(int));
+                DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int));
+            }
+            catch { }
+        }
+
+        float K => DeviceDpi / 96f;
+        int S(float v) => (int)Math.Round(v * K);
+
+        public void SetWhat(string newWhat, string newSize) { what = newWhat; size = newSize; done = false; Relayout(); }
+
+        public void SetDevices(List<DeviceInfo> list, bool isOnline, bool isSignedIn)
+        {
+            devices = list ?? new();
+            online = isOnline;
+            signedIn = isSignedIn;
+            if (IsHandleCreated) Relayout();
+        }
+
+        public void ShowNearCursor()
+        {
+            if (!IsHandleCreated) CreateHandle();
+            Relayout();
+            var area = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Location = new Point(area.Left + (area.Width - Width) / 2, area.Top + (int)((area.Height - Height) * 0.4));
+            if (!Visible) Show();
+            Activate();
+            SetForegroundWindow(Handle);
+        }
+
+        const int Cols = 4;
+        void Relayout()
+        {
+            if (!IsHandleCreated) return;
+            int pad = S(20), tileW = S(92), tileH = S(104), gap = S(6);
+            int cols = Math.Max(1, Math.Min(Cols, devices.Count));
+            int w = Math.Max(S(340), pad * 2 + cols * tileW + (cols - 1) * gap);
+            int rows = devices.Count == 0 ? 0 : (devices.Count + Cols - 1) / Cols;
+            int top = S(78);
+            int body = rows == 0 ? S(64) : rows * tileH + (rows - 1) * gap;
+            int h = top + body + S(66);
+            hits.Clear();
+            int rowW = cols * tileW + (cols - 1) * gap, x0 = (w - rowW) / 2;
+            for (int i = 0; i < devices.Count; i++)
+                hits.Add((new Rectangle(x0 + (i % Cols) * (tileW + gap), top + (i / Cols) * (tileH + gap), tileW, tileH), devices[i].Id));
+            cancelR = new Rectangle(w - pad - S(84), h - S(50), S(84), S(34));
+            openR = new Rectangle(pad - S(8), h - S(50), S(120), S(34));
+            if (Size != new Size(w, h))
+            {
+                var c = Visible ? new Point(Left + Width / 2, Top + Height / 2) : Point.Empty;
+                Size = new Size(w, h);
+                if (Visible) Location = new Point(c.X - w / 2, c.Y - h / 2);
+            }
+            Invalidate();
+        }
+
+        static string Glyph(string kind) => kind switch
+        {
+            "android" or "iphone" => "",
+            "mac" or "chromebook" => "",
+            "windows" => "",
+            "ipad" => "",
+            _ => "",
+        };
+
+        static Font IconFont(float px)
+        {
+            foreach (var name in new[] { "Segoe Fluent Icons", "Segoe MDL2 Assets" })
+            {
+                var f = new Font(name, px, FontStyle.Regular, GraphicsUnit.Pixel);
+                if (f.Name == name) return f;
+                f.Dispose();
+            }
+            return new Font("Segoe UI Symbol", px, FontStyle.Regular, GraphicsUnit.Pixel);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            g.Clear(Raised);
+            int pad = S(20);
+            using var h1 = new Font("Segoe UI Semibold", 16 * K, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var body = new Font("Segoe UI", 13 * K, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var bold = new Font("Segoe UI Semibold", 13 * K, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var small = new Font("Segoe UI", 11.5f * K, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var paper = new SolidBrush(Paper);
+            using var dim = new SolidBrush(Dim);
+            using var one = new StringFormat(StringFormatFlags.NoWrap) { Trimming = StringTrimming.EllipsisCharacter };
+            using var center = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
+            using var mid = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+
+            g.DrawString("Send " + what, h1, paper, new RectangleF(pad, S(18), Width - pad * 2, S(24)), one);
+            g.DrawString(size != null ? size + ". Choose a device." : "Choose a device.", body, dim, new RectangleF(pad, S(44), Width - pad * 2, S(20)), one);
+
+            if (devices.Count == 0)
+            {
+                string msg = !signedIn && online ? "Sign in to Beam to send." : !online ? "Connecting to Beam…" : "Looking for devices…";
+                g.DrawString(msg, body, dim, new RectangleF(pad, S(78), Width - pad * 2, S(56)), mid);
+            }
+            using var iconFont = IconFont(25 * K);
+            for (int i = 0; i < hits.Count && i < devices.Count; i++)
+            {
+                var (r, id) = hits[i];
+                var d = devices[i];
+                bool hot = hover == id || focusIndex == i;
+                float dia = S(60);
+                var circle = new RectangleF(r.X + (r.Width - dia) / 2, r.Y + S(4), dia, dia);
+                using (var fill = new SolidBrush(hot ? Raised2 : Color.FromArgb(19, 28, 46))) g.FillEllipse(fill, circle);
+                using (var ring = new Pen(hot ? Signal : d.Mine ? Color.FromArgb(140, Signal) : Line, S(1.5f))) g.DrawEllipse(ring, circle);
+                g.DrawString(Glyph(d.Kind), iconFont, paper, circle, mid);
+                g.DrawString(d.Name, bold, paper, new RectangleF(r.X, circle.Bottom + S(8), r.Width, S(18)), center);
+                using var tag = new SolidBrush(d.Mine ? Signal : Dim);
+                g.DrawString(d.Mine ? "My device" : "Nearby", small, tag, new RectangleF(r.X, circle.Bottom + S(26), r.Width, S(16)), center);
+            }
+
+            // footer
+            using (var line = new Pen(Line, 1)) g.DrawLine(line, 0, Height - S(64), Width, Height - S(64));
+            using (var link = new SolidBrush(hover == "open" ? Paper : Signal))
+                g.DrawString("Open Beam", bold, link, openR, mid);
+            using (var path = Pill(cancelR, S(8)))
+            {
+                using var b = new SolidBrush(hover == "cancel" ? Raised2 : Raised);
+                g.FillPath(b, path);
+                using var p = new Pen(Line, 1);
+                g.DrawPath(p, path);
+            }
+            g.DrawString("Cancel", bold, paper, cancelR, mid);
+        }
+
+        static GraphicsPath Pill(Rectangle r, int radius)
+        {
+            var p = new GraphicsPath();
+            int d = radius * 2;
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        string HitTest(Point pt)
+        {
+            foreach (var (r, id) in hits) if (r.Contains(pt)) return id;
+            if (cancelR.Contains(pt)) return "cancel";
+            if (openR.Contains(pt)) return "open";
+            return null;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            var h = HitTest(e.Location);
+            if (h != hover) { hover = h; Cursor = h != null ? Cursors.Hand : Cursors.Default; Invalidate(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e) { hover = null; Invalidate(); }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            var h = HitTest(e.Location);
+            if (h == "cancel") Finish(null);
+            else if (h == "open") { done = true; Hide(); OpenBeam?.Invoke(); }
+            else if (h != null) Finish(h);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape) { Finish(null); return; }
+            if (devices.Count == 0) return;
+            if (e.KeyCode == Keys.Right || e.KeyCode == Keys.Tab) focusIndex = (focusIndex + 1) % devices.Count;
+            else if (e.KeyCode == Keys.Left) focusIndex = (focusIndex - 1 + devices.Count) % devices.Count;
+            else if ((e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && focusIndex >= 0) { Finish(devices[focusIndex].Id); return; }
+            else return;
+            Invalidate();
+        }
+
+        protected override bool ProcessDialogKey(Keys keyData)
+        {
+            if (keyData == Keys.Tab) { OnKeyDown(new KeyEventArgs(Keys.Tab)); return true; }
+            return base.ProcessDialogKey(keyData);
+        }
+
+        // Clicking somewhere else cancels, like a menu.
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            if (Visible && !done) Finish(null);
+        }
+
+        void Finish(string id)
+        {
+            if (done) return;
+            done = true;
+            Hide();
+            focusIndex = -1;
+            if (id != null) Picked?.Invoke(id);
+            else Cancelled?.Invoke();
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Finish(null); return; }
+            base.OnFormClosing(e);
+        }
+
+        [DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        [DllImport("user32.dll")]
+        static extern bool SetForegroundWindow(IntPtr hWnd);
     }
 
     /// <summary>

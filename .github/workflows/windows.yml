@@ -31,6 +31,11 @@ jobs:
           $pfx = Join-Path $env:RUNNER_TEMP "share.pfx"
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
           New-Item -ItemType Directory -Force windows\identity-out | Out-Null
+          # Index the icons (every size Windows asks for), so the Share window can show Beam's icon.
+          & "$($kit.FullName)\makepri.exe" createconfig /cf "$env:RUNNER_TEMP\priconfig.xml" /dq en-US /pv 10.0.0 /o
+          if ($LASTEXITCODE) { exit 1 }
+          & "$($kit.FullName)\makepri.exe" new /pr windows\identity /cf "$env:RUNNER_TEMP\priconfig.xml" /mn windows\identity\AppxManifest.xml /of windows\identity\resources.pri /o
+          if ($LASTEXITCODE) { exit 1 }
           & "$($kit.FullName)\makeappx.exe" pack /d windows\identity /p windows\identity-out\Beam.Share.msix /nv /o
           if ($LASTEXITCODE) { exit 1 }
           & "$($kit.FullName)\signtool.exe" sign /fd SHA256 /f $pfx /p $env:PFX_PASSWORD /tr http://timestamp.digicert.com /td SHA256 windows\identity-out\Beam.Share.msix

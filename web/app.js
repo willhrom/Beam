@@ -667,13 +667,17 @@ if (nativeKind === "windows") {
     if (!e.data || e.data.op !== "share") return;
     const files = [];
     for (const h of e.additionalObjects || []) { try { files.push(await h.getFile()); } catch {} }
-    shareFromDesktop(files, e.data.text || null);
+    shareFromDesktop(files, e.data.text || null, e.data.to || null);
   });
 }
 function nativeStatus() {
   if (!native) return;
   const busy = [...S.tx.values()].some((t) => !["done", "failed", "asking"].includes(t.state));
-  native.postMessage({ op: "status", online: S.online, peers: S.peers.length, busy });
+  const peers = S.peers.map((p) => ({ id: p.id, name: p.name, kind: p.kind, mine: !!p.mine || (!!S.paired[p.id] && S.paired[p.id].pub === p.pub) }));
+  const key = JSON.stringify([S.online, !!S.user, busy, peers]);
+  if (key === nativeStatus.last) return;
+  nativeStatus.last = key;
+  native.postMessage({ op: "status", online: S.online, signedIn: !!S.user, peers: S.peers.length, devices: peers, busy });
 }
 
 // A small progress card in the corner of the screen (Mac and Windows apps), and the tab title in browsers.
@@ -790,8 +794,13 @@ function pendingLabel() {
 }
 
 // Files handed over by the Mac or Windows app ("Send with Beam"): pick a device and go.
-function shareFromDesktop(files, text) {
+function shareFromDesktop(files, text, to) {
   if (!files.length && !text) return;
+  // Picked from the app's quick "Send to…" card: send straight away, no need to open Beam.
+  if (to) {
+    const peer = S.peers.find((p) => p.id === to);
+    if (peer) { S.pending = null; render(); sendItems(peer, files, text || null); return; }
+  }
   S.pending = { files, text: text || null };
   render();
   if (native) native.postMessage({ op: "show" });
