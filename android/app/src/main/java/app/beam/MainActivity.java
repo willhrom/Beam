@@ -93,6 +93,7 @@ public class MainActivity extends Activity implements Beam.Listener {
   @Override protected void onResume() {
     super.onResume();
     beam.listeners.add(this);
+    beam.start(); // always connected while Beam is open, whatever the background setting
     beam.kick();
     beam.nearby.discover(true);
     render();
@@ -104,6 +105,20 @@ public class MainActivity extends Activity implements Beam.Listener {
   @Override protected void onDestroy() {
     if (signInDialog != null) { signInDialog.dismiss(); signInDialog = null; }
     super.onDestroy();
+  }
+
+  @Override protected void onStop() {
+    super.onStop();
+    // Not staying reachable in the background: disconnect once the screen is closed and nothing is moving.
+    if (!beam.prefs.enabled && !BeamService.running) stopWhenIdle();
+  }
+
+  private void stopWhenIdle() {
+    beam.main.postDelayed(() -> {
+      if (beam.prefs.enabled || BeamService.running || hasWindowFocus()) return;
+      for (Transfer t : beam.tx.values()) if (t.active() && !Transfer.ASKING.equals(t.state)) { stopWhenIdle(); return; }
+      beam.stop();
+    }, 5000);
   }
 
   @Override protected void onPause() {
@@ -167,10 +182,10 @@ public class MainActivity extends Activity implements Beam.Listener {
           .setPositiveButton("Install", (d, w) -> startActivity(new Intent(this, UpdateActivity.class)))
           .setNegativeButton("Later", null).show();
     }
-    status.setText(!beam.prefs.enabled ? "Off — turn on in Settings"
-        : beam.needLogin ? "Sign in to use Beam"
+    status.setText(beam.needLogin ? "Sign in to use Beam"
         : !beam.online ? (beam.nearby.usable() ? "No internet · offline sharing with nearby phones" : "Connecting…")
-        : "Visible as " + beam.prefs.name + " · " + (beam.prefs.nearby ? "Everyone nearby" : "My devices only"));
+        : "Visible as " + beam.prefs.name + " · " + (beam.prefs.nearby ? "Everyone nearby" : "My devices only")
+          + (beam.prefs.enabled ? "" : "\nOnly while Beam is open. To receive when it's closed, turn on \"Stay reachable\" in Settings."));
 
     // peers (rebuilt only when something about them changed)
     StringBuilder key = new StringBuilder();
@@ -480,7 +495,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     name.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
     l.addView(label("Device name"));
     l.addView(name);
-    Switch on = sw("Run in the background", beam.prefs.enabled);
+    Switch on = sw("Stay reachable when Beam is closed", beam.prefs.enabled);
     Switch nb = sw("Everyone nearby can see me", beam.prefs.nearby);
     Switch aa = sw("Auto-accept from my devices", beam.prefs.autoAccept);
     l.addView(on);

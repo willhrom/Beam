@@ -31,9 +31,9 @@ public class BeamService extends Service implements Beam.Listener {
     }
   }
 
+  /** Stops staying reachable in the background. Beam keeps working while its screen is open. */
   static void stop(Context c) {
     c.stopService(new Intent(c, BeamService.class));
-    Beam.get(c).stop();
   }
 
   @Override public void onCreate() {
