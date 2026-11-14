@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Linq;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -90,13 +91,14 @@ namespace Beam
 
     sealed class MainForm : Form
     {
-        readonly WebView2 web = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(11, 13, 18) };
+        readonly WebView2 web = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(15, 22, 38) };
         readonly NotifyIcon tray = new NotifyIcon();
         readonly ToolStripMenuItem startupItem = new ToolStripMenuItem("Start with Windows");
         readonly Dictionary<string, (FileStream stream, string path)> saves = new();
         readonly Uri server = new Uri(Program.Server);
         bool online, quitting, pageReady;
         public bool Busy;
+        readonly ProgressPopup popup = new ProgressPopup();
         readonly Updater updater;
         readonly ToolStripMenuItem updateItem = new ToolStripMenuItem("Check for updates");
         CoreWebView2Environment env;
@@ -112,7 +114,7 @@ namespace Beam
             ClientSize = new Size(440, 680);
             MinimumSize = new Size(360, 500);
             StartPosition = FormStartPosition.CenterScreen;
-            BackColor = Color.FromArgb(11, 13, 18);
+            BackColor = Color.FromArgb(15, 22, 38);
             Icon = LoadIcon();
             ShowInTaskbar = true;
             Controls.Add(web);
@@ -149,6 +151,7 @@ namespace Beam
             InstallExplorerMenus();
             StartPipeServer();
             ListenForQuit();
+            popup.Clicked += ShowMain;
             updater = new Updater(this);
             updater.Start();
 
@@ -354,6 +357,7 @@ namespace Beam
         public void Quit()
         {
             quitting = true;
+            popup.Hide();
             tray.Visible = false;
             foreach (var s in saves.Values) { try { s.stream.Dispose(); File.Delete(s.path); } catch { } }
             Application.Exit();
@@ -391,6 +395,16 @@ namespace Beam
                     int peers = d.TryGetProperty("peers", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
                     tray.Text = online ? $"Beam — {peers} device{(peers == 1 ? "" : "s")} nearby" : "Beam — connecting…";
                     break;
+                case "progress":
+                {
+                    bool showIt = d.TryGetProperty("show", out var sh) && sh.ValueKind == JsonValueKind.True;
+                    double frac = d.TryGetProperty("pct", out var pv) && pv.ValueKind == JsonValueKind.Number ? pv.GetDouble() : 0;
+                    int hold = d.TryGetProperty("hold", out var hv) && hv.ValueKind == JsonValueKind.Number ? hv.GetInt32() : 0;
+                    // Beam's own window already shows progress when it's in front.
+                    bool inFront = Visible && WindowState != FormWindowState.Minimized && Form.ActiveForm == this;
+                    popup.Set(showIt && !inFront, Str("title"), Str("detail"), frac, Str("state") ?? "active", Str("dir") ?? "in", hold);
+                    break;
+                }
                 case "notify":
                     Notify(Str("tag") ?? "", Str("title") ?? "Beam", Str("body") ?? "",
                         d.TryGetProperty("actions", out var a) && a.ValueKind == JsonValueKind.True);
@@ -523,6 +537,170 @@ namespace Beam
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid id, uint flags, IntPtr token, out string path);
     }
+    /// <summary>
+    /// A small card in the lower-right corner of the screen showing a transfer's progress
+    /// while Beam's window isn't in front. It never takes focus; clicking it opens Beam.
+    /// </summary>
+    sealed class ProgressPopup : Form
+    {
+        string title = "", detail = "", state = "active", dir = "in";
+        double pct;
+        bool regionCorners;
+        readonly System.Windows.Forms.Timer hideTimer = new System.Windows.Forms.Timer();
+        public event Action Clicked;
+
+        public ProgressPopup()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            BackColor = Color.FromArgb(23, 33, 54);
+            Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            hideTimer.Tick += (s, e) => { hideTimer.Stop(); Hide(); };
+        }
+
+        protected override bool ShowWithoutActivation => true;
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008; // never activate, no taskbar button, always on top
+                return cp;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            // Windows 11 rounds the corners and draws the border for us; older versions get a clipped shape.
+            int round = 2, border = 0x0052372A;
+            try
+            {
+                regionCorners = DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int)) != 0;
+                DwmSetWindowAttribute(Handle, 34, ref border, sizeof(int));
+            }
+            catch { regionCorners = true; }
+        }
+
+        float K => DeviceDpi / 96f;
+
+        public void Set(bool show, string newTitle, string newDetail, double fraction, string newState, string newDir, int holdMs)
+        {
+            hideTimer.Stop();
+            bool ended = newState == "done" || newState == "failed";
+            if (!show || (ended && holdMs <= 0)) { Hide(); return; }
+            title = newTitle ?? "";
+            detail = newDetail ?? "";
+            pct = Math.Max(0, Math.Min(1, fraction));
+            state = newState;
+            dir = newDir;
+            var area = Screen.PrimaryScreen.WorkingArea;
+            int w = (int)(332 * K), h = (int)(78 * K), m = (int)(14 * K);
+            Bounds = new Rectangle(area.Right - w - m, area.Bottom - h - m, w, h);
+            if (regionCorners)
+            {
+                using var path = new GraphicsPath();
+                int r = (int)(20 * K);
+                path.AddArc(0, 0, r, r, 180, 90);
+                path.AddArc(w - r, 0, r, r, 270, 90);
+                path.AddArc(w - r, h - r, r, r, 0, 90);
+                path.AddArc(0, h - r, r, r, 90, 90);
+                path.CloseFigure();
+                Region = new Region(path);
+            }
+            if (!Visible) Show();
+            Invalidate();
+            if (ended) { hideTimer.Interval = Math.Max(500, holdMs); hideTimer.Start(); }
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            base.OnMouseClick(e);
+            Hide();
+            Clicked?.Invoke();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            float k = K;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            g.Clear(BackColor);
+            Color accent = state == "done" ? Color.FromArgb(74, 222, 154)
+                : state == "failed" ? Color.FromArgb(255, 123, 123)
+                : state == "paused" ? Color.FromArgb(147, 161, 184)
+                : Color.FromArgb(92, 200, 255);
+
+            // round badge with an arrow (down = receiving, up = sending), tick, cross or pause
+            float pad = 14 * k, d = 36 * k;
+            var badge = new RectangleF(pad, 13 * k, d, d);
+            using (var b = new SolidBrush(Color.FromArgb(38, accent))) g.FillEllipse(b, badge);
+            using (var pen = new Pen(accent, 2.2f * k) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+            {
+                float cx = badge.X + d / 2, cy = badge.Y + d / 2, a = 6.5f * k;
+                if (state == "done")
+                    g.DrawLines(pen, new[] { new PointF(cx - a, cy + a * 0.1f), new PointF(cx - a * 0.3f, cy + a * 0.75f), new PointF(cx + a, cy - a * 0.65f) });
+                else if (state == "failed")
+                {
+                    g.DrawLine(pen, cx - a * 0.7f, cy - a * 0.7f, cx + a * 0.7f, cy + a * 0.7f);
+                    g.DrawLine(pen, cx + a * 0.7f, cy - a * 0.7f, cx - a * 0.7f, cy + a * 0.7f);
+                }
+                else if (state == "paused")
+                {
+                    g.DrawLine(pen, cx - a * 0.45f, cy - a * 0.75f, cx - a * 0.45f, cy + a * 0.75f);
+                    g.DrawLine(pen, cx + a * 0.45f, cy - a * 0.75f, cx + a * 0.45f, cy + a * 0.75f);
+                }
+                else
+                {
+                    float s = dir == "out" ? -1 : 1;
+                    g.DrawLine(pen, cx, cy - a * s, cx, cy + a * s);
+                    g.DrawLines(pen, new[] { new PointF(cx - a * 0.75f, cy + a * 0.25f * s), new PointF(cx, cy + a * s), new PointF(cx + a * 0.75f, cy + a * 0.25f * s) });
+                }
+            }
+
+            float left = badge.Right + 12 * k, right = ClientSize.Width - pad;
+            using var titleFont = new Font("Segoe UI Semibold", 13.5f * k, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var smallFont = new Font("Segoe UI", 12.5f * k, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var paper = new SolidBrush(Color.FromArgb(237, 242, 250));
+            using var dim = new SolidBrush(Color.FromArgb(147, 161, 184));
+            using var oneLine = new StringFormat(StringFormatFlags.NoWrap) { Trimming = StringTrimming.EllipsisCharacter };
+            using var farRight = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Far };
+            bool running = state == "active" || state == "paused";
+            float pctWidth = running ? g.MeasureString("100%", smallFont).Width + 4 * k : 0;
+            g.DrawString(title, titleFont, paper, new RectangleF(left, 11 * k, right - left - pctWidth, 20 * k), oneLine);
+            if (running) g.DrawString((int)Math.Floor(pct * 100) + "%", smallFont, dim, new RectangleF(right - pctWidth, 12.5f * k, pctWidth, 20 * k), farRight);
+            g.DrawString(detail, smallFont, dim, new RectangleF(left, 31 * k, right - left, 18 * k), oneLine);
+
+            // progress bar
+            var track = new RectangleF(left + 2 * k, ClientSize.Height - 18 * k, right - left - 2 * k, 4 * k);
+            using (var trackBrush = new SolidBrush(Color.FromArgb(30, 255, 255, 255))) FillPill(g, trackBrush, track);
+            float fill = (float)(track.Width * pct);
+            if (fill >= track.Height)
+            {
+                using var fillBrush = new SolidBrush(accent);
+                FillPill(g, fillBrush, new RectangleF(track.X, track.Y, fill, track.Height));
+            }
+        }
+
+        static void FillPill(Graphics g, Brush brush, RectangleF r)
+        {
+            using var p = new GraphicsPath();
+            float d = r.Height;
+            p.AddArc(r.X, r.Y, d, d, 90, 180);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 180);
+            p.CloseFigure();
+            g.FillPath(brush, p);
+        }
+
+        [DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    }
+
     /// <summary>
     /// Keeps Beam up to date: checks the latest release every few hours, downloads it in the
     /// background, and swaps it in (a quick restart) when no transfer is running.

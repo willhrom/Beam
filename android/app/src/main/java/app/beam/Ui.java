@@ -15,8 +15,9 @@ import android.widget.TextView;
 
 /** Small helpers for building the screens in code. */
 final class Ui {
-  static final int BG = 0xFF0B0D12, CARD = 0xFF161A22, LINE = 0xFF262C38, TEXT = 0xFFEEF1F6, DIM = 0xFF8B93A3,
-      ACCENT = 0xFF3B82F6, ACCENT2 = 0xFF22D3EE, GOOD = 0xFF34D399, BAD = 0xFFF87171;
+  // The same palette as the web and desktop apps.
+  static final int BG = 0xFF0F1626, CARD = 0xFF172136, LINE = 0xFF2A3752, TEXT = 0xFFEDF2FA, DIM = 0xFF93A1B8,
+      ACCENT = 0xFF2F6BFF, ACCENT2 = 0xFF5CC8FF, GOOD = 0xFF4ADE9A, BAD = 0xFFFF7B7B;
 
   static int dp(Context c, float v) {
     return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, c.getResources().getDisplayMetrics()));

@@ -84,6 +84,7 @@ final class Transfer {
 
   volatile Route route;
   private Route pumpRoute;
+  private volatile Route rxStartedOn; // the sender has begun sending on this route
   private final Object lock = new Object();
   private long lastUi, pausedAt;
   private boolean everOpen, discovering;
@@ -172,11 +173,25 @@ final class Transfer {
     state = RECEIVING;
     pausedAt = 0;
     ui();
-    String from;
-    synchronized (this) {
-      from = curDone ? "{\"t\":\"from\",\"i\":" + (cur + 1) + ",\"off\":0}" : "{\"t\":\"from\",\"i\":" + cur + ",\"off\":" + got + "}";
-    }
-    try { r.sendText(from); } catch (IOException e) { routeDropped(r); }
+    try { r.sendText(fromMessage()); } catch (IOException e) { routeDropped(r); }
+  }
+
+  private synchronized String fromMessage() {
+    return curDone ? "{\"t\":\"from\",\"i\":" + (cur + 1) + ",\"off\":0}" : "{\"t\":\"from\",\"i\":" + cur + ",\"off\":" + got + "}";
+  }
+
+  /** Repeat "start here" if the sender hasn't begun: the first message on a new connection can get lost. */
+  private void resendFrom(Route r) {
+    if (route != r || !active() || rxStartedOn == r) return;
+    try { r.sendText(fromMessage()); } catch (IOException ignored) {}
+  }
+
+  private void retryFrom(final Route r, final int n) {
+    beam.main.postDelayed(() -> {
+      if (route != r || !active() || rxStartedOn == r || n >= 6) return;
+      resendFrom(r);
+      retryFrom(r, n + 1);
+    }, 1500);
   }
 
   /** Makes `r` the current route, releasing the old one. */
@@ -281,6 +296,7 @@ final class Transfer {
       case "file": {
         int i = m.optInt("i", -1);
         long off = m.optLong("off", 0);
+        rxStartedOn = r;
         if (i == cur && !curDone && off == got) return; // resuming the same file
         if (!(curDone && i == cur + 1 && off == 0 && i < items.size())) throw new IOException("Bad data");
         cur = i;
@@ -610,7 +626,10 @@ final class Transfer {
     c.dc.registerObserver(new DataChannel.Observer() {
       public void onBufferedAmountChange(long previous) { synchronized (lock) { lock.notifyAll(); } }
       public void onStateChange() {
-        if (c.dc.state() == DataChannel.State.CLOSED) beam.main.post(() -> routeDropped(c));
+        DataChannel.State st = c.dc.state();
+        if (st == DataChannel.State.CLOSED) beam.main.post(() -> routeDropped(c));
+        // Tell the receiver we're listening, in case its first message was sent before we could hear it.
+        else if (st == DataChannel.State.OPEN) beam.main.post(() -> { try { if (route == c) c.sendText("{\"t\":\"ready\"}"); } catch (IOException ignored) {} });
         synchronized (lock) { lock.notifyAll(); }
       }
       public void onMessage(DataChannel.Buffer b) {
@@ -754,7 +773,9 @@ final class Transfer {
             b.data.get(bytes);
             rxBytes(c, bytes, 0, bytes.length);
           } else {
-            rxControl(new JSONObject(text(b)), c);
+            JSONObject m = new JSONObject(text(b));
+            if ("ready".equals(m.optString("t"))) beam.main.post(() -> resendFrom(c));
+            else rxControl(m, c);
           }
         } catch (Stopped s) {
           // old route
@@ -771,6 +792,7 @@ final class Transfer {
     if (route != c || !active() || c.sentFrom) return;
     c.sentFrom = true;
     sendFromOver(c);
+    retryFrom(c, 0);
   }
 
   // =====================================================================================

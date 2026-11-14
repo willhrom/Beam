@@ -105,6 +105,99 @@ final class Updater {
   }
 }
 
+/// A small card in the lower-right corner of the screen showing a transfer's progress
+/// while Beam's window isn't in front. It never takes focus; clicking it opens Beam.
+final class ProgressPopup {
+  final class Card: NSVisualEffectView {
+    var onClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onClick?() }
+  }
+
+  let panel: NSPanel
+  let icon = NSImageView()
+  let title = NSTextField(labelWithString: "")
+  let detail = NSTextField(labelWithString: "")
+  let percent = NSTextField(labelWithString: "")
+  let bar = NSProgressIndicator()
+  var hideWork: DispatchWorkItem?
+
+  init(onClick: @escaping () -> Void) {
+    let w: CGFloat = 324, h: CGFloat = 78
+    panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+    panel.level = .statusBar
+    panel.isOpaque = false
+    panel.backgroundColor = .clear
+    panel.hasShadow = true
+    panel.hidesOnDeactivate = false
+    panel.isReleasedWhenClosed = false
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+    panel.appearance = NSAppearance(named: .darkAqua)
+
+    let card = Card(frame: NSRect(x: 0, y: 0, width: w, height: h))
+    card.material = .hudWindow
+    card.blendingMode = .behindWindow
+    card.state = .active
+    card.wantsLayer = true
+    card.layer?.cornerRadius = 14
+    card.layer?.masksToBounds = true
+    card.onClick = { [weak self] in
+      self?.panel.orderOut(nil)
+      onClick()
+    }
+
+    icon.frame = NSRect(x: 14, y: 30, width: 34, height: 34)
+    icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 27, weight: .medium)
+    title.frame = NSRect(x: 60, y: 46, width: w - 60 - 62, height: 18)
+    title.font = .systemFont(ofSize: 13, weight: .semibold)
+    title.lineBreakMode = .byTruncatingMiddle
+    percent.frame = NSRect(x: w - 62, y: 46, width: 48, height: 17)
+    percent.alignment = .right
+    percent.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+    percent.textColor = .secondaryLabelColor
+    detail.frame = NSRect(x: 60, y: 28, width: w - 74, height: 16)
+    detail.font = .systemFont(ofSize: 12)
+    detail.textColor = .secondaryLabelColor
+    detail.lineBreakMode = .byTruncatingTail
+    bar.frame = NSRect(x: 60, y: 11, width: w - 74, height: 10)
+    bar.style = .bar
+    bar.controlSize = .small
+    bar.isIndeterminate = false
+    bar.minValue = 0
+    bar.maxValue = 1
+    let parts: [NSView] = [icon, title, percent, detail, bar]
+    for part in parts { card.addSubview(part) }
+    panel.contentView = card
+  }
+
+  func set(show: Bool, title newTitle: String, detail newDetail: String, pct: Double, state: String, dir: String, hold: Int) {
+    hideWork?.cancel()
+    let ended = state == "done" || state == "failed"
+    if !show || (ended && hold <= 0) {
+      panel.orderOut(nil)
+      return
+    }
+    let fraction = max(0, min(1, pct.isFinite ? pct : 0))
+    title.stringValue = newTitle
+    detail.stringValue = newDetail
+    bar.doubleValue = fraction
+    percent.stringValue = ended ? "" : "\(Int(fraction * 100))%"
+    let symbol = state == "done" ? "checkmark.circle.fill" : state == "failed" ? "exclamationmark.circle.fill"
+      : state == "paused" ? "pause.circle.fill" : dir == "out" ? "arrow.up.circle.fill" : "arrow.down.circle.fill"
+    icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+    icon.contentTintColor = state == "done" ? .systemGreen : state == "failed" ? .systemRed
+      : state == "paused" ? .secondaryLabelColor : NSColor(red: 0.36, green: 0.78, blue: 1, alpha: 1)
+    if let area = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame {
+      panel.setFrameOrigin(NSPoint(x: area.maxX - panel.frame.width - 16, y: area.minY + 16))
+    }
+    panel.orderFrontRegardless()
+    if ended {
+      let work = DispatchWorkItem { [weak self] in self?.panel.orderOut(nil) }
+      hideWork = work
+      DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(500, hold)), execute: work)
+    }
+  }
+}
+
 // Lets the page read a shared Finder file piece by piece (so big videos never load all at once).
 final class FileReader: NSObject, WKScriptMessageHandlerWithReply {
   weak var app: AppDelegate?
@@ -134,6 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
   var shared: [String: URL] = [:]   // files handed to Beam from Finder, by id
   var busy = false                   // a transfer is running (don't restart for an update)
   lazy var updater = Updater(self)
+  lazy var popup = ProgressPopup(onClick: { [weak self] in self?.showWindow() })
   var pendingShare: [URL] = []
   var pageReady = false
   var statusItem: NSStatusItem!
@@ -262,7 +356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
                       backing: .buffered, defer: false)
     window.title = "Beam"
     window.titlebarAppearsTransparent = true
-    window.backgroundColor = NSColor(red: 0.043, green: 0.051, blue: 0.071, alpha: 1)
+    window.backgroundColor = NSColor(red: 0.059, green: 0.086, blue: 0.149, alpha: 1)
     window.appearance = NSAppearance(named: .darkAqua)
     window.isReleasedWhenClosed = false
     window.minSize = NSSize(width: 340, height: 480)
@@ -381,6 +475,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
       busy = d["busy"] as? Bool ?? false
       statusItem.button?.appearsDisabled = !online
       statusItem.button?.toolTip = online ? "Beam — \(d["peers"] as? Int ?? 0) devices nearby" : "Beam — connecting…"
+    case "progress":
+      // Beam's own window already shows progress when it's in front.
+      let inFront = window.isVisible && NSApp.isActive && window.isKeyWindow
+      popup.set(show: (d["show"] as? Bool ?? false) && !inFront,
+                title: d["title"] as? String ?? "", detail: d["detail"] as? String ?? "",
+                pct: (d["pct"] as? NSNumber)?.doubleValue ?? 0,
+                state: d["state"] as? String ?? "active", dir: d["dir"] as? String ?? "in",
+                hold: (d["hold"] as? NSNumber)?.intValue ?? 0)
     case "notify":
       notify(tag: d["tag"] as? String ?? "", title: d["title"] as? String ?? "Beam", body: d["body"] as? String ?? "", request: d["actions"] as? Bool ?? false)
     case "unnotify":

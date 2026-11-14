@@ -100,6 +100,11 @@ public class MainActivity extends Activity implements Beam.Listener {
     for (Transfer t : beam.tx.values()) if (t.incoming && Transfer.ASKING.equals(t.state)) { showIncoming(t); break; }
   }
 
+  @Override protected void onDestroy() {
+    if (signInDialog != null) { signInDialog.dismiss(); signInDialog = null; }
+    super.onDestroy();
+  }
+
   @Override protected void onPause() {
     super.onPause();
     beam.listeners.remove(this);
@@ -464,45 +469,151 @@ public class MainActivity extends Activity implements Beam.Listener {
   }
 
   // ---------- signing in ----------
-  private AlertDialog signInDialog;
+  // A full screen of its own: nothing else in Beam works until it's done.
+  private android.app.Dialog signInDialog;
+  private String signInMode, signInCta;
+  private TextView signInError;
+  private android.widget.Button signInGo;
 
-  /** mode: "signin", "invite" or "setup" (null = pick the right one). */
+  /** mode: "signin", "invite" or "setup" (null = whichever applies). */
   private void showSignIn(String mode) {
-    if (signInDialog != null) { signInDialog.setOnDismissListener(null); signInDialog.dismiss(); signInDialog = null; }
-    if (!beam.needLogin) return;
-    if (mode == null) mode = beam.needSetup ? "setup" : "signin";
+    if (!beam.needLogin) {
+      if (signInDialog != null) { signInDialog.dismiss(); signInDialog = null; }
+      return;
+    }
+    if (mode == null) mode = beam.needSetup ? "setup" : signInMode != null && !"setup".equals(signInMode) ? signInMode : "signin";
+    // Same screen already showing (an error came back, or we reconnected): keep what was typed.
+    if (signInDialog != null && signInDialog.isShowing() && mode.equals(signInMode)) {
+      if (beam.loginError != null) { authError(beam.loginError); beam.loginError = null; }
+      else authBusy(false);
+      return;
+    }
+    if (signInDialog != null) signInDialog.dismiss();
+    signInMode = mode;
     final String m = mode;
-    LinearLayout l = Ui.col(this);
-    String intro = "setup".equals(m) ? "Create the admin account. You'll add everyone else later."
-        : "invite".equals(m) ? "Use the username and invite code you were given, then choose your own PIN."
-        : "Sign in once on this phone. It stays signed in.";
-    l.addView(Ui.text(this, intro, 14, Ui.DIM, false));
-    EditText code = field(l, "setup".equals(m) ? "Setup code" : "Invite code", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS, !"signin".equals(m));
-    EditText name = field(l, "Your name", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS, "setup".equals(m));
-    EditText user = field(l, "Username", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI, true);
-    EditText pin = field(l, "signin".equals(m) ? "PIN" : "Choose a PIN (4–12 digits)", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD, true);
-    EditText pin2 = field(l, "PIN again", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD, !"signin".equals(m));
-    if (beam.loginError != null) { l.addView(Ui.text(this, beam.loginError, 14, Ui.BAD, false), Ui.margins(this, -1, -2, 0, 8, 0, 0)); beam.loginError = null; }
-    AlertDialog.Builder b = Ui.dialog(this)
-        .setTitle("setup".equals(m) ? "Set up Beam" : "invite".equals(m) ? "Join Beam" : "Sign in to Beam")
-        .setView(pad(l))
-        .setCancelable(false)
-        .setPositiveButton("setup".equals(m) ? "Create" : "invite".equals(m) ? "Join" : "Sign in", null);
-    if ("signin".equals(m)) b.setNeutralButton("I have an invite code", null);
-    else if ("invite".equals(m)) b.setNeutralButton("I have a PIN", null);
-    signInDialog = b.create();
-    signInDialog.setOnShowListener(x -> {
-      signInDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
-        String u = user.getText().toString().trim(), p = pin.getText().toString();
-        if (!"signin".equals(m) && !p.equals(pin2.getText().toString())) { Toast.makeText(this, "The PINs don't match", Toast.LENGTH_SHORT).show(); return; }
-        if ("setup".equals(m)) beam.setup(code.getText().toString().trim(), name.getText().toString().trim(), u, p);
-        else if ("invite".equals(m)) beam.join(u, code.getText().toString().trim(), p);
-        else beam.login(u, p);
-      });
-      android.widget.Button n = signInDialog.getButton(AlertDialog.BUTTON_NEUTRAL);
-      if (n != null) n.setOnClickListener(v -> showSignIn("signin".equals(m) ? "invite" : "signin"));
+    final boolean setup = "setup".equals(m), invite = "invite".equals(m);
+
+    LinearLayout col = Ui.col(this);
+    int pad = Ui.dp(this, 28);
+    col.setPadding(pad, Ui.dp(this, 64), pad, pad);
+    android.widget.ImageView mark = new android.widget.ImageView(this);
+    mark.setImageResource(R.mipmap.ic_launcher);
+    col.addView(mark, Ui.lp(Ui.dp(this, 56), Ui.dp(this, 56)));
+    TextView heading = Ui.text(this, setup ? "Set up Beam" : invite ? "Join with an invite" : "Sign in", 28, Ui.TEXT, true);
+    heading.setLetterSpacing(-0.02f);
+    col.addView(heading, Ui.margins(this, -1, -2, 0, 24, 0, 6));
+    col.addView(Ui.text(this, setup ? "You're the first one here. Create the admin account, then invite everyone else from Settings."
+        : invite ? "Enter the username and code from your invite, then choose a PIN you'll remember."
+        : "Use your Beam username and PIN. This phone stays signed in.", 15, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 0, 0, 14));
+
+    int text = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+    int pinType = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD;
+    final EditText code = authField(col, setup ? "Setup code" : "Invite code", setup ? null : "It works once, for 7 days.", text | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS, setup || invite);
+    final EditText name = authField(col, "Your name", null, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS, setup);
+    final EditText user = authField(col, "Username", null, text, true);
+    final EditText pin = authField(col, setup || invite ? "Choose a PIN" : "PIN", setup || invite ? "4 to 12 digits." : null, pinType, true);
+    final EditText pin2 = authField(col, "Confirm PIN", null, pinType, setup || invite);
+
+    signInError = Ui.text(this, "", 14, 0xFFFFB9B9, false);
+    android.graphics.drawable.GradientDrawable errBg = Ui.round(0x17FF7B7B, Ui.dp(this, 10));
+    errBg.setStroke(Ui.dp(this, 1), 0x59FF7B7B);
+    signInError.setBackground(errBg);
+    int ep = Ui.dp(this, 12);
+    signInError.setPadding(ep, Ui.dp(this, 10), ep, Ui.dp(this, 10));
+    signInError.setVisibility(View.GONE);
+    col.addView(signInError, Ui.margins(this, -1, -2, 0, 14, 0, 0));
+
+    signInCta = setup ? "Create admin account" : invite ? "Join Beam" : "Sign in";
+    signInGo = Ui.button(this, signInCta, Ui.ACCENT, Color.WHITE, v -> {
+      String u = user.getText().toString().trim(), p = pin.getText().toString();
+      String problem = setup && code.getText().toString().trim().isEmpty() ? "Enter the setup code."
+          : setup && name.getText().toString().trim().isEmpty() ? "Enter your name."
+          : u.isEmpty() ? "Enter your username."
+          : invite && code.getText().toString().trim().isEmpty() ? "Enter your invite code."
+          : p.isEmpty() ? "Enter your PIN."
+          : (setup || invite) && !p.matches("\\d{4,12}") ? "PINs are 4 to 12 digits."
+          : (setup || invite) && !p.equals(pin2.getText().toString()) ? "The two PINs don't match." : null;
+      if (problem != null) { authError(problem); return; }
+      authBusy(true);
+      if (setup) beam.setup(code.getText().toString().trim(), name.getText().toString().trim(), u, p);
+      else if (invite) beam.join(u, code.getText().toString().trim(), p);
+      else beam.login(u, p);
     });
-    signInDialog.show();
+    signInGo.setTextSize(16);
+    signInGo.setPadding(0, Ui.dp(this, 14), 0, Ui.dp(this, 14));
+    col.addView(signInGo, Ui.margins(this, -1, -2, 0, 18, 0, 0));
+
+    if (!setup) {
+      TextView other = Ui.text(this, invite ? "Already have a PIN? Sign in" : "New here? Use an invite code", 14, Ui.ACCENT2, true);
+      other.setGravity(Gravity.CENTER);
+      other.setPadding(0, Ui.dp(this, 16), 0, Ui.dp(this, 16));
+      other.setOnClickListener(v -> showSignIn(invite ? "signin" : "invite"));
+      col.addView(other, Ui.lp(-1, -2));
+    }
+    TextView foot = Ui.text(this, setup ? "The setup code stops working once the admin account exists."
+        : "Beam is invite-only. Ask the person who runs your Beam for an invite.", 12.5f, Ui.DIM, false);
+    foot.setGravity(Gravity.CENTER);
+    col.addView(foot, Ui.margins(this, -1, -2, 0, 14, 0, 0));
+
+    ScrollView sv = new ScrollView(this);
+    sv.setFillViewport(true);
+    sv.setBackgroundColor(Ui.BG);
+    sv.addView(col);
+    android.app.Dialog dlg = new android.app.Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar);
+    dlg.setContentView(sv);
+    dlg.setCancelable(false);
+    // Back leaves Beam rather than dismissing the sign-in.
+    dlg.setOnKeyListener((d, keyCode, ev) -> {
+      if (keyCode == android.view.KeyEvent.KEYCODE_BACK && ev.getAction() == android.view.KeyEvent.ACTION_UP) { moveTaskToBack(true); return true; }
+      return false;
+    });
+    if (dlg.getWindow() != null) {
+      dlg.getWindow().setStatusBarColor(Ui.BG);
+      dlg.getWindow().setNavigationBarColor(Ui.BG);
+      dlg.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+    }
+    signInDialog = dlg;
+    dlg.show();
+    if (beam.loginError != null) { authError(beam.loginError); beam.loginError = null; }
+  }
+
+  /** A labelled, rounded input for the sign-in screen. */
+  private EditText authField(LinearLayout col, String label, String hint, int type, boolean show) {
+    EditText e = new EditText(this);
+    e.setInputType(type);
+    e.setSingleLine(true);
+    e.setTextColor(Ui.TEXT);
+    e.setTextSize(16);
+    android.graphics.drawable.GradientDrawable bg = Ui.round(Ui.CARD, Ui.dp(this, 10));
+    bg.setStroke(Ui.dp(this, 1), Ui.LINE);
+    e.setBackground(bg);
+    int h = Ui.dp(this, 14);
+    e.setPadding(h, Ui.dp(this, 12), h, Ui.dp(this, 12));
+    if (!show) return e;
+    col.addView(Ui.text(this, label, 13, Ui.TEXT, true), Ui.margins(this, -1, -2, 0, 14, 0, 6));
+    col.addView(e, Ui.lp(-1, -2));
+    if (hint != null) col.addView(Ui.text(this, hint, 12.5f, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 6, 0, 0));
+    return e;
+  }
+
+  private void authBusy(boolean on) {
+    if (signInGo == null) return;
+    signInGo.setEnabled(!on);
+    signInGo.setAlpha(on ? 0.6f : 1f);
+    signInGo.setText(on ? "One moment…" : signInCta);
+    if (!on) return;
+    signInError.setVisibility(View.GONE);
+    final android.app.Dialog mine = signInDialog;
+    beam.main.postDelayed(() -> {
+      if (signInDialog == mine && mine != null && mine.isShowing() && !signInGo.isEnabled()) authError("Can't reach Beam. Check your connection and try again.");
+    }, 9000);
+  }
+
+  private void authError(String msg) {
+    if (signInError == null) return;
+    authBusy(false);
+    signInError.setText(msg);
+    signInError.setVisibility(View.VISIBLE);
   }
 
   private EditText field(LinearLayout l, String hint, int type, boolean show) {

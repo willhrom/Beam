@@ -11,6 +11,7 @@ const native = (window.webkit && window.webkit.messageHandlers && window.webkit.
 const nativeKind = native ? (window.webkit ? "mac" : "windows") : null;
 const revealLabel = nativeKind === "windows" ? "Show in folder" : "Show in Finder";
 const $ = (s) => document.querySelector(s);
+if (nativeKind) document.body.classList.add("native-" + nativeKind);
 
 // ---------- small utils ----------
 const enc = new TextEncoder();
@@ -154,12 +155,15 @@ async function onServer(m) {
         S.online = false;
         S.needSetup = !!m.setup;
         render();
-        showSignIn(S.needSetup ? "setup" : (S.signInMode || "signin"));
+        // Keep whatever is already typed if the same screen is showing (e.g. after a reconnect).
+        const want = S.needSetup ? "setup" : S.signInMode && S.signInMode !== "setup" ? S.signInMode : "signin";
+        if (!S.authOpen || want !== S.signInMode) showSignIn(want);
+        else authBusy(false);
         break;
       }
       S.user = m.user || null;
       S.signInMode = "signin";
-      if (S.lockSheet) { S.lockSheet = false; closeSheet(); toast("Signed in as " + (S.user ? S.user.name : "")); }
+      if (S.authOpen) { hideSignIn(); toast("Signed in as " + (S.user ? S.user.name : "")); }
       S.online = true;
       backoff = 1000;
       if (Array.isArray(m.ice) && m.ice.length) S.ice = m.ice;
@@ -194,7 +198,7 @@ async function onServer(m) {
       }
       break;
     case "login-error":
-      if (S.lockSheet) { S.signInError = m.reason; showSignIn(S.signInMode); }
+      if (S.authOpen) authError(m.reason);
       break;
     case "signed-out":
       S.user = null;
@@ -332,6 +336,8 @@ async function connectOut(t, mode) {
     else if (m.t === "ok") finish(t);
     else if (m.t === "cancel") fail(t, "Cancelled");
   };
+  // Tell the receiver we're listening, in case its first message was sent before we could hear it.
+  dc.onopen = () => { if (live()) try { dc.send(JSON.stringify({ t: "ready" })); } catch {} };
   dc.onclose = () => { if (live()) dropped(t, gen); };
   pc.onconnectionstatechange = () => { if (live() && pc.connectionState === "failed") dropped(t, gen); };
   await pc.setLocalDescription(await pc.createOffer());
@@ -545,15 +551,23 @@ function makeWriter(t, it, index) {
 function setupReceive(t, dc, gen) {
   const live = () => t.gen === gen && !["done", "failed"].includes(t.state);
   dc.binaryType = "arraybuffer";
-  let sentFrom = false;
+  let sentFrom = false, started = false;
+  // Tell the sender where to start: the beginning, or wherever we got to before a drop.
+  const sendFrom = () => { try { dc.send(JSON.stringify(t.curDone ? { t: "from", i: t.cur + 1, off: 0 } : { t: "from", i: t.cur, off: t.got })); } catch {} };
   const opened = () => {
     if (!live() || sentFrom) return;
     sentFrom = true;
     t.state = "receiving";
     t.pausedAt = null;
     renderTx(t);
-    // Tell the sender where to start: the beginning, or wherever we got to before a drop.
-    dc.send(JSON.stringify(t.curDone ? { t: "from", i: t.cur + 1, off: 0 } : { t: "from", i: t.cur, off: t.got }));
+    sendFrom();
+    // The first message on a brand-new connection can get lost, so repeat it until the sender starts.
+    // (The sender ignores repeats.)
+    let tries = 0;
+    const again = setInterval(() => {
+      if (started || !live() || dc.readyState !== "open" || ++tries > 6) return clearInterval(again);
+      sendFrom();
+    }, 1500);
   };
   dc.onopen = opened;
   if (dc.readyState === "open") opened();
@@ -564,7 +578,9 @@ function setupReceive(t, dc, gen) {
     if (!live()) return;
     if (typeof e.data === "string") {
       const m = JSON.parse(e.data);
+      if (m.t === "ready") { if (!started) sendFrom(); return; }
       if (m.t === "file") {
+        started = true;
         if (m.i === t.cur && !t.curDone && m.off === t.got) return; // resuming the same file
         if (!(t.curDone && m.i === t.cur + 1 && m.off === 0 && m.i < t.items.length)) return fail(t, "Bad data");
         t.cur = m.i; t.got = 0; t.curDone = false;
@@ -599,6 +615,7 @@ function finish(t) {
   if (t.state === "done" || t.state === "failed") return;
   t.state = "done";
   renderTx(t);
+  progressFinal(t);
   setTimeout(() => { if (t.state === "done") closePc(t); }, 1500);
   if (t.dir === "in") {
     const texts = t.received.filter((r) => r.text);
@@ -613,6 +630,7 @@ function fail(t, why) {
   closePc(t);
   if (t.w) { const w = t.w; t.w = null; t.q = t.q.then(() => w.abort()).catch(() => {}); }
   renderTx(t);
+  progressFinal(t);
 }
 function cancelTx(t) {
   if (["waiting", "preparing", "paused", "reconnecting"].includes(t.state)) wsSend({ t: "signal", to: t.peer.id, data: { k: "cancel", tid: t.tid } });
@@ -658,6 +676,45 @@ function nativeStatus() {
   native.postMessage({ op: "status", online: S.online, peers: S.peers.length, busy });
 }
 
+// A small progress card in the corner of the screen (Mac and Windows apps), and the tab title in browsers.
+const LIVE = ["connecting", "receiving", "sending", "finishing", "paused", "reconnecting"];
+let progTimer = 0, progShown = false;
+function nativeProgressSoon() { if (!progTimer) progTimer = setTimeout(() => { progTimer = 0; nativeProgress(); }, 250); }
+function nativeProgress() {
+  const live = [...S.tx.values()].filter((t) => LIVE.includes(t.state));
+  const t = live.find((x) => x.dir === "in") || live[0];
+  const frac = t && t.total ? Math.min(1, t.done / t.total) : 0;
+  if (!native) { document.title = t ? `Beam (${Math.floor(frac * 100)}%)` : "Beam"; return; }
+  if (!t) {
+    if (progShown) { progShown = false; native.postMessage({ op: "progress", show: false }); }
+    return;
+  }
+  t.inPopup = progShown = true;
+  const paused = t.state === "paused" || t.state === "reconnecting";
+  native.postMessage({
+    op: "progress", show: true, state: paused ? "paused" : "active", dir: t.dir, pct: frac,
+    title: (t.dir === "in" ? "Receiving " : "Sending ") + describeItems(t.items),
+    detail: paused ? "Connection lost. Reconnecting…" : (t.dir === "in" ? "From " : "To ") + t.peer.name + (live.length > 1 ? ` and ${live.length - 1} more` : ""),
+  });
+}
+// A transfer just ended: show how it went for a moment, unless another one is still running.
+function progressFinal(t) {
+  if (!native) return nativeProgressSoon();
+  if ([...S.tx.values()].some((x) => x !== t && LIVE.includes(x.state))) return nativeProgressSoon();
+  progShown = false;
+  const done = t.state === "done";
+  const quiet = !t.inPopup || (!done && ["Cancelled", "Declined", "Expired"].includes(t.reason));
+  if (quiet) return native.postMessage({ op: "progress", show: false });
+  const what = describeItems(t.items);
+  native.postMessage({
+    op: "progress", show: true, state: done ? "done" : "failed", dir: t.dir, pct: done ? 1 : t.total ? Math.min(1, t.done / t.total) : 0,
+    title: done ? (t.dir === "in" ? "Received " : "Sent ") + what : (t.dir === "in" ? "Didn't receive " : "Didn't send ") + what,
+    detail: done ? (t.dir === "in" ? "From " : "To ") + t.peer.name : t.reason || "Something went wrong",
+    // On Windows the "Received" notification appears in the same corner, so step aside for it.
+    hold: done ? (t.dir === "in" && nativeKind === "windows" ? 0 : 3000) : 5000,
+  });
+}
+
 // ---------- UI ----------
 const ICONS = {
   phone: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M16 1H8a3 3 0 0 0-3 3v16a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3V4a3 3 0 0 0-3-3zm1 19a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h1.5l.5 1h4l.5-1H16a1 1 0 0 1 1 1z"/></svg>',
@@ -665,6 +722,12 @@ const ICONS = {
   desktop: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-5v2h2a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h2v-2H5a2 2 0 0 1-2-2zm2 0v11h14V4z"/></svg>',
   tablet: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M18 1H6a3 3 0 0 0-3 3v16a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3V4a3 3 0 0 0-3-3zm1 19a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1zm-7-1.5a1 1 0 1 0 0-2 1 1 0 0 0 0 2z"/></svg>',
   globe: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm6.93 6h-2.95a15.7 15.7 0 0 0-1.38-3.56A8.03 8.03 0 0 1 18.93 8zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14a8.2 8.2 0 0 1 0-4h3.38a16.5 16.5 0 0 0 0 4zm.81 2h2.95c.32 1.25.78 2.45 1.38 3.56A8 8 0 0 1 5.07 16zM8.02 8H5.07a8 8 0 0 1 4.33-3.56A15.7 15.7 0 0 0 8.02 8zM12 19.96A14.1 14.1 0 0 1 10.09 16h3.82A14.1 14.1 0 0 1 12 19.96zM14.34 14H9.66a14.7 14.7 0 0 1 0-4h4.68a14.7 14.7 0 0 1 0 4zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95a8.03 8.03 0 0 1-4.33 3.56zM16.36 14a16.5 16.5 0 0 0 0-4h3.38a8.2 8.2 0 0 1 0 4z"/></svg>',
+  gear: '<svg viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h8m6 0h2M4 17h2m6 0h8"/><circle cx="15" cy="7" r="2.5"/><circle cx="9" cy="17" r="2.5"/></g></svg>',
+  down: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 5v14m-6-6 6 6 6-6"/></svg>',
+  up: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 19V5m-6 6 6-6 6 6"/></svg>',
+  check: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
+  cross: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" d="M7 7l10 10M17 7 7 17"/></svg>',
+  pause: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" d="M9 7v10m6-10v10"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zm4 18H6V4h7v5h5z"/></svg>',
   text: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M5 4v3h5.5v12h3V7H19V4z"/></svg>',
 };
@@ -672,6 +735,11 @@ const iconFor = (k) => ({ android: ICONS.phone, iphone: ICONS.phone, mac: ICONS.
 
 function render() {
   document.body.classList.toggle("offline", !S.online);
+  document.body.classList.toggle("searching", S.online && !S.peers.length);
+  const acct = $("#settingsBtn");
+  acct.hidden = !S.user;
+  const chip = S.user ? `<span class="initial">${esc((S.user.name || "?").trim().charAt(0).toUpperCase())}</span><span class="who">${esc(S.user.name)}</span>${ICONS.gear}` : "";
+  if (acct.dataset.html !== chip) { acct.innerHTML = chip; acct.dataset.html = chip; }
   const box = $("#peers");
   const ids = new Set(S.peers.map((p) => p.id));
   for (const el of [...box.children]) if (!ids.has(el.dataset.id)) el.remove();
@@ -698,12 +766,14 @@ function render() {
       box.appendChild(el);
     }
     if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    el.classList.toggle("mine", paired);
   }
   $("#empty").style.display = S.peers.length ? "none" : "";
-  $("#empty").innerHTML = !S.user && !S.online && ws && ws.readyState === 1 ? "Sign in to use Beam." : S.online
-    ? 'Looking for devices…<br><small>Open Beam on another device on this WiFi, or pair one in Settings.</small>'
-    : "Connecting…";
-  $("#me").innerHTML = S.pending ? `<b>Tap a device to send ${esc(pendingLabel())}</b> · <a href="#" id="pcx">cancel</a>` : `Visible as <b>${esc(S.name)}</b> · ${S.nearby ? "Everyone nearby" : "My devices only"}`;
+  $("#empty").innerHTML = !S.user && !S.online && ws && ws.readyState === 1 ? "Sign in to use Beam" : S.online
+    ? "Looking for devices<small>Open Beam on another device that's signed in as you, or on this WiFi.</small>"
+    : "Connecting to Beam…";
+  $("#me").innerHTML = S.pending ? `<b>Choose a device to send ${esc(pendingLabel())}</b><a href="#" id="pcx">Cancel</a>`
+    : `<b>${esc(S.name)}</b><span>${S.nearby ? "Visible to everyone nearby" : "Visible to your devices only"}</span>`;
   const pcx = $("#pcx");
   if (pcx) pcx.onclick = (e) => { e.preventDefault(); S.pending = null; render(); };
   for (const t of S.tx.values()) if (t.dir === "out") renderRing(t);
@@ -727,7 +797,7 @@ function shareFromDesktop(files) {
   if (native) native.postMessage({ op: "show" });
   const others = S.peers;
   openSheet(`<h2>Send ${esc(pendingLabel())}</h2>
-    <p>${fmtSize(files.reduce((a, f) => a + f.size, 0))} · tap a device</p>
+    <p>${fmtSize(files.reduce((a, f) => a + f.size, 0))}. Choose a device.</p>
     <div class="list">${others.map((p) => `<div class="item"><span>${esc(p.name)} <span class="sub">${S.paired[p.id] ? "My device" : "Nearby"}</span></span><button class="btn primary small" data-to="${p.id}">Send</button></div>`).join("") || '<div class="item"><span class="sub">Looking for devices… they\'ll also appear on the main screen.</span></div>'}</div>
     <div class="actions"><button class="btn ghost" id="cx">Cancel</button></div>`);
   $("#cx").onclick = () => { S.pending = null; closeSheet(); render(); };
@@ -757,7 +827,36 @@ function renderRing(t) {
   el.style.strokeDashoffset = String(238.8 * (1 - (t.state === "waiting" ? 0.04 : frac)));
 }
 
-const STATE_TEXT = { paused: "Connection lost — will resume", reconnecting: "Reconnecting…", preparing: "Preparing…", waiting: "Waiting for them to accept…", asking: "Wants to send you this", connecting: "Connecting…", sending: "Sending", receiving: "Receiving", finishing: "Finishing…", done: "Done", failed: "" };
+// What a transfer is, and one plain sentence about where it stands.
+function txTitle(t) {
+  if (t.items.length === 1) return t.items[0].text ? "Text" : t.items[0].name;
+  return describeItems(t.items);
+}
+function txLine(t) {
+  const n = t.peer.name;
+  switch (t.state) {
+    case "preparing": return "Getting ready to send to " + n;
+    case "waiting": return "Waiting for " + n + " to accept";
+    case "asking": return n + " wants to send you this";
+    case "connecting": return "Connecting to " + n;
+    case "sending": return "Sending to " + n;
+    case "receiving": return "Receiving from " + n;
+    case "finishing": return "Finishing up";
+    case "paused": return "Connection lost. It will pick up where it stopped";
+    case "reconnecting": return "Reconnecting to " + n;
+    case "done": return (t.dir === "out" ? "Sent to " : "Received from ") + n;
+    default: {
+      const why = String(t.reason || "Something went wrong");
+      return (t.dir === "out" ? "Not sent to " : "Not received from ") + n + ": " + why.charAt(0).toLowerCase() + why.slice(1);
+    }
+  }
+}
+function txIcon(t) {
+  if (t.state === "done") return ICONS.check;
+  if (t.state === "failed") return ICONS.cross;
+  if (t.state === "paused" || t.state === "reconnecting") return ICONS.pause;
+  return t.dir === "in" ? ICONS.down : ICONS.up;
+}
 
 function renderTxList() {
   const box = $("#transfers");
@@ -768,6 +867,7 @@ function renderTxList() {
 
 function renderTx(t) {
   nativeStatusSoon();
+  nativeProgressSoon();
   const box = $("#transfers");
   let el = box.querySelector(`[data-tid="${t.tid}"]`);
   if (!S.tx.has(t.tid)) { if (el) el.remove(); return; }
@@ -777,12 +877,17 @@ function renderTx(t) {
     box.prepend(el);
   }
   el.className = "tx " + t.state;
-  const what = describeItems(t.items);
-  const title = (t.dir === "out" ? "To " : "From ") + t.peer.name;
-  const sub = t.state === "failed" ? t.reason : t.state === "done" ? (t.dir === "out" ? "Sent " : "Received ") + what : STATE_TEXT[t.state] + " · " + what + (t.total ? " · " + fmtSize(t.total) : "");
+  const moving = ["sending", "receiving", "paused", "reconnecting"].includes(t.state);
+  const pct = t.total ? Math.floor((100 * t.done) / t.total) : 0;
   let body = "";
-  if (["sending", "receiving", "paused", "reconnecting"].includes(t.state)) body += `<div class="bar"><i style="width:${t.total ? (100 * t.done) / t.total : 0}%"></i></div>`;
-  if (t.received && t.received.length) {
+  if (moving) body += `<div class="bar"><i style="width:${t.total ? (100 * t.done) / t.total : 0}%"></i></div>`;
+  const one = t.state === "done" && t.items.length === 1 && t.received && t.received.length === 1 && !t.received[0].text ? t.received[0] : null;
+  let oneBtn = "";
+  if (one) {
+    oneBtn = one.url ? `<a class="btn ghost small" href="${one.url}" download="${esc(one.name)}">Save</a>`
+      : "folder" in one ? `<span class="size">Saved${one.folder ? " in " + esc(one.folder) : ""}</span>`
+      : one.path ? `<button class="btn ghost small" data-reveal="${esc(one.path)}">${revealLabel}</button>` : `<span class="size">Saving…</span>`;
+  } else if (t.received && t.received.length) {
     body += '<div class="files">';
     for (const r of t.received) {
       if (r.text) {
@@ -803,8 +908,9 @@ function renderTx(t) {
   let btns = "";
   if (t.state === "asking") btns = `<button class="btn primary small" data-act="accept">Accept</button><button class="btn ghost small" data-act="decline">Decline</button>`;
   else if (!["done", "failed"].includes(t.state)) btns = `<button class="btn ghost small" data-act="cancel">Cancel</button>`;
-  else btns = `<button class="btn ghost small" data-act="clear">✕</button>`;
-  const html = `<div class="row"><div style="min-width:0"><div class="title">${esc(title)}</div><div class="sub">${esc(sub)}</div></div><div class="row">${btns}</div></div>${body}`;
+  else btns = `<button class="btn ghost small icon" data-act="clear" aria-label="Remove from list">✕</button>`;
+  const side = moving ? `<span class="pct">${pct}%</span>` : t.total && !t.items.every((i) => i.text) ? `<span class="size">${fmtSize(t.total)}</span>` : "";
+  const html = `<div class="tx-head"><span class="tx-ico">${txIcon(t)}</span><div class="tx-text"><div class="title">${esc(txTitle(t))}</div><div class="sub">${esc(txLine(t))}</div></div><div class="tx-side">${one ? oneBtn : side}${btns}</div></div>${body}`;
   if (el.dataset.html !== html) {
     el.innerHTML = html;
     el.dataset.html = html;
@@ -830,6 +936,9 @@ function renderProgress(t) {
     progressRaf = 0;
     const bar = document.querySelector(`[data-tid="${t.tid}"] .bar i`);
     if (bar) bar.style.width = (t.total ? (100 * t.done) / t.total : 0) + "%";
+    const pct = document.querySelector(`[data-tid="${t.tid}"] .pct`);
+    if (pct) pct.textContent = (t.total ? Math.floor((100 * t.done) / t.total) : 0) + "%";
+    nativeProgressSoon();
     if (t.dir === "out") renderRing(t);
   });
 }
@@ -859,7 +968,7 @@ function closeSheet() {
   $("#sheet").hidden = true;
   $("#sheetBody").innerHTML = "";
 }
-$("#sheet").addEventListener("click", (e) => { if (e.target.id === "sheet" && !S.lockSheet) closeSheet(); });
+$("#sheet").addEventListener("click", (e) => { if (e.target.id === "sheet") closeSheet(); });
 
 function chooseWhat(peerId) {
   const p = S.peers.find((x) => x.id === peerId);
@@ -893,9 +1002,9 @@ function promptIncoming(t) {
   if (!$("#sheet").hidden) return; // the transfer card has Accept/Decline too
   const list = t.items.slice(0, 6).map((i) => `<div class="item"><span>${esc(i.text ? "Text" : i.name)}</span><span class="sub">${i.text ? "" : fmtSize(i.size)}</span></div>`).join("") +
     (t.items.length > 6 ? `<div class="item"><span class="sub">and ${t.items.length - 6} more</span></div>` : "");
-  openSheet(`<h2>${esc(t.peer.name)}</h2><p>wants to send you ${esc(describeItems(t.items))}${t.total ? " (" + fmtSize(t.total) + ")" : ""}</p>
-    <p><small>Device ${shortId(t.peer.id)}${t.peer.paired ? " · My device" : ""}</small></p>
-    <div class="list">${list}</div>${sizeNote(t)}
+  openSheet(`<h2>${esc(t.peer.name)} wants to send you ${esc(describeItems(t.items))}</h2>
+    <p>${t.total ? fmtSize(t.total) + ", from " : "From "}${t.peer.paired ? "one of your devices" : "device " + shortId(t.peer.id)}</p>
+    ${t.items.length > 1 ? `<div class="list">${list}</div>` : ""}${sizeNote(t)}
     <div class="actions"><button class="btn ghost" id="dec">Decline</button><button class="btn primary" id="acc">Accept</button></div>`);
   $("#sheet").dataset.tid = t.tid;
   $("#acc").onclick = () => accept(t, true);
@@ -921,10 +1030,10 @@ function showSettings() {
   openSheet(`<h2>Settings</h2>
     <h3>This device</h3>
     <input type="text" id="nm" maxlength="40" value="${esc(S.name)}">
-    <label class="opt"><span>Everyone nearby can see me<small>Off = only your paired devices</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
-    <label class="opt"><span>Auto-accept from my devices<small>Files from paired devices arrive without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>
+    <label class="opt"><span>Everyone nearby can see me<small>When off, only your own and paired devices can</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
+    <label class="opt"><span>Auto-accept from my devices<small>What they send arrives without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>
     ${!native && "Notification" in window && Notification.permission !== "granted" ? '<label class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></label>' : ""}
-    ${canSaveToDisk ? `<label class="opt"><span>Save received files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Downloads via Save buttons · big transfers ask for a folder"}</small></span><button class="btn ghost small" id="sf">Choose…</button></label>` : ""}
+    ${canSaveToDisk ? `<label class="opt"><span>Save received files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Your Downloads folder. Big transfers ask where to save"}</small></span><button class="btn ghost small" id="sf">Choose…</button></label>` : ""}
     <p><small>Device code ${shortId(Id.id)}</small></p>
     <h3>Account</h3>
     <div class="list"><div class="item"><span>${S.user ? esc(S.user.name) + ' <span class="sub">' + esc(S.user.username) + (S.user.admin ? " · admin" : "") + "</span>" : "Not signed in"}</span></div></div>
@@ -1024,48 +1133,100 @@ function autoPairMine() {
   if (changed) { savePaired(); updateServer(); }
 }
 
+// Signing in is a full screen of its own: nothing else in Beam works until it's done.
+const AUTH = {
+  signin: {
+    title: "Sign in", lede: "Use your Beam username and PIN. This device stays signed in.", cta: "Sign in", busy: "Signing in…",
+    switchTo: "invite", switchLead: "New here?", switchLabel: "Use an invite code",
+  },
+  invite: {
+    title: "Join with an invite", lede: "Enter the username and code from your invite, then choose a PIN you'll remember.", cta: "Join Beam", busy: "Joining…",
+    switchTo: "signin", switchLead: "Already have a PIN?", switchLabel: "Sign in",
+  },
+  setup: {
+    title: "Set up Beam", lede: "You're the first one here. Create the admin account, then invite everyone else from Settings.", cta: "Create admin account", busy: "Creating…",
+  },
+};
 function showSignIn(mode) {
+  const A = AUTH[mode] || AUTH.signin;
   S.signInMode = mode;
-  S.lockSheet = true;
-  const err = S.signInError ? `<p style="color:var(--bad)">${esc(S.signInError)}</p>` : "";
-  S.signInError = null;
-  const field = (id, label, type, extra = "") => `<label style="display:block;margin:10px 0 4px;color:var(--dim);font-size:13px">${label}</label><input type="${type}" id="${id}" ${extra}>`;
-  const pinAttrs = 'inputmode="numeric" autocomplete="off" maxlength="12" pattern="[0-9]*"';
-  let body;
-  if (mode === "setup") {
-    body = `<h2>Set up Beam</h2><p>Create the admin account. You'll add everyone else from Settings.</p>
-      ${field("su_code", "Setup code", "text", 'autocomplete="off"')}${field("su_name", "Your name", "text")}${field("su_user", "Username", "text", 'autocapitalize="none" autocomplete="username"')}
-      ${field("su_pin", "Choose a PIN (4–12 digits)", "password", pinAttrs)}${field("su_pin2", "PIN again", "password", pinAttrs)}${err}
-      <div class="actions"><button class="btn primary" id="go">Create admin account</button></div>`;
-  } else if (mode === "invite") {
-    body = `<h2>Join Beam</h2><p>Use the username and invite code you were given.</p>
-      ${field("in_user", "Username", "text", 'autocapitalize="none" autocomplete="username"')}${field("in_code", "Invite code", "text", 'autocapitalize="characters" autocomplete="off" placeholder="ABCD-2345"')}
-      ${field("in_pin", "Choose a PIN (4–12 digits)", "password", pinAttrs)}${field("in_pin2", "PIN again", "password", pinAttrs)}${err}
-      <div class="actions"><button class="btn ghost" id="back">I have a PIN</button><button class="btn primary" id="go">Join</button></div>`;
-  } else {
-    body = `<h2>Sign in to Beam</h2><p>Sign in once on this device. It stays signed in.</p>
-      ${field("li_user", "Username", "text", 'autocapitalize="none" autocomplete="username"')}${field("li_pin", "PIN", "password", pinAttrs)}${err}
-      <div class="actions"><button class="btn ghost" id="inv">I have an invite code</button><button class="btn primary" id="go">Sign in</button></div>`;
-  }
-  openSheet(body);
+  S.authOpen = true;
+  if (!$("#sheet").hidden) { sheetOnClose = null; closeSheet(); }
+  const text = (id, label, attrs = "", hint = "") => `<label class="field"><span class="label">${label}</span><input type="text" id="${id}" ${attrs}>${hint ? `<span class="hint">${hint}</span>` : ""}</label>`;
+  const pin = (id, label, ac, hint = "") => `<label class="field"><span class="label">${label}</span><span class="pin-wrap"><input type="password" id="${id}" inputmode="numeric" pattern="[0-9]*" maxlength="12" autocomplete="${ac}"><button type="button" class="reveal" data-for="${id}">Show</button></span>${hint ? `<span class="hint">${hint}</span>` : ""}</label>`;
+  const user = 'autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="username"';
+  const fields = mode === "setup"
+    ? text("su_code", "Setup code", 'autocomplete="off" autocapitalize="characters" spellcheck="false"', "The one-time code you got when Beam was put on its server.") +
+      text("su_name", "Your name", 'autocomplete="name"') + text("su_user", "Username", user, "Short and lowercase, like will.") +
+      pin("su_pin", "Choose a PIN", "new-password", "4 to 12 digits.") + pin("su_pin2", "Confirm PIN", "new-password")
+    : mode === "invite"
+    ? text("in_user", "Username", user) + text("in_code", "Invite code", 'autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-2345"', "It works once, for 7 days.") +
+      pin("in_pin", "Choose a PIN", "new-password", "4 to 12 digits.") + pin("in_pin2", "Confirm PIN", "new-password")
+    : text("li_user", "Username", user) + pin("li_pin", "PIN", "current-password");
+  $("#authBody").innerHTML = `<img class="auth-mark" src="/icon.svg" alt="" width="52" height="52">
+    <h1>${A.title}</h1><p class="lede">${A.lede}</p>
+    <form id="authForm" novalidate>${fields}
+      <div class="alert" id="authErr" role="alert" hidden></div>
+      <button class="btn primary" id="go" type="submit">${A.cta}</button>
+    </form>
+    ${A.switchTo ? `<p class="switch">${A.switchLead} <button type="button" id="${A.switchTo === "invite" ? "inv" : "back"}">${A.switchLabel}</button></p>` : ""}
+    <p class="foot">${mode === "setup" ? "The setup code stops working once the admin account exists." : "Beam is invite-only. Ask the person who runs your Beam for an invite."}</p>`;
+  $("#auth").hidden = false;
   const v = (id) => ($("#" + id) ? $("#" + id).value.trim() : "");
-  const submit = () => {
-    if (mode === "setup") {
-      if (v("su_pin") !== v("su_pin2")) { S.signInError = "The PINs don't match."; return showSignIn(mode); }
-      wsSend({ t: "setup", code: v("su_code"), name: v("su_name"), user: v("su_user"), pin: v("su_pin") });
-    } else if (mode === "invite") {
-      if (v("in_pin") !== v("in_pin2")) { S.signInError = "The PINs don't match."; return showSignIn(mode); }
-      wsSend({ t: "login", user: v("in_user"), invite: v("in_code"), pin: v("in_pin") });
-    } else {
-      wsSend({ t: "login", user: v("li_user"), pin: v("li_pin") });
-    }
+  const p = mode === "setup" ? "su" : mode === "invite" ? "in" : "li";
+  $("#authForm").onsubmit = (e) => {
+    e.preventDefault();
+    const pinOk = /^\d{4,12}$/.test(v(p + "_pin"));
+    const problem =
+      mode === "setup" && !v("su_code") ? "Enter the setup code." :
+      mode === "setup" && !v("su_name") ? "Enter your name." :
+      !v(p + "_user") ? "Enter your username." :
+      mode === "invite" && !v("in_code") ? "Enter your invite code." :
+      !v(p + "_pin") ? "Enter your PIN." :
+      mode !== "signin" && !pinOk ? "PINs are 4 to 12 digits." :
+      mode !== "signin" && v(p + "_pin") !== v(p + "_pin2") ? "The two PINs don't match." :
+      !ws || ws.readyState !== 1 ? "Can't reach Beam. Check your connection and try again." : "";
+    if (problem) return authError(problem);
+    authBusy(true);
+    if (mode === "setup") wsSend({ t: "setup", code: v("su_code"), name: v("su_name"), user: v("su_user"), pin: v("su_pin") });
+    else if (mode === "invite") wsSend({ t: "login", user: v("in_user"), invite: v("in_code"), pin: v("in_pin") });
+    else wsSend({ t: "login", user: v("li_user"), pin: v("li_pin") });
   };
-  $("#go").onclick = submit;
-  document.querySelectorAll("#sheetBody input").forEach((i) => (i.onkeydown = (e) => { if (e.key === "Enter") submit(); }));
+  document.querySelectorAll("#authBody .reveal").forEach((b) => (b.onclick = () => {
+    const i = $("#" + b.dataset.for), show = i.type === "password";
+    i.type = show ? "text" : "password";
+    b.textContent = show ? "Hide" : "Show";
+  }));
   if ($("#inv")) $("#inv").onclick = () => showSignIn("invite");
   if ($("#back")) $("#back").onclick = () => showSignIn("signin");
-  const first = $("#sheetBody input");
+  const first = $("#authBody input");
   if (first) first.focus();
+}
+let authTimer = 0;
+function authBusy(on) {
+  const go = $("#go"), A = AUTH[S.signInMode] || AUTH.signin;
+  clearTimeout(authTimer);
+  if (!go || !S.authOpen) return;
+  go.disabled = on;
+  go.textContent = on ? A.busy : A.cta;
+  if (on) {
+    $("#authErr").hidden = true;
+    authTimer = setTimeout(() => authError("Can't reach Beam. Check your connection and try again."), 9000);
+  }
+}
+function authError(msg) {
+  if (!S.authOpen) return;
+  authBusy(false);
+  const box = $("#authErr");
+  box.textContent = msg;
+  box.hidden = false;
+  if (S.signInMode === "signin" && $("#li_user").value) { $("#li_pin").focus(); $("#li_pin").select(); }
+}
+function hideSignIn() {
+  clearTimeout(authTimer);
+  S.authOpen = false;
+  $("#auth").hidden = true;
+  $("#authBody").innerHTML = "";
 }
 
 function showChangePin() {
