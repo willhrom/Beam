@@ -207,6 +207,13 @@ async function onServer(m) {
     case "account-error":
       toast(m.reason);
       break;
+    case "account-alert": {
+      // Someone signed in to this account on another device.
+      const msg = `"${String(m.device || "A device").slice(0, 40)}" just signed in to your Beam account.`;
+      notify("account-alert", "New sign-in to your account", msg + " If this wasn't you, change your PIN in Settings and ask the admin to sign that device out.", false);
+      toast(msg);
+      break;
+    }
     case "account-ok":
       closeSheet();
       toast(m.message);
@@ -947,9 +954,10 @@ function renderProgress(t) {
     if (bar) bar.style.width = (t.total ? (100 * t.done) / t.total : 0) + "%";
     const pct = document.querySelector(`[data-tid="${t.tid}"] .pct`);
     if (pct) pct.textContent = (t.total ? Math.floor((100 * t.done) / t.total) : 0) + "%";
-    nativeProgressSoon();
     if (t.dir === "out") renderRing(t);
   });
+  // Not tied to drawing: the corner card has to keep moving while Beam's window is hidden.
+  nativeProgressSoon();
 }
 
 function toast(msg) {
@@ -1167,10 +1175,10 @@ function showSignIn(mode) {
   const fields = mode === "setup"
     ? text("su_code", "Setup code", 'autocomplete="off" autocapitalize="characters" spellcheck="false"', "The one-time code you got when Beam was put on its server.") +
       text("su_name", "Your name", 'autocomplete="name"') + text("su_user", "Username", user, "Short and lowercase, like will.") +
-      pin("su_pin", "Choose a PIN", "new-password", "4 to 12 digits.") + pin("su_pin2", "Confirm PIN", "new-password")
+      pin("su_pin", "Choose a PIN", "new-password", "6 to 12 digits.") + pin("su_pin2", "Confirm PIN", "new-password")
     : mode === "invite"
     ? text("in_user", "Username", user) + text("in_code", "Invite code", 'autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-2345"', "It works once, for 7 days.") +
-      pin("in_pin", "Choose a PIN", "new-password", "4 to 12 digits.") + pin("in_pin2", "Confirm PIN", "new-password")
+      pin("in_pin", "Choose a PIN", "new-password", "6 to 12 digits.") + pin("in_pin2", "Confirm PIN", "new-password")
     : text("li_user", "Username", user) + pin("li_pin", "PIN", "current-password");
   $("#authBody").innerHTML = `<img class="auth-mark" src="/icon.svg" alt="" width="52" height="52">
     <h1>${A.title}</h1><p class="lede">${A.lede}</p>
@@ -1185,14 +1193,14 @@ function showSignIn(mode) {
   const p = mode === "setup" ? "su" : mode === "invite" ? "in" : "li";
   $("#authForm").onsubmit = (e) => {
     e.preventDefault();
-    const pinOk = /^\d{4,12}$/.test(v(p + "_pin"));
+    const pinOk = /^\d{6,12}$/.test(v(p + "_pin"));
     const problem =
       mode === "setup" && !v("su_code") ? "Enter the setup code." :
       mode === "setup" && !v("su_name") ? "Enter your name." :
       !v(p + "_user") ? "Enter your username." :
       mode === "invite" && !v("in_code") ? "Enter your invite code." :
       !v(p + "_pin") ? "Enter your PIN." :
-      mode !== "signin" && !pinOk ? "PINs are 4 to 12 digits." :
+      mode !== "signin" && !pinOk ? "PINs are 6 to 12 digits." :
       mode !== "signin" && v(p + "_pin") !== v(p + "_pin2") ? "The two PINs don't match." :
       !ws || ws.readyState !== 1 ? "Can't reach Beam. Check your connection and try again." : "";
     if (problem) return authError(problem);
@@ -1242,7 +1250,7 @@ function showChangePin() {
   const pinAttrs = 'inputmode="numeric" autocomplete="off" maxlength="12"';
   openSheet(`<h2>Change PIN</h2>
     <input type="password" id="op" placeholder="Current PIN" ${pinAttrs} style="margin-top:10px">
-    <input type="password" id="np" placeholder="New PIN (4–12 digits)" ${pinAttrs} style="margin-top:10px">
+    <input type="password" id="np" placeholder="New PIN (6–12 digits)" ${pinAttrs} style="margin-top:10px">
     <input type="password" id="np2" placeholder="New PIN again" ${pinAttrs} style="margin-top:10px">
     <div class="actions"><button class="btn ghost" id="cx">Cancel</button><button class="btn primary" id="go">Change</button></div>`);
   $("#cx").onclick = closeSheet;

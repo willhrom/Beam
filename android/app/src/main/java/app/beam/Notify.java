@@ -106,6 +106,17 @@ final class Notify {
     }
   }
 
+  void accountAlert(String device) {
+    nm.notify(9, new Notification.Builder(c, CH_REQUEST)
+        .setSmallIcon(R.drawable.ic_stat)
+        .setContentTitle("New sign-in to your Beam account")
+        .setContentText("\"" + device + "\" just signed in.")
+        .setStyle(new Notification.BigTextStyle().bigText("\"" + device + "\" just signed in to your Beam account. If this wasn't you, change your PIN in Settings and ask the admin to sign that device out."))
+        .setContentIntent(openApp())
+        .setAutoCancel(true)
+        .build());
+  }
+
   void received(Transfer t) {
     int id = idFor(t) + 140000;
     Notification.Builder b = new Notification.Builder(c, CH_DONE).setSmallIcon(R.drawable.ic_stat).setAutoCancel(true);

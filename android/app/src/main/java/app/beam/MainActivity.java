@@ -511,7 +511,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     final EditText code = authField(col, setup ? "Setup code" : "Invite code", setup ? null : "It works once, for 7 days.", text | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS, setup || invite);
     final EditText name = authField(col, "Your name", null, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS, setup);
     final EditText user = authField(col, "Username", null, text, true);
-    final EditText pin = authField(col, setup || invite ? "Choose a PIN" : "PIN", setup || invite ? "4 to 12 digits." : null, pinType, true);
+    final EditText pin = authField(col, setup || invite ? "Choose a PIN" : "PIN", setup || invite ? "6 to 12 digits." : null, pinType, true);
     final EditText pin2 = authField(col, "Confirm PIN", null, pinType, setup || invite);
 
     signInError = Ui.text(this, "", 14, 0xFFFFB9B9, false);
@@ -531,7 +531,7 @@ public class MainActivity extends Activity implements Beam.Listener {
           : u.isEmpty() ? "Enter your username."
           : invite && code.getText().toString().trim().isEmpty() ? "Enter your invite code."
           : p.isEmpty() ? "Enter your PIN."
-          : (setup || invite) && !p.matches("\\d{4,12}") ? "PINs are 4 to 12 digits."
+          : (setup || invite) && !p.matches("\\d{6,12}") ? "PINs are 6 to 12 digits."
           : (setup || invite) && !p.equals(pin2.getText().toString()) ? "The two PINs don't match." : null;
       if (problem != null) { authError(problem); return; }
       authBusy(true);
@@ -628,7 +628,7 @@ public class MainActivity extends Activity implements Beam.Listener {
   private void showChangePin() {
     LinearLayout l = Ui.col(this);
     int t = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD;
-    EditText old = field(l, "Current PIN", t, true), p1 = field(l, "New PIN (4–12 digits)", t, true), p2 = field(l, "New PIN again", t, true);
+    EditText old = field(l, "Current PIN", t, true), p1 = field(l, "New PIN (6–12 digits)", t, true), p2 = field(l, "New PIN again", t, true);
     Ui.dialog(this).setTitle("Change PIN").setView(pad(l))
         .setPositiveButton("Change", (d, w) -> {
           if (!p1.getText().toString().equals(p2.getText().toString())) { Toast.makeText(this, "The new PINs don't match", Toast.LENGTH_SHORT).show(); return; }

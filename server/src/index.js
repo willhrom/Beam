@@ -14,6 +14,8 @@ const MAX_NAME = 40;
 const MAX_WATCH = 40;
 const MAX_SIGNAL = 64 * 1024;
 const PAIR_TTL = 10 * 60 * 1000;
+const MAX_WAITING_PER_NET = 12, MAX_WAITING = 400; // connections not yet signed in
+const TALK_TTL = 30 * 60 * 1000;                   // how long a started transfer may resume across networks
 
 export default {
   async fetch(req, env) {
@@ -72,7 +74,7 @@ async function checkPin(rec, pin) {
   for (let i = 0; i < h.length; i++) diff |= h.charCodeAt(i) ^ rec.h.charCodeAt(i);
   return diff === 0 && h.length === rec.h.length;
 }
-const validPin = (p) => /^\d{4,12}$/.test(String(p || ""));
+const validPin = (p) => /^\d{6,12}$/.test(String(p || "")); // for choosing a PIN
 const validUser = (u) => /^[a-z0-9._-]{2,32}$/.test(u);
 const normUser = (u) => String(u || "").trim().toLowerCase();
 const INVITE_TTL = 7 * 24 * 3600 * 1000;
@@ -101,11 +103,17 @@ export class Hub extends DurableObject {
   }
 
   async fetch(req) {
+    // Limit connections that haven't signed in yet, so nobody can tie the server up.
+    const net = netKey(req.headers.get("CF-Connecting-IP"));
+    const waiting = this.ctx.getWebSockets().map((w) => w.deserializeAttachment() || {}).filter((x) => !x.user);
+    if (waiting.filter((x) => x.net === net).length >= MAX_WAITING_PER_NET || waiting.length >= MAX_WAITING) {
+      return new Response("Too many connections", { status: 429 });
+    }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
     const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
-    server.serializeAttachment({ nonce, net: netKey(req.headers.get("CF-Connecting-IP")), tries: 0 });
+    server.serializeAttachment({ nonce, net, tries: 0 });
     send(server, { t: "challenge", nonce, v: (this.env.VERSION && this.env.VERSION.id) || "" });
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -218,6 +226,14 @@ export class Hub extends DurableObject {
   }
 
   async webSocketMessage(ws, raw) {
+    try {
+      await this.handle(ws, raw);
+    } catch (e) {
+      console.error("message failed", e && e.message);
+    }
+  }
+
+  async handle(ws, raw) {
     if (typeof raw !== "string" || raw.length > MAX_SIGNAL) return;
     let m;
     try {
@@ -229,7 +245,8 @@ export class Hub extends DurableObject {
 
     if (m.t === "hello") {
       if (a.id) return;
-      const pub = b64d(String(m.pub || ""));
+      if (typeof m.pub !== "string" || m.pub.length > 300 || typeof m.sig !== "string" || m.sig.length > 200) return ws.close(4001, "auth");
+      const pub = b64d(m.pub);
       const ok = await verify(pub, b64d(String(m.sig || "")), "beam-hello:" + a.nonce);
       if (!ok) {
         send(ws, { t: "error", code: "auth" });
@@ -284,7 +301,7 @@ export class Hub extends DurableObject {
       const username = normUser(m.user), name = clean(m.name, 40);
       if (!validUser(username)) return send(ws, { t: "login-error", reason: "Usernames are 2–32 letters, numbers, dots, dashes or underscores." });
       if (!name) return send(ws, { t: "login-error", reason: "Enter your name." });
-      if (!validPin(m.pin)) return send(ws, { t: "login-error", reason: "PINs are 4–12 digits." });
+      if (!validPin(m.pin)) return send(ws, { t: "login-error", reason: "PINs are 6–12 digits." });
       const rec = { name, admin: true, ...(await hashPin(String(m.pin))), created: Date.now() };
       await this.ctx.storage.put("user:" + username, rec);
       await this.ctx.storage.put("meta:hasUsers", true);
@@ -313,7 +330,7 @@ export class Hub extends DurableObject {
       let ok = false;
       if (m.invite) {
         ok = !!rec.invite && rec.invite.exp > Date.now() && normInvite(m.invite) === normInvite(rec.invite.code);
-        if (ok && !validPin(m.pin)) return send(ws, { t: "login-error", reason: "Choose a PIN of 4–12 digits." });
+        if (ok && !validPin(m.pin)) return send(ws, { t: "login-error", reason: "Choose a PIN of 6–12 digits." });
         if (ok) { Object.assign(rec, await hashPin(String(m.pin))); delete rec.invite; }
       } else {
         ok = await checkPin(rec, m.pin);
@@ -333,6 +350,8 @@ export class Hub extends DurableObject {
       await this.ctx.storage.put(key, rec);
       await this.ctx.storage.put("dev:" + a.id, { user: username, name: a.name, kind: a.kind, added: Date.now() });
       a.user = username;
+      for (const o of this.sockets())
+        if (o.a.user === username && o.a.id !== a.id) send(o.ws, { t: "account-alert", device: a.name, kind: a.kind, at: Date.now() });
       return this.signedIn(ws, a, rec);
     }
 
@@ -347,7 +366,7 @@ export class Hub extends DurableObject {
       const key = "user:" + a.user;
       const rec = await this.ctx.storage.get(key);
       if (!rec || !(await checkPin(rec, m.old))) return send(ws, { t: "account-error", reason: "Your current PIN isn't right." });
-      if (!validPin(m.pin)) return send(ws, { t: "account-error", reason: "PINs are 4–12 digits." });
+      if (!validPin(m.pin)) return send(ws, { t: "account-error", reason: "PINs are 6–12 digits." });
       Object.assign(rec, await hashPin(String(m.pin)));
       await this.ctx.storage.put(key, rec);
       return send(ws, { t: "account-ok", message: "PIN changed." });
@@ -417,11 +436,17 @@ export class Hub extends DurableObject {
       const pairing = (k === "pair-ok" || k === "pair-no") && a.pairWith === to;
       // A transfer already under way may continue after one side changes network (and so
       // stops being "nearby"); new offers still need the devices to see each other.
-      const ongoing = k === "resume" || k === "answer" || k === "complete" || k === "cancel" || k === "decline";
+      const talkKey = "talk:" + [a.id, to].sort().join("|");
+      let ongoing = false;
+      if (target && (k === "resume" || k === "answer" || k === "complete" || k === "cancel" || k === "decline")) {
+        const until = await this.ctx.storage.get(talkKey);
+        ongoing = !!until && until > Date.now();
+      }
       if (!target || (!this.visible(a, target.a) && !pairing && !ongoing)) {
         send(ws, { t: "error", code: "offline", to, ref: m.data && m.data.tid });
         return;
       }
+      if (k === "offer" || k === "resume" || k === "answer") await this.ctx.storage.put(talkKey, Date.now() + TALK_TTL);
       send(target.ws, { t: "signal", from: a.id, data: m.data });
       return;
     }

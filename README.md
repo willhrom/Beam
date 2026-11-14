@@ -42,6 +42,16 @@ Only people the admin adds can use Beam. The first person to open Beam enters th
 
 ## Security
 
+Hardening in place:
+- New PINs must be 6–12 digits (older 4–5 digit PINs still sign in). Wrong-PIN lockouts per network and per account.
+- When a device signs in to an account, that account's other devices are alerted.
+- Connections that haven't signed in are capped per network and overall; malformed messages are dropped.
+- A transfer may resume across networks only between two devices that actually started it (for 30 minutes).
+- The direct (Bluetooth / Wi-Fi Direct) route only connects devices whose keys are already known (same account or paired), and doesn't broadcast the device name.
+
+What the server can see: device names, who sends to whom, and file names and sizes (in the offer). Never file contents.
+
+
 - Files go **directly between devices** over a WebRTC data channel, encrypted with DTLS. The Cloudflare server only introduces devices and never sees file contents.
 - Each device has its own P-256 key (Android Keystore, or a non-exportable WebCrypto key). Its device ID is a hash of that key, and the server makes every device prove it owns its key before it can appear.
 - Each side **signs** its connection offer/answer, which includes the encryption fingerprint. So the server can't swap in its own keys to read a transfer.

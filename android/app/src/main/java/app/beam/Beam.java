@@ -240,6 +240,10 @@ final class Beam {
         account = null;
         event("toast", m.optString("reason", "Signed out"));
         break;
+      case "account-alert":
+        // Someone signed in to this account on another device.
+        notify.accountAlert(trim(m.optString("device", "A device")));
+        break;
       case "account-error":
       case "account-ok":
         event("toast", m.optString("reason", m.optString("message")));

@@ -136,11 +136,12 @@ final class Nearby {
 
   boolean usable() { return beam.running && beam.account != null && allowed(beam.app); }
 
-  /** What other phones see before connecting: Beam ID, who may see us, device kind and name. */
+  /**
+   * What other phones see over Bluetooth before connecting. No device name: the direct route
+   * is only used between your own and paired devices, which already know each other's names.
+   */
   private String endpointName() {
-    String name = beam.prefs.name.replace("|", " ");
-    if (name.length() > 24) name = name.substring(0, 24);
-    return "b1|" + beam.me.id + "|" + (beam.prefs.nearby ? "e" : "p") + "|android|" + name;
+    return "b1|" + beam.me.id + "|p|android|";
   }
 
   // ---------- advertising: always on while Beam runs, so others can find this phone ----------
@@ -187,11 +188,11 @@ final class Nearby {
     @Override public void onEndpointFound(String endpointId, DiscoveredEndpointInfo info) {
       String[] p = info.getEndpointName().split("\\|", 5);
       if (p.length < 5 || !"b1".equals(p[0]) || !p[1].matches("[0-9a-f]{32}") || p[1].equals(beam.me.id)) return;
-      boolean mine = beam.prefs.paired.containsKey(p[1]);
-      if (!"e".equals(p[2]) && !mine) return; // only visible to its own devices
-      if (!beam.prefs.nearby && !mine) return; // we chose to only deal with our own devices
+      // Offline, only devices whose keys we already know: your own (same account) and paired ones.
+      // Strangers can't reach this phone without the server checking they've been invited.
       Prefs.Paired pp = beam.prefs.paired.get(p[1]);
-      Beam.Peer peer = new Beam.Peer(p[1], pp != null ? pp.name : Beam.trim(p[4]), p[3], pp != null ? pp.pub : "");
+      if (pp == null) return;
+      Beam.Peer peer = new Beam.Peer(p[1], pp.name, p[3], pp.pub);
       peer.endpointId = endpointId;
       found.put(endpointId, peer);
       beam.changed();
@@ -219,6 +220,8 @@ final class Nearby {
       }
       l.token = info.getRawAuthenticationToken();
       client.acceptConnection(endpointId, payloads);
+      final Link link = l;
+      beam.main.postDelayed(() -> { if (!link.verified && !link.closed) { link.close(); lost(link); } }, 20000);
     }
 
     @Override public void onConnectionResult(String endpointId, ConnectionResolution result) {
@@ -345,7 +348,7 @@ final class Nearby {
           && Crypto.verify(pub, m.optString("sig"), "beam-nearby|" + Crypto.hex(l.token) + "|" + id)
           && (l.expectId == null || l.expectId.equals(id));
       boolean mine = beam.prefs.paired.containsKey(id);
-      if (!ok || (!beam.prefs.nearby && !mine)) { l.close(); lost(l); return; }
+      if (!ok || !mine) { l.close(); lost(l); return; } // only your own and paired devices
       l.verified = true;
       l.peerId = id;
       l.peerName = mine ? beam.prefs.paired.get(id).name : Beam.trim(m.optString("name", "Device"));
