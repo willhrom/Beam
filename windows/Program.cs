@@ -70,9 +70,9 @@ namespace Beam
                         foreach (var f in files) w.WriteLine(f);
                         if (shareText != null) w.WriteLine("TEXT\t" + Convert.ToBase64String(Encoding.UTF8.GetBytes(shareText)));
                     }
-                    catch { }
+                    catch { showSignal.Set(); } // couldn't hand it over: at least bring Beam up
                 }
-                showSignal.Set();
+                else showSignal.Set(); // opened from the Start menu: show Beam's window
                 return;
             }
 
