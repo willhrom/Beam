@@ -12,6 +12,14 @@ An AirDrop-style way to send files, photos, text and links between your devices.
 - **Nearby**: devices on the same WiFi (same public internet address) see each other automatically, like AirDrop's "Everyone".
 - **My devices**: pair once (Settings → Show a code / Enter a code, then check both screens show the same 6-digit number). Paired devices see each other anywhere, even on different networks, and can skip the Accept prompt.
 
+## Offline sharing (Android ↔ Android)
+
+With no internet or shared WiFi (a plane, a park, a dead zone), Android phones still find each other: Beam advertises over Bluetooth Low Energy and Google's Nearby Connections moves files over a direct Wi-Fi link between the phones. Offline devices show "· offline" under their name. When both phones can reach the server, Beam uses the normal internet path instead.
+
+Each side signs Nearby's link token with its Beam key (`beam-nearby|<token hex>|<deviceId>`), so a paired device can't be impersonated and nobody can sit in the middle. Phones set to "my devices only" only show up for their paired devices.
+
+Offline transfers don't resume after a drop yet, and text sent offline is limited to 30 KB.
+
 ## Security
 
 - Files go **directly between devices** over a WebRTC data channel, encrypted with DTLS. The Cloudflare server only introduces devices and never sees file contents.

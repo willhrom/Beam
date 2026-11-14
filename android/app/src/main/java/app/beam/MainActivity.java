@@ -53,14 +53,20 @@ public class MainActivity extends Activity implements Beam.Listener {
     beam = Beam.get(this);
     build();
     BeamService.start(this);
+    List<String> need = new ArrayList<>();
     if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-      requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS }, 2);
-    } else {
-      askBattery();
+      need.add(Manifest.permission.POST_NOTIFICATIONS);
     }
+    // Bluetooth + nearby Wi-Fi, for offline sharing with other phones
+    if (beam.prefs.offline) for (String p : Nearby.permissions()) if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) need.add(p);
+    if (!need.isEmpty()) requestPermissions(need.toArray(new String[0]), 2);
+    else askBattery();
   }
 
-  @Override public void onRequestPermissionsResult(int code, String[] p, int[] r) { askBattery(); }
+  @Override public void onRequestPermissionsResult(int code, String[] p, int[] r) {
+    beam.nearby.refresh(); // starts advertising, and discovery if this screen is showing
+    askBattery();
+  }
 
   /** Android may pause background apps to save battery; ask once to be left running. */
   private void askBattery() {
@@ -86,6 +92,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     super.onResume();
     beam.listeners.add(this);
     beam.kick();
+    beam.nearby.discover(true);
     render();
     // show any request that arrived while we were away
     for (Transfer t : beam.tx.values()) if (t.incoming && Transfer.ASKING.equals(t.state)) { showIncoming(t); break; }
@@ -94,6 +101,7 @@ public class MainActivity extends Activity implements Beam.Listener {
   @Override protected void onPause() {
     super.onPause();
     beam.listeners.remove(this);
+    beam.nearby.discover(false);
   }
 
   // ---------- layout ----------
@@ -141,23 +149,25 @@ public class MainActivity extends Activity implements Beam.Listener {
   }
 
   private void render() {
-    status.setText(!beam.prefs.enabled ? "Off — turn on in Settings" : !beam.online ? "Connecting…"
+    status.setText(!beam.prefs.enabled ? "Off — turn on in Settings"
+        : !beam.online ? (beam.nearby.usable() ? "No internet · offline sharing with nearby phones" : "Connecting…")
         : "Visible as " + beam.prefs.name + " · " + (beam.prefs.nearby ? "Everyone nearby" : "My devices only"));
 
     // peers (rebuilt only when something about them changed)
     StringBuilder key = new StringBuilder();
-    for (Beam.Peer p : beam.peers) key.append(p.id).append(p.name).append(noteFor(p)).append(beam.prefs.paired.containsKey(p.id)).append('|');
+    List<Beam.Peer> all = beam.allPeers();
+    for (Beam.Peer p : all) key.append(p.id).append(p.name).append(noteFor(p)).append(beam.prefs.paired.containsKey(p.id)).append(beam.isOfflineOnly(p.id)).append('|');
     if (!key.toString().equals(peersKey)) {
       peersKey = key.toString();
       peersGrid.removeAllViews();
-      for (Beam.Peer p : beam.peers) {
-        LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id), noteFor(p));
+      for (Beam.Peer p : all) {
+        LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id), noteFor(p), beam.isOfflineOnly(p.id));
         b.setOnClickListener(v -> chooseWhat(p.id));
         peersGrid.addView(b);
       }
     }
-    empty.setVisibility(beam.peers.isEmpty() ? View.VISIBLE : View.GONE);
-    empty.setText(beam.online ? "Looking for devices…\nOpen Beam on another device on this WiFi,\nor pair one in Settings." : "");
+    empty.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
+    empty.setText(beam.online || beam.nearby.usable() ? "Looking for devices…\nOpen Beam on another device on this WiFi,\nor pair one in Settings." : "");
 
     // transfers, newest first
     transfers.removeAllViews();
@@ -375,9 +385,11 @@ public class MainActivity extends Activity implements Beam.Listener {
     Switch on = sw("Run in the background", beam.prefs.enabled);
     Switch nb = sw("Everyone nearby can see me", beam.prefs.nearby);
     Switch aa = sw("Auto-accept from my devices", beam.prefs.autoAccept);
+    Switch off = sw("Offline sharing with nearby phones (Bluetooth + Wi-Fi Direct)", beam.prefs.offline);
     l.addView(on);
     l.addView(nb);
     l.addView(aa);
+    l.addView(off);
     l.addView(Ui.text(this, "Device code " + Crypto.shortId(beam.me.id), 12, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 8, 0, 0));
 
     l.addView(label("My devices"));
@@ -413,7 +425,10 @@ public class MainActivity extends Activity implements Beam.Listener {
       beam.prefs.nearby = nb.isChecked();
       beam.prefs.autoAccept = aa.isChecked();
       beam.prefs.enabled = on.isChecked();
+      boolean wantOffline = off.isChecked() && !beam.prefs.offline;
+      beam.prefs.offline = off.isChecked();
       beam.prefs.save();
+      if (wantOffline && !Nearby.allowed(this)) requestPermissions(Nearby.permissions(), 3);
       if (wasOn && !beam.prefs.enabled) BeamService.stop(this);
       else if (!wasOn && beam.prefs.enabled) BeamService.start(this);
       beam.updateServer();

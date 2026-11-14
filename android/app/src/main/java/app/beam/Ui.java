@@ -100,7 +100,7 @@ final class Ui {
   }
 
   /** A round device bubble with a name underneath, used on the main screen and in the share sheet. */
-  static LinearLayout peerBubble(Context c, Beam.Peer p, boolean paired, String note) {
+  static LinearLayout peerBubble(Context c, Beam.Peer p, boolean paired, String note, boolean offline) {
     LinearLayout box = col(c);
     box.setGravity(Gravity.CENTER_HORIZONTAL);
     int pad = dp(c, 6);
@@ -115,7 +115,8 @@ final class Ui {
     TextView name = oneLine(text(c, p.name, 13, TEXT, false));
     name.setGravity(Gravity.CENTER);
     box.addView(name, margins(c, dp(c, 96), -2, 0, 6, 0, 0));
-    TextView tag = text(c, note != null ? note : paired ? "My device" : "Nearby", 11, note != null || paired ? ACCENT2 : DIM, false);
+    String label = note != null ? note : (paired ? "My device" : "Nearby") + (offline ? " · offline" : "");
+    TextView tag = text(c, label, 11, note != null || paired ? ACCENT2 : DIM, false);
     tag.setGravity(Gravity.CENTER);
     box.addView(tag, lp(-2, -2));
     return box;

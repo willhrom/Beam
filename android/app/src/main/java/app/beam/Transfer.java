@@ -75,6 +75,7 @@ final class Transfer {
   volatile String state;
   String reason, offerSdp;
   int gen;
+  boolean offline; // going over Bluetooth + direct Wi-Fi (Nearby) instead of WebRTC
   final long created = System.currentTimeMillis();
 
   private volatile Conn conn;
@@ -192,10 +193,13 @@ final class Transfer {
     abstract void failed(String e);
   }
 
-  private void ui() {
+  void ui() {
     lastUi = System.currentTimeMillis();
     beam.transferChanged(this);
   }
+
+  /** Progress changed; refresh the screen at most every 300 ms. Safe from any thread. */
+  void progressUi() { progress(); }
 
   private void progress() {
     long now = System.currentTimeMillis();
@@ -208,7 +212,8 @@ final class Transfer {
   void startSend() {
     state = PREPARING;
     ui();
-    connectOut("offer");
+    if (offline) beam.nearby.startSend(this, beam.nearby.peerById(peerId));
+    else connectOut("offer");
   }
 
   /** Opens a new connection: the first offer, or a resume after a drop. */
@@ -467,6 +472,7 @@ final class Transfer {
   // ---------- receiving ----------
   void accept() {
     if (!ASKING.equals(state)) return;
+    if (offline) { beam.nearby.accept(this); return; }
     state = CONNECTING;
     ui();
     answerConn(offerSdp, gen);
@@ -656,6 +662,7 @@ final class Transfer {
     cleanupTemp();
     final Conn c = conn;
     beam.main.postDelayed(() -> { if (conn == c) closeConn(); }, 1500);
+    if (offline) beam.nearby.onFinish(this);
     if (incoming) beam.notify.received(this);
   }
 
@@ -670,6 +677,7 @@ final class Transfer {
     state = FAILED;
     reason = why;
     synchronized (lock) { lock.notifyAll(); }
+    if (offline) beam.nearby.onFail(this);
     if (incoming) new Thread(this::discardPartial).start();
     cleanupTemp();
     ui();

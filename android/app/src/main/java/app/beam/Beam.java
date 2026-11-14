@@ -36,6 +36,7 @@ final class Beam {
 
   static final class Peer {
     final String id, name, kind, pub;
+    String endpointId; // set when found offline over Bluetooth
     Peer(String id, String name, String kind, String pub) { this.id = id; this.name = name; this.kind = kind; this.pub = pub; }
   }
 
@@ -58,6 +59,7 @@ final class Beam {
   final Identity me;
   final Handler main = new Handler(Looper.getMainLooper());
   final Notify notify;
+  final Nearby nearby;
   final List<Listener> listeners = new CopyOnWriteArrayList<>();
   final Map<String, Transfer> tx = new LinkedHashMap<>();
   List<Peer> peers = new ArrayList<>();
@@ -75,6 +77,7 @@ final class Beam {
     this.prefs = new Prefs(app);
     this.me = new Identity();
     this.notify = new Notify(app);
+    this.nearby = new Nearby(this);
     try {
       ice = new JSONArray("[{\"urls\":[\"stun:stun.cloudflare.com:3478\",\"stun:stun.l.google.com:19302\"]}]");
     } catch (Exception ignored) {}
@@ -85,6 +88,7 @@ final class Beam {
     if (running) return;
     running = true;
     connect();
+    nearby.refresh();
   }
 
   void stop() {
@@ -94,6 +98,7 @@ final class Beam {
     ws = null;
     online = false;
     peers = new ArrayList<>();
+    nearby.stopAll();
     changed();
   }
 
@@ -301,13 +306,24 @@ final class Beam {
     Transfer t = new Transfer(this, tid, true, from, name, d.optString("kind", "web"), pp != null, items);
     t.offerSdp = sdp;
     t.gen = d.optInt("gen", 0);
-    tx.put(tid, t);
-    if (pp != null && prefs.autoAccept) {
+    incoming(t);
+  }
+
+  /** A new incoming transfer (over the internet or offline): auto-accept from my devices, otherwise ask. */
+  void incoming(final Transfer t) {
+    tx.put(t.tid, t);
+    if (t.paired && prefs.autoAccept) {
       t.accept();
     } else {
       notify.request(t);
       event("incoming", t);
-      main.postDelayed(() -> { if (Transfer.ASKING.equals(t.state)) { notify.cancelRequest(t); t.fail("Expired"); } }, OFFER_TIMEOUT);
+      main.postDelayed(() -> {
+        if (Transfer.ASKING.equals(t.state)) {
+          notify.cancelRequest(t);
+          if (t.offline) nearby.decline(t);
+          t.fail("Expired");
+        }
+      }, OFFER_TIMEOUT);
     }
     changed();
   }
@@ -315,6 +331,8 @@ final class Beam {
   // ---------- actions from the UI ----------
   Transfer send(Peer p, List<Transfer.Item> items) {
     Transfer t = new Transfer(this, Crypto.randomId(), false, p.id, p.name, p.kind, prefs.paired.containsKey(p.id), items);
+    // Over the internet when the server can reach them; otherwise Bluetooth + direct Wi-Fi.
+    t.offline = onlinePeer(p.id) == null && nearby.peerById(p.id) != null;
     tx.put(t.tid, t);
     t.startSend();
     changed();
@@ -330,7 +348,8 @@ final class Beam {
     Transfer t = tx.get(tid);
     if (t == null || !Transfer.ASKING.equals(t.state)) return;
     notify.cancelRequest(t);
-    try { signal(t.peerId, new JSONObject().put("k", "decline").put("tid", tid)); } catch (Exception ignored) {}
+    if (t.offline) nearby.decline(t);
+    else try { signal(t.peerId, new JSONObject().put("k", "decline").put("tid", tid)); } catch (Exception ignored) {}
     t.state = Transfer.FAILED;
     t.reason = "Declined";
     tx.remove(tid);
@@ -340,7 +359,7 @@ final class Beam {
   void cancel(String tid) {
     Transfer t = tx.get(tid);
     if (t == null) return;
-    if (Transfer.WAITING.equals(t.state) || Transfer.PREPARING.equals(t.state) || Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state)) {
+    if (!t.offline && (Transfer.WAITING.equals(t.state) || Transfer.PREPARING.equals(t.state) || Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state))) {
       try { signal(t.peerId, new JSONObject().put("k", "cancel").put("tid", tid)); } catch (Exception ignored) {}
     }
     t.fail("Cancelled");
@@ -356,6 +375,7 @@ final class Beam {
       wsSend(new JSONObject().put("t", "update").put("name", prefs.name).put("nearby", prefs.nearby).put("watch", new JSONArray(prefs.watch())));
     } catch (Exception ignored) {}
     notify.refreshStatus(this);
+    if (running) nearby.refresh();
     changed();
   }
 
@@ -413,10 +433,29 @@ final class Beam {
     event("toast", ok ? "Paired with " + name : (why != null ? why : "Pairing failed"));
   }
 
-  Peer peer(String id) {
+  Peer onlinePeer(String id) {
     for (Peer p : peers) if (p.id.equals(id)) return p;
     return null;
   }
+
+  Peer peer(String id) {
+    Peer p = onlinePeer(id);
+    return p != null ? p : nearby.peerById(id);
+  }
+
+  /** Everyone reachable: through the server, plus phones found offline over Bluetooth. */
+  List<Peer> allPeers() {
+    List<Peer> all = new ArrayList<>(peers);
+    for (Peer p : nearby.found.values()) if (onlinePeer(p.id) == null && !contains(all, p.id)) all.add(p);
+    return all;
+  }
+
+  private static boolean contains(List<Peer> list, String id) {
+    for (Peer p : list) if (p.id.equals(id)) return true;
+    return false;
+  }
+
+  boolean isOfflineOnly(String id) { return onlinePeer(id) == null && nearby.peerById(id) != null; }
 
   // ---------- listeners ----------
   void changed() {

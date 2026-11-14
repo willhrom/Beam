@@ -23,7 +23,7 @@ final class Prefs {
 
   private final SharedPreferences sp;
   String name;
-  boolean nearby, autoAccept, enabled;
+  boolean nearby, autoAccept, enabled, offline;
   final Map<String, Paired> paired = new LinkedHashMap<>();
 
   Prefs(Context c) {
@@ -35,6 +35,7 @@ final class Prefs {
     nearby = sp.getBoolean("nearby", true);
     autoAccept = sp.getBoolean("autoAccept", true);
     enabled = sp.getBoolean("enabled", true);
+    offline = sp.getBoolean("offline", true);
     try {
       JSONObject o = new JSONObject(sp.getString("paired", "{}"));
       for (Iterator<String> it = o.keys(); it.hasNext(); ) {
@@ -51,7 +52,7 @@ final class Prefs {
       for (Paired p : paired.values()) o.put(p.id, new JSONObject().put("pub", p.pub).put("name", p.name).put("kind", p.kind));
     } catch (Exception ignored) {}
     sp.edit().putString("name", name).putBoolean("nearby", nearby).putBoolean("autoAccept", autoAccept)
-        .putBoolean("enabled", enabled).putString("paired", o.toString()).apply();
+        .putBoolean("enabled", enabled).putBoolean("offline", offline).putString("paired", o.toString()).apply();
   }
 
   List<String> watch() { return new ArrayList<>(paired.keySet()); }

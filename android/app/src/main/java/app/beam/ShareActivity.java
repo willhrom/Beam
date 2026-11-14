@@ -67,12 +67,14 @@ public class ShareActivity extends Activity implements Beam.Listener {
     super.onResume();
     beam.listeners.add(this);
     beam.kick();
+    beam.nearby.discover(true);
     render();
   }
 
   @Override protected void onPause() {
     super.onPause();
     beam.listeners.remove(this);
+    beam.nearby.discover(false);
   }
 
   @Override protected void onDestroy() {
@@ -85,14 +87,15 @@ public class ShareActivity extends Activity implements Beam.Listener {
 
   private void render() {
     if (row == null || busy) return;
-    hint.setText(!beam.online ? "Connecting…" : beam.peers.isEmpty() ? "Looking for devices… Open Beam on the other device." : "Tap a device");
+    List<Beam.Peer> all = beam.allPeers();
+    hint.setText(all.isEmpty() ? (beam.online || beam.nearby.usable() ? "Looking for devices… Open Beam on the other device." : "Connecting…") : "Tap a device");
     StringBuilder k = new StringBuilder();
-    for (Beam.Peer p : beam.peers) k.append(p.id).append(p.name).append('|');
+    for (Beam.Peer p : all) k.append(p.id).append(p.name).append(beam.isOfflineOnly(p.id)).append('|');
     if (k.toString().equals(key)) return;
     key = k.toString();
     row.removeAllViews();
-    for (Beam.Peer p : beam.peers) {
-      LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id), null);
+    for (Beam.Peer p : all) {
+      LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id), null, beam.isOfflineOnly(p.id));
       b.setOnClickListener(v -> send(p.id));
       row.addView(b);
     }
