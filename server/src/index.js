@@ -58,6 +58,33 @@ function netKey(ip) {
   }
   return "4:" + ip;
 }
+// PINs are stored only as salted PBKDF2 hashes.
+async function hashPin(pin, saltHex) {
+  const salt = saltHex ? Uint8Array.from(saltHex.match(/../g).map((h) => parseInt(h, 16))) : crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: 100000 }, key, 256);
+  return { s: hex(salt), h: hex(bits) };
+}
+async function checkPin(rec, pin) {
+  if (!rec || !rec.s || !/^\d{4,12}$/.test(String(pin || ""))) return false;
+  const { h } = await hashPin(String(pin), rec.s);
+  let diff = 0;
+  for (let i = 0; i < h.length; i++) diff |= h.charCodeAt(i) ^ rec.h.charCodeAt(i);
+  return diff === 0 && h.length === rec.h.length;
+}
+const validPin = (p) => /^\d{4,12}$/.test(String(p || ""));
+const validUser = (u) => /^[a-z0-9._-]{2,32}$/.test(u);
+const normUser = (u) => String(u || "").trim().toLowerCase();
+const INVITE_TTL = 7 * 24 * 3600 * 1000;
+function inviteCode() {
+  const abc = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O, 1/I
+  const r = crypto.getRandomValues(new Uint8Array(8));
+  const c = [...r].map((x) => abc[x % abc.length]).join("");
+  return c.slice(0, 4) + "-" + c.slice(4);
+}
+const normInvite = (c) => String(c || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+const LOCK_AFTER = 5, LOCK_FOR = 15 * 60 * 1000;
+
 const clean = (s, n) => String(s ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, n);
 const send = (ws, obj) => {
   try {
@@ -83,7 +110,13 @@ export class Hub extends DurableObject {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  /** Signed-in devices. */
   sockets() {
+    return this.allSockets().filter((s) => s.a.user);
+  }
+
+  /** Every connected device that has proven its key, signed in or not. */
+  allSockets() {
     const out = [];
     for (const ws of this.ctx.getWebSockets()) {
       const a = ws.deserializeAttachment();
@@ -92,9 +125,53 @@ export class Hub extends DurableObject {
     return out;
   }
 
+  async hasUsers() { return !!(await this.ctx.storage.get("meta:hasUsers")); }
+
+  /** Finish connecting a device that belongs to an account. */
+  async signedIn(ws, a, rec) {
+    a.admin = !!rec.admin;
+    ws.serializeAttachment(a);
+    send(ws, { t: "welcome", id: a.id, ice: await this.turn(), user: { username: a.user, name: rec.name, admin: a.admin } });
+    this.broadcast(a, null);
+  }
+
+  /** Disconnect every device matching `pred` (removed person or device). */
+  kick(pred, why) {
+    for (const s of this.allSockets()) {
+      if (!pred(s.a)) continue;
+      const before = { ...s.a };
+      s.ws.serializeAttachment({});
+      send(s.ws, { t: "signed-out", reason: why });
+      try { s.ws.close(4002, "signed out"); } catch {}
+      if (before.user) this.broadcast(before, before);
+    }
+  }
+
+  async adminList() {
+    const users = await this.ctx.storage.list({ prefix: "user:" });
+    const devs = await this.ctx.storage.list({ prefix: "dev:" });
+    const online = new Set(this.sockets().map((s) => s.a.id));
+    const out = [];
+    for (const [k, u] of users) {
+      const username = k.slice(5);
+      const devices = [];
+      for (const [dk, d] of devs) if (d.user === username) devices.push({ id: dk.slice(4), name: d.name, kind: d.kind, online: online.has(dk.slice(4)) });
+      out.push({
+        username, name: u.name, admin: !!u.admin,
+        status: u.s ? "active" : "invited",
+        invite: u.invite && u.invite.exp > Date.now() ? u.invite.code : null,
+        locked: Object.values(u.locks || {}).some((l) => l.until > Date.now()),
+        devices,
+      });
+    }
+    out.sort((x, y) => (y.admin - x.admin) || x.name.localeCompare(y.name));
+    return { t: "admin-list", users: out };
+  }
+
   // Can `viewer` see `peer`? Same network (both visible to everyone) or paired both ways.
   visible(viewer, peer) {
-    if (viewer.id === peer.id) return false;
+    if (viewer.id === peer.id || !viewer.user || !peer.user) return false;
+    if (viewer.user === peer.user) return true; // my own devices, anywhere
     if (viewer.nearby && peer.nearby && viewer.net === peer.net) return true;
     return viewer.watch.includes(peer.id) && peer.watch.includes(viewer.id);
   }
@@ -102,7 +179,7 @@ export class Hub extends DurableObject {
   peersFor(a, all) {
     return all
       .filter((p) => this.visible(a, p.a))
-      .map((p) => ({ id: p.a.id, name: p.a.name, kind: p.a.kind, pub: p.a.pub, paired: a.watch.includes(p.a.id), local: p.a.net === a.net }));
+      .map((p) => ({ id: p.a.id, name: p.a.name, kind: p.a.kind, pub: p.a.pub, paired: a.watch.includes(p.a.id), local: p.a.net === a.net, mine: p.a.user === a.user }));
   }
 
   // Send fresh peer lists to everyone whose view of `changed` may have changed.
@@ -161,10 +238,12 @@ export class Hub extends DurableObject {
       }
       const id = await idFromPub(pub);
       // A device reconnecting replaces its old connection.
-      for (const s of this.sockets())
+      for (const s of this.allSockets())
         if (s.a.id === id) {
+          const before = { ...s.a };
           s.ws.serializeAttachment({});
           try { s.ws.close(4000, "replaced"); } catch {}
+          if (before.user) this.broadcast(before, before);
         }
       const me = {
         id,
@@ -175,13 +254,150 @@ export class Hub extends DurableObject {
         watch: (Array.isArray(m.watch) ? m.watch : []).map(String).filter((x) => /^[0-9a-f]{32}$/.test(x)).slice(0, MAX_WATCH),
         net: a.net,
         tries: 0,
+        user: null,
       };
-      ws.serializeAttachment(me);
-      send(ws, { t: "welcome", id, ice: await this.turn() });
-      this.broadcast(me, null);
+      // Is this device signed in to an account?
+      const dev = await this.ctx.storage.get("dev:" + id);
+      const rec = dev && (await this.ctx.storage.get("user:" + dev.user));
+      if (dev && !rec) await this.ctx.storage.delete("dev:" + id);
+      if (!rec) {
+        ws.serializeAttachment(me);
+        send(ws, { t: "welcome", id, login: true, setup: !(await this.hasUsers()) });
+        return;
+      }
+      me.user = dev.user;
+      if (dev.name !== me.name || dev.kind !== me.kind) await this.ctx.storage.put("dev:" + id, { ...dev, name: me.name, kind: me.kind });
+      await this.signedIn(ws, me, rec);
       return;
     }
     if (!a.id) return;
+
+    // ---------- signing in (the only thing a device can do before it has an account) ----------
+    if (m.t === "setup" && !a.user) {
+      // First run: whoever has the setup code creates the admin account.
+      a.tries = (a.tries || 0) + 1;
+      ws.serializeAttachment(a);
+      if (a.tries > 5) return send(ws, { t: "login-error", reason: "Too many tries. Reconnect and try again." });
+      if (await this.hasUsers()) return send(ws, { t: "login-error", reason: "Beam is already set up. Sign in instead." });
+      const code = String(this.env.BEAM_SETUP_CODE || "");
+      if (!code || normInvite(m.code) !== normInvite(code)) return send(ws, { t: "login-error", reason: "That setup code isn't right." });
+      const username = normUser(m.user), name = clean(m.name, 40);
+      if (!validUser(username)) return send(ws, { t: "login-error", reason: "Usernames are 2–32 letters, numbers, dots, dashes or underscores." });
+      if (!name) return send(ws, { t: "login-error", reason: "Enter your name." });
+      if (!validPin(m.pin)) return send(ws, { t: "login-error", reason: "PINs are 4–12 digits." });
+      const rec = { name, admin: true, ...(await hashPin(String(m.pin))), created: Date.now() };
+      await this.ctx.storage.put("user:" + username, rec);
+      await this.ctx.storage.put("meta:hasUsers", true);
+      await this.ctx.storage.put("dev:" + a.id, { user: username, name: a.name, kind: a.kind, added: Date.now() });
+      a.user = username;
+      return this.signedIn(ws, a, rec);
+    }
+
+    if (m.t === "login" && !a.user) {
+      const username = normUser(m.user);
+      const key = "user:" + username;
+      const rec = validUser(username) ? await this.ctx.storage.get(key) : null;
+      const wrong = () => send(ws, { t: "login-error", reason: m.invite ? "That username or invite code isn't right." : "Wrong username or PIN." });
+      if (!rec) return wrong();
+      // Wrong-PIN lockouts are per network, so someone guessing elsewhere can't lock you out at home.
+      // A global cap still stops guessing spread across many networks.
+      const now = Date.now();
+      rec.locks = rec.locks || {};
+      const nl = rec.locks[a.net] || { n: 0, until: 0 };
+      const g = rec.gfail && now - rec.gfail.since < 3600000 ? rec.gfail : { n: 0, since: now };
+      const until = Math.max(nl.until || 0, g.n >= 25 ? g.since + 3600000 : 0);
+      if (until > now) {
+        const mins = Math.ceil((until - now) / 60000);
+        return send(ws, { t: "login-error", reason: `Too many wrong tries. Try again in ${mins} minute${mins === 1 ? "" : "s"}.` });
+      }
+      let ok = false;
+      if (m.invite) {
+        ok = !!rec.invite && rec.invite.exp > Date.now() && normInvite(m.invite) === normInvite(rec.invite.code);
+        if (ok && !validPin(m.pin)) return send(ws, { t: "login-error", reason: "Choose a PIN of 4–12 digits." });
+        if (ok) { Object.assign(rec, await hashPin(String(m.pin))); delete rec.invite; }
+      } else {
+        ok = await checkPin(rec, m.pin);
+      }
+      if (!ok) {
+        nl.n = (nl.n || 0) + 1;
+        if (nl.n >= LOCK_AFTER) { nl.until = now + LOCK_FOR; nl.n = 0; }
+        rec.locks[a.net] = nl;
+        const nets = Object.keys(rec.locks);
+        if (nets.length > 50) delete rec.locks[nets[0]];
+        g.n += 1;
+        rec.gfail = g;
+        await this.ctx.storage.put(key, rec);
+        return wrong();
+      }
+      delete rec.locks[a.net];
+      await this.ctx.storage.put(key, rec);
+      await this.ctx.storage.put("dev:" + a.id, { user: username, name: a.name, kind: a.kind, added: Date.now() });
+      a.user = username;
+      return this.signedIn(ws, a, rec);
+    }
+
+    if (!a.user) return; // everything below needs a signed-in device
+
+    if (m.t === "logout") {
+      await this.ctx.storage.delete("dev:" + a.id);
+      return this.kick((x) => x.id === a.id, "You signed out on this device.");
+    }
+
+    if (m.t === "pin-change") {
+      const key = "user:" + a.user;
+      const rec = await this.ctx.storage.get(key);
+      if (!rec || !(await checkPin(rec, m.old))) return send(ws, { t: "account-error", reason: "Your current PIN isn't right." });
+      if (!validPin(m.pin)) return send(ws, { t: "account-error", reason: "PINs are 4–12 digits." });
+      Object.assign(rec, await hashPin(String(m.pin)));
+      await this.ctx.storage.put(key, rec);
+      return send(ws, { t: "account-ok", message: "PIN changed." });
+    }
+
+    // ---------- admin: managing people ----------
+    if (m.t && m.t.startsWith("admin-")) {
+      if (!a.admin) return;
+      const username = normUser(m.user);
+      const key = "user:" + username;
+      if (m.t === "admin-add") {
+        const name = clean(m.name, 40);
+        if (!validUser(username)) return send(ws, { t: "account-error", reason: "Usernames are 2–32 letters, numbers, dots, dashes or underscores." });
+        if (!name) return send(ws, { t: "account-error", reason: "Enter their name." });
+        if (await this.ctx.storage.get(key)) return send(ws, { t: "account-error", reason: "That username is taken." });
+        const code = inviteCode();
+        await this.ctx.storage.put(key, { name, admin: false, invite: { code, exp: Date.now() + INVITE_TTL }, created: Date.now() });
+        send(ws, { t: "admin-invite", user: username, name, code });
+      } else if (m.t === "admin-reset") {
+        const rec = await this.ctx.storage.get(key);
+        if (!rec) return;
+        const code = inviteCode();
+        rec.invite = { code, exp: Date.now() + INVITE_TTL };
+        rec.locks = {};
+        delete rec.gfail;
+        await this.ctx.storage.put(key, rec);
+        send(ws, { t: "admin-invite", user: username, name: rec.name, code, reset: true });
+      } else if (m.t === "admin-remove") {
+        if (username === a.user) return send(ws, { t: "account-error", reason: "You can't remove yourself." });
+        await this.ctx.storage.delete(key);
+        const devs = await this.ctx.storage.list({ prefix: "dev:" });
+        for (const [dk, d] of devs) if (d.user === username) await this.ctx.storage.delete(dk);
+        this.kick((x) => x.user === username, "Your Beam account was removed.");
+      } else if (m.t === "admin-remove-device") {
+        const id = String(m.id || "");
+        const d = await this.ctx.storage.get("dev:" + id);
+        if (!d) return;
+        await this.ctx.storage.delete("dev:" + id);
+        this.kick((x) => x.id === id, "This device was signed out by the admin.");
+      } else if (m.t === "admin-set-admin") {
+        const rec = await this.ctx.storage.get(key);
+        if (!rec || username === a.user) return;
+        rec.admin = !!m.admin;
+        await this.ctx.storage.put(key, rec);
+        for (const s of this.sockets()) if (s.a.user === username) { s.a.admin = rec.admin; s.ws.serializeAttachment(s.a); }
+      } else if (m.t !== "admin-list") {
+        return;
+      }
+      return send(ws, await this.adminList());
+    }
 
     if (m.t === "update") {
       const before = { ...a };

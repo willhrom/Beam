@@ -19,7 +19,7 @@ jobs:
           BEAM_URL: ${{ vars.BEAM_URL }}
         run: |
           URL="${BEAM_URL:-https://beam.wahromyk.workers.dev}"
-          sed "s#__BEAM_URL__#$URL#" mac/main.swift > "$RUNNER_TEMP/main.swift"
+          sed -e "s#__BEAM_URL__#$URL#" -e "s#__REPO__#${{ github.repository }}#" mac/main.swift > "$RUNNER_TEMP/main.swift"
           swiftc -O -swift-version 5 -target arm64-apple-macos13 -o "$RUNNER_TEMP/beam-arm64" "$RUNNER_TEMP/main.swift"
           swiftc -O -swift-version 5 -target x86_64-apple-macos13 -o "$RUNNER_TEMP/beam-x86" "$RUNNER_TEMP/main.swift"
           APP=Beam.app
@@ -29,6 +29,9 @@ jobs:
           iconutil -c icns mac/AppIcon.iconset -o $APP/Contents/Resources/AppIcon.icns
           codesign --force --deep --sign - $APP
           ditto -c -k --keepParent $APP Beam-mac.zip
+          SHA=$(shasum -a 256 Beam-mac.zip | cut -d' ' -f1)
+          echo "{\"version\": ${{ github.run_number }}, \"url\": \"https://github.com/${{ github.repository }}/releases/download/mac/Beam-mac.zip\", \"sha256\": \"$SHA\"}" > mac.json
+          cat mac.json
       - name: Publish the download
         uses: softprops/action-gh-release@v2
         with:
@@ -39,6 +42,8 @@ jobs:
             The first time, macOS will block it because it isn't from the App Store. Run this once in Terminal:
             xattr -cr /Applications/Beam.app
             then open Beam. It lives in the menu bar.
-          files: Beam-mac.zip
+          files: |
+            Beam-mac.zip
+            mac.json
           overwrite_files: true
           make_latest: false

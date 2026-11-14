@@ -37,6 +37,7 @@ final class Beam {
   static final class Peer {
     final String id, name, kind, pub;
     String endpointId; // set when found nearby over Bluetooth
+    boolean mine;      // signed in to the same account
     boolean local;     // the server says it's on our network
     Peer(String id, String name, String kind, String pub) { this.id = id; this.name = name; this.kind = kind; this.pub = pub; }
   }
@@ -67,6 +68,9 @@ final class Beam {
   JSONArray ice;
   boolean online, running;
   Pairing pairing;
+  JSONObject account;          // {username, name, admin} once signed in
+  boolean needLogin, needSetup;
+  String loginError;
 
   private final OkHttpClient http = new OkHttpClient.Builder().pingInterval(25, TimeUnit.SECONDS).readTimeout(0, TimeUnit.MILLISECONDS).build();
   private WebSocket ws;
@@ -85,9 +89,12 @@ final class Beam {
   }
 
   // ---------- lifecycle ----------
+  private boolean updaterScheduled;
+
   void start() {
     if (running) return;
     running = true;
+    if (!updaterScheduled) { updaterScheduled = true; Updater.schedule(this); }
     connect();
     nearby.refresh();
     Shortcuts.update(this);
@@ -167,6 +174,22 @@ final class Beam {
         break;
       }
       case "welcome":
+        if (m.optBoolean("login")) {
+          // This phone isn't signed in to a Beam account yet.
+          account = null;
+          online = false;
+          needLogin = true;
+          needSetup = m.optBoolean("setup");
+          nearby.stopAll();
+          notify.refreshStatus(this);
+          event("login", null);
+          changed();
+          break;
+        }
+        boolean wasLoggedOut = needLogin;
+        account = m.optJSONObject("user");
+        needLogin = false;
+        if (wasLoggedOut) { nearby.refresh(); event("login", null); event("toast", "Signed in as " + (account != null ? account.optString("name") : "")); }
         online = true;
         backoff = 1000;
         JSONArray i = m.optJSONArray("ice");
@@ -181,12 +204,22 @@ final class Beam {
           JSONObject p = a.getJSONObject(k);
           Peer peer = new Peer(p.getString("id"), p.optString("name", "Device"), p.optString("kind", "web"), p.optString("pub"));
           peer.local = p.optBoolean("local");
+          peer.mine = p.optBoolean("mine");
           list.add(peer);
           Prefs.Paired pp = prefs.paired.get(peer.id);
           if (pp != null && pp.pub.equals(peer.pub) && !pp.name.equals(peer.name)) { pp.name = peer.name; save = true; }
         }
+        // Devices on my own account link up automatically (their keys get pinned like a pairing).
+        boolean linked = false;
+        for (Peer p : list) {
+          if (p.mine && !p.pub.isEmpty() && !prefs.paired.containsKey(p.id)) {
+            prefs.paired.put(p.id, new Prefs.Paired(p.id, p.pub, p.name, p.kind));
+            linked = save = true;
+          }
+        }
         if (save) prefs.save();
         peers = list;
+        if (linked) updateServer();
         changed();
         break;
       }
@@ -198,6 +231,18 @@ final class Beam {
           Transfer t = tx.get(m.optString("ref"));
           if (t != null) t.peerUnreachable();
         }
+        break;
+      case "login-error":
+        loginError = m.optString("reason");
+        event("login", null);
+        break;
+      case "signed-out":
+        account = null;
+        event("toast", m.optString("reason", "Signed out"));
+        break;
+      case "account-error":
+      case "account-ok":
+        event("toast", m.optString("reason", m.optString("message")));
         break;
       case "pair-code":
         if (pairing != null && pairing.show) { pairing.code = m.getString("code"); event("pairing", null); }
@@ -396,6 +441,27 @@ final class Beam {
     prefs.paired.remove(id);
     prefs.save();
     updateServer();
+  }
+
+  // ---------- account ----------
+  void login(String user, String pin) {
+    try { wsSend(new JSONObject().put("t", "login").put("user", user).put("pin", pin)); } catch (Exception ignored) {}
+  }
+
+  void join(String user, String invite, String pin) {
+    try { wsSend(new JSONObject().put("t", "login").put("user", user).put("invite", invite).put("pin", pin)); } catch (Exception ignored) {}
+  }
+
+  void setup(String code, String name, String user, String pin) {
+    try { wsSend(new JSONObject().put("t", "setup").put("code", code).put("name", name).put("user", user).put("pin", pin)); } catch (Exception ignored) {}
+  }
+
+  void changePin(String old, String pin) {
+    try { wsSend(new JSONObject().put("t", "pin-change").put("old", old).put("pin", pin)); } catch (Exception ignored) {}
+  }
+
+  void logout() {
+    try { wsSend(new JSONObject().put("t", "logout")); } catch (Exception ignored) {}
   }
 
   // pairing

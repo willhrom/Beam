@@ -134,7 +134,7 @@ final class Nearby {
     return true;
   }
 
-  boolean usable() { return beam.running && allowed(beam.app); }
+  boolean usable() { return beam.running && beam.account != null && allowed(beam.app); }
 
   /** What other phones see before connecting: Beam ID, who may see us, device kind and name. */
   private String endpointName() {

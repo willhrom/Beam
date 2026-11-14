@@ -2,6 +2,7 @@ plugins { id 'com.android.application' }
 
 def run = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
 def server = System.getenv("BEAM_URL") ?: "https://beam.wahromyk.workers.dev"
+def repo = System.getenv("GITHUB_REPOSITORY") ?: "willhrom/Beam"
 
 android {
   namespace 'app.beam'
@@ -13,6 +14,7 @@ android {
     versionCode run
     versionName "1.0.${run}"
     buildConfigField "String", "SERVER_URL", "\"${server}\""
+    buildConfigField "String", "UPDATE_URL", "\"https://github.com/${repo}/releases/download/android/android.json\""
   }
   buildFeatures { buildConfig true }
   // The signing key lives in GitHub secrets, never in the repo.

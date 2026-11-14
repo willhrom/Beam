@@ -27,8 +27,11 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TURN_KEY_ID: ${{ secrets.TURN_KEY_ID }}
           TURN_KEY_API_TOKEN: ${{ secrets.TURN_KEY_API_TOKEN }}
+          BEAM_SETUP_CODE: ${{ secrets.BEAM_SETUP_CODE }}
         run: |
           npx --yes wrangler@4.162.0 deploy
+          # One-time code for creating the admin account (only works while there are no accounts)
+          if [ -n "$BEAM_SETUP_CODE" ]; then echo "$BEAM_SETUP_CODE" | npx --yes wrangler@4.162.0 secret put BEAM_SETUP_CODE; fi
           # Optional relay for devices that can't reach each other directly (Cloudflare Realtime TURN)
           if [ -n "$TURN_KEY_ID" ]; then
             echo "$TURN_KEY_ID" | npx --yes wrangler@4.162.0 secret put TURN_KEY_ID

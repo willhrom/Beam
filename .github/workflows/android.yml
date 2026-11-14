@@ -40,8 +40,12 @@ jobs:
       - name: Remove the key file
         if: always()
         run: rm -f "$RUNNER_TEMP/release.p12"
-      - name: Name the file
-        run: cp android/app/build/outputs/apk/release/app-release.apk beam.apk
+      - name: Name the file and write the update manifest
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk beam.apk
+          SHA=$(sha256sum beam.apk | cut -d' ' -f1)
+          echo "{\"version\": ${{ github.run_number }}, \"url\": \"https://github.com/${{ github.repository }}/releases/download/android/beam.apk\", \"sha256\": \"$SHA\"}" > android.json
+          cat android.json
       # Always published to the same "android" release, so the download link never changes.
       - name: Publish the download
         uses: softprops/action-gh-release@v2
@@ -49,6 +53,8 @@ jobs:
           tag_name: android
           name: Beam for Android (always the newest)
           body: "Install on your phone by opening: https://github.com/${{ github.repository }}/releases/download/android/beam.apk"
-          files: beam.apk
+          files: |
+            beam.apk
+            android.json
           overwrite_files: true
           make_latest: false

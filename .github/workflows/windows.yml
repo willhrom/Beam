@@ -23,9 +23,12 @@ jobs:
           BEAM_URL: ${{ vars.BEAM_URL }}
         run: |
           URL="${BEAM_URL:-https://beam.wahromyk.workers.dev}"
-          sed -i "s#__BEAM_URL__#$URL#" windows/Program.cs
+          sed -i -e "s#__BEAM_URL__#$URL#" -e "s#__REPO__#${{ github.repository }}#" windows/Program.cs
           dotnet publish windows/Beam.csproj -c Release -p:Version=1.0.${{ github.run_number }} -o out
           cp out/Beam.exe Beam.exe
+          SHA=$(sha256sum Beam.exe | cut -d' ' -f1)
+          echo "{\"version\": ${{ github.run_number }}, \"url\": \"https://github.com/${{ github.repository }}/releases/download/windows/Beam.exe\", \"sha256\": \"$SHA\"}" > windows.json
+          cat windows.json
       - name: Publish the download
         uses: softprops/action-gh-release@v2
         with:
@@ -34,6 +37,8 @@ jobs:
           body: |
             Download Beam.exe and run it. It lives in the system tray and starts with Windows.
             Windows SmartScreen may warn because the app isn't signed: click "More info" → "Run anyway".
-          files: Beam.exe
+          files: |
+            Beam.exe
+            windows.json
           overwrite_files: true
           make_latest: false

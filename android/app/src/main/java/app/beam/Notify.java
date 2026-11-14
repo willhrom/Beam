@@ -45,7 +45,7 @@ final class Notify {
   private static int idFor(Transfer t) { return 1000 + (t.tid.hashCode() & 0xffff); }
 
   Notification status(Beam b) {
-    String text = !b.online ? "Connecting…" : b.prefs.nearby ? "Visible to everyone nearby as " + b.prefs.name : "Visible to your devices as " + b.prefs.name;
+    String text = b.needLogin ? "Open Beam to sign in" : !b.online ? "Connecting…" : b.prefs.nearby ? "Visible to everyone nearby as " + b.prefs.name : "Visible to your devices as " + b.prefs.name;
     return new Notification.Builder(c, CH_STATUS)
         .setSmallIcon(R.drawable.ic_stat)
         .setContentTitle("Beam is ready")

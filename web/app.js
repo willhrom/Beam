@@ -143,6 +143,18 @@ async function onServer(m) {
       break;
     case "welcome":
       if (m.id !== Id.id) console.warn("server id mismatch");
+      if (m.login) {
+        // This device isn't signed in to a Beam account yet.
+        S.user = null;
+        S.online = false;
+        S.needSetup = !!m.setup;
+        render();
+        showSignIn(S.needSetup ? "setup" : (S.signInMode || "signin"));
+        break;
+      }
+      S.user = m.user || null;
+      S.signInMode = "signin";
+      if (S.lockSheet) { S.lockSheet = false; closeSheet(); toast("Signed in as " + (S.user ? S.user.name : "")); }
       S.online = true;
       backoff = 1000;
       if (Array.isArray(m.ice) && m.ice.length) S.ice = m.ice;
@@ -150,6 +162,7 @@ async function onServer(m) {
       break;
     case "peers":
       S.peers = m.peers || [];
+      autoPairMine();
       // keep paired names fresh
       for (const p of S.peers) if (S.paired[p.id] && S.paired[p.id].pub === p.pub && S.paired[p.id].name !== p.name) { S.paired[p.id].name = p.name; savePaired(); }
       render();
@@ -174,6 +187,27 @@ async function onServer(m) {
         S.pairing.safety = await safetyCode(Id.pub, m.pub);
         showPairWaiting();
       }
+      break;
+    case "login-error":
+      if (S.lockSheet) { S.signInError = m.reason; showSignIn(S.signInMode); }
+      break;
+    case "signed-out":
+      S.user = null;
+      toast(m.reason || "Signed out");
+      break;
+    case "account-error":
+      toast(m.reason);
+      break;
+    case "account-ok":
+      closeSheet();
+      toast(m.message);
+      break;
+    case "admin-list":
+      S.adminList = m.users;
+      if (S.adminOpen && !S.inviteOpen) showPeople();
+      break;
+    case "admin-invite":
+      showInvite(m);
       break;
     case "pair-error":
       if (S.pairing) { S.pairing.error = m.reason; showPairJoin(); }
@@ -608,7 +642,11 @@ if (nativeKind === "windows") {
     shareFromDesktop(files);
   });
 }
-function nativeStatus() { if (native) native.postMessage({ op: "status", online: S.online, peers: S.peers.length }); }
+function nativeStatus() {
+  if (!native) return;
+  const busy = [...S.tx.values()].some((t) => !["done", "failed", "asking"].includes(t.state));
+  native.postMessage({ op: "status", online: S.online, peers: S.peers.length, busy });
+}
 
 // ---------- UI ----------
 const ICONS = {
@@ -629,7 +667,7 @@ function render() {
   for (const el of [...box.children]) if (!ids.has(el.dataset.id)) el.remove();
   for (const p of S.peers) {
     let el = box.querySelector(`[data-id="${p.id}"]`);
-    const paired = !!S.paired[p.id] && S.paired[p.id].pub === p.pub;
+    const paired = (!!S.paired[p.id] && S.paired[p.id].pub === p.pub) || p.mine;
     const html = `<div class="avatar">${iconFor(p.kind)}<svg class="ring" viewBox="0 0 82 82"><circle cx="41" cy="41" r="38" stroke-dasharray="238.8" stroke-dashoffset="238.8"/></svg></div>
       <div class="name">${esc(p.name)}</div><div class="tag ${paired ? "paired" : ""}">${paired ? "My device" : "Nearby"}</div>`;
     if (!el) {
@@ -652,7 +690,7 @@ function render() {
     if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
   }
   $("#empty").style.display = S.peers.length ? "none" : "";
-  $("#empty").innerHTML = S.online
+  $("#empty").innerHTML = !S.user && !S.online && ws && ws.readyState === 1 ? "Sign in to use Beam." : S.online
     ? 'Looking for devices…<br><small>Open Beam on another device on this WiFi, or pair one in Settings.</small>'
     : "Connecting…";
   $("#me").innerHTML = S.pending ? `<b>Tap a device to send ${esc(pendingLabel())}</b> · <a href="#" id="pcx">cancel</a>` : `Visible as <b>${esc(S.name)}</b> · ${S.nearby ? "Everyone nearby" : "My devices only"}`;
@@ -719,6 +757,7 @@ function renderTxList() {
 }
 
 function renderTx(t) {
+  nativeStatusSoon();
   const box = $("#transfers");
   let el = box.querySelector(`[data-tid="${t.tid}"]`);
   if (!S.tx.has(t.tid)) { if (el) el.remove(); return; }
@@ -772,6 +811,8 @@ function renderTx(t) {
   if (t.dir === "out") renderRing(t);
 }
 
+let statusTimer = 0;
+function nativeStatusSoon() { if (native && !statusTimer) statusTimer = setTimeout(() => { statusTimer = 0; nativeStatus(); }, 500); }
 let progressRaf = 0;
 function renderProgress(t) {
   if (progressRaf) return;
@@ -792,20 +833,23 @@ function toast(msg) {
 }
 
 // ----- sheets -----
-let sheetOnClose = null;
+let sheetOnClose = null, sheetGen = 0;
 function openSheet(html, onClose) {
+  sheetGen++;
   $("#sheetBody").innerHTML = html;
   $("#sheet").hidden = false;
   sheetOnClose = onClose || null;
 }
 function closeSheet() {
-  $("#sheet").hidden = true;
-  $("#sheetBody").innerHTML = "";
-  const f = sheetOnClose;
+  // Run the close handler first: it may still need to read what's on the sheet (e.g. Settings).
+  const f = sheetOnClose, gen = sheetGen;
   sheetOnClose = null;
   if (f) f();
+  if (sheetGen !== gen) return; // the handler opened another sheet
+  $("#sheet").hidden = true;
+  $("#sheetBody").innerHTML = "";
 }
-$("#sheet").addEventListener("click", (e) => { if (e.target.id === "sheet") closeSheet(); });
+$("#sheet").addEventListener("click", (e) => { if (e.target.id === "sheet" && !S.lockSheet) closeSheet(); });
 
 function chooseWhat(peerId) {
   const p = S.peers.find((x) => x.id === peerId);
@@ -872,12 +916,19 @@ function showSettings() {
     ${!native && "Notification" in window && Notification.permission !== "granted" ? '<label class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></label>' : ""}
     ${canSaveToDisk ? `<label class="opt"><span>Save received files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Downloads via Save buttons · big transfers ask for a folder"}</small></span><button class="btn ghost small" id="sf">Choose…</button></label>` : ""}
     <p><small>Device code ${shortId(Id.id)}</small></p>
+    <h3>Account</h3>
+    <div class="list"><div class="item"><span>${S.user ? esc(S.user.name) + ' <span class="sub">' + esc(S.user.username) + (S.user.admin ? " · admin" : "") + "</span>" : "Not signed in"}</span></div></div>
+    <div class="actions">${S.user && S.user.admin ? '<button class="btn primary" id="ppl">Manage people</button>' : ""}<button class="btn ghost" id="cpin">Change PIN</button><button class="btn danger" id="sout">Sign out</button></div>
     <h3>My devices</h3>
-    <p>Paired devices find each other anywhere, not just on the same WiFi.</p>
+    <p>Devices signed in to your account find each other automatically. You can also pair with someone else's device:</p>
+
     <div class="list">${paired.map(([id, p]) => `<div class="item"><span>${esc(p.name)} <span class="sub">${shortId(id)}</span></span><button class="btn danger small" data-unpair="${id}">Remove</button></div>`).join("") || '<div class="item"><span class="sub">None yet</span></div>'}</div>
     <div class="actions"><button class="btn ghost" id="pShow">Show a code</button><button class="btn ghost" id="pJoin">Enter a code</button></div>
     <div class="actions"><button class="btn primary" id="done">Done</button></div>`, saveSettings);
   $("#done").onclick = closeSheet;
+  if ($("#ppl")) $("#ppl").onclick = () => { saveSettings(); sheetOnClose = null; S.adminOpen = true; showPeople(); wsSend({ t: "admin-list" }); };
+  $("#cpin").onclick = () => { saveSettings(); sheetOnClose = null; showChangePin(); };
+  $("#sout").onclick = () => { if (confirm("Sign out of Beam on this device?")) { sheetOnClose = null; closeSheet(); wsSend({ t: "logout" }); } };
   $("#pShow").onclick = () => { saveSettings(); S.pairing = { mode: "show" }; wsSend({ t: "pair-code" }); showPairShow(); };
   $("#pJoin").onclick = () => { saveSettings(); S.pairing = { mode: "join" }; showPairJoin(); };
   const sf = $("#sf");
@@ -948,6 +999,112 @@ function pairDone(ok, why) {
   sheetOnClose = null;
   closeSheet();
   toast(ok ? "Paired with " + name : why || "Pairing failed");
+}
+
+// ---------- accounts ----------
+// Devices signed in to the same account link up automatically (their keys get pinned like a pairing).
+function autoPairMine() {
+  let changed = false;
+  for (const p of S.peers) {
+    if (!p.mine || !p.pub) continue;
+    if (S.paired[p.id]) continue; // never overwrite a key we already trust
+    S.paired[p.id] = { pub: p.pub, name: p.name, kind: p.kind };
+    changed = true;
+  }
+  if (changed) { savePaired(); updateServer(); }
+}
+
+function showSignIn(mode) {
+  S.signInMode = mode;
+  S.lockSheet = true;
+  const err = S.signInError ? `<p style="color:var(--bad)">${esc(S.signInError)}</p>` : "";
+  S.signInError = null;
+  const field = (id, label, type, extra = "") => `<label style="display:block;margin:10px 0 4px;color:var(--dim);font-size:13px">${label}</label><input type="${type}" id="${id}" ${extra}>`;
+  const pinAttrs = 'inputmode="numeric" autocomplete="off" maxlength="12" pattern="[0-9]*"';
+  let body;
+  if (mode === "setup") {
+    body = `<h2>Set up Beam</h2><p>Create the admin account. You'll add everyone else from Settings.</p>
+      ${field("su_code", "Setup code", "text", 'autocomplete="off"')}${field("su_name", "Your name", "text")}${field("su_user", "Username", "text", 'autocapitalize="none" autocomplete="username"')}
+      ${field("su_pin", "Choose a PIN (4–12 digits)", "password", pinAttrs)}${field("su_pin2", "PIN again", "password", pinAttrs)}${err}
+      <div class="actions"><button class="btn primary" id="go">Create admin account</button></div>`;
+  } else if (mode === "invite") {
+    body = `<h2>Join Beam</h2><p>Use the username and invite code you were given.</p>
+      ${field("in_user", "Username", "text", 'autocapitalize="none" autocomplete="username"')}${field("in_code", "Invite code", "text", 'autocapitalize="characters" autocomplete="off" placeholder="ABCD-2345"')}
+      ${field("in_pin", "Choose a PIN (4–12 digits)", "password", pinAttrs)}${field("in_pin2", "PIN again", "password", pinAttrs)}${err}
+      <div class="actions"><button class="btn ghost" id="back">I have a PIN</button><button class="btn primary" id="go">Join</button></div>`;
+  } else {
+    body = `<h2>Sign in to Beam</h2><p>Sign in once on this device. It stays signed in.</p>
+      ${field("li_user", "Username", "text", 'autocapitalize="none" autocomplete="username"')}${field("li_pin", "PIN", "password", pinAttrs)}${err}
+      <div class="actions"><button class="btn ghost" id="inv">I have an invite code</button><button class="btn primary" id="go">Sign in</button></div>`;
+  }
+  openSheet(body);
+  const v = (id) => ($("#" + id) ? $("#" + id).value.trim() : "");
+  const submit = () => {
+    if (mode === "setup") {
+      if (v("su_pin") !== v("su_pin2")) { S.signInError = "The PINs don't match."; return showSignIn(mode); }
+      wsSend({ t: "setup", code: v("su_code"), name: v("su_name"), user: v("su_user"), pin: v("su_pin") });
+    } else if (mode === "invite") {
+      if (v("in_pin") !== v("in_pin2")) { S.signInError = "The PINs don't match."; return showSignIn(mode); }
+      wsSend({ t: "login", user: v("in_user"), invite: v("in_code"), pin: v("in_pin") });
+    } else {
+      wsSend({ t: "login", user: v("li_user"), pin: v("li_pin") });
+    }
+  };
+  $("#go").onclick = submit;
+  document.querySelectorAll("#sheetBody input").forEach((i) => (i.onkeydown = (e) => { if (e.key === "Enter") submit(); }));
+  if ($("#inv")) $("#inv").onclick = () => showSignIn("invite");
+  if ($("#back")) $("#back").onclick = () => showSignIn("signin");
+  const first = $("#sheetBody input");
+  if (first) first.focus();
+}
+
+function showChangePin() {
+  const pinAttrs = 'inputmode="numeric" autocomplete="off" maxlength="12"';
+  openSheet(`<h2>Change PIN</h2>
+    <input type="password" id="op" placeholder="Current PIN" ${pinAttrs} style="margin-top:10px">
+    <input type="password" id="np" placeholder="New PIN (4–12 digits)" ${pinAttrs} style="margin-top:10px">
+    <input type="password" id="np2" placeholder="New PIN again" ${pinAttrs} style="margin-top:10px">
+    <div class="actions"><button class="btn ghost" id="cx">Cancel</button><button class="btn primary" id="go">Change</button></div>`);
+  $("#cx").onclick = closeSheet;
+  $("#go").onclick = () => {
+    if ($("#np").value !== $("#np2").value) return toast("The new PINs don't match.");
+    wsSend({ t: "pin-change", old: $("#op").value, pin: $("#np").value });
+  };
+}
+
+function showPeople() {
+  const users = S.adminList || [];
+  const rows = users.map((u) => {
+    const status = u.status === "invited" ? (u.invite ? `Invited · code <b>${esc(u.invite)}</b>` : "Invite expired") : `${u.devices.length} device${u.devices.length === 1 ? "" : "s"}${u.locked ? " · locked (too many wrong PINs)" : ""}`;
+    const devs = u.devices.map((d) => `<div class="item" style="padding-left:14px"><span>${esc(d.name)} <span class="sub">${d.online ? "online" : "offline"}</span></span><button class="btn ghost small" data-rmdev="${d.id}">Sign out</button></div>`).join("");
+    const self = S.user && u.username === S.user.username;
+    return `<div class="item" style="flex-wrap:wrap"><span style="min-width:0">${esc(u.name)} <span class="sub">${esc(u.username)}${u.admin ? " · admin" : ""}</span><br><span class="sub">${status}</span></span>
+      <span class="row" style="gap:6px;display:flex"><button class="btn ghost small" data-reset="${esc(u.username)}">${u.status === "invited" ? "New code" : "Reset PIN"}</button>${self ? "" : `<button class="btn danger small" data-rm="${esc(u.username)}">Remove</button>`}</span></div>${devs}`;
+  }).join("");
+  openSheet(`<h2>People</h2><p>Only people you add here can use Beam.</p>
+    <div class="list">${rows || '<div class="item"><span class="sub">Loading…</span></div>'}</div>
+    <h3>Add someone</h3>
+    <input type="text" id="np_name" placeholder="Their name">
+    <input type="text" id="np_user" placeholder="Username (e.g. sarah)" autocapitalize="none" style="margin-top:8px">
+    <div class="actions"><button class="btn ghost" id="cx">Done</button><button class="btn primary" id="add">Add</button></div>`, () => { S.adminOpen = false; });
+  $("#cx").onclick = closeSheet;
+  $("#add").onclick = () => wsSend({ t: "admin-add", name: $("#np_name").value.trim(), user: $("#np_user").value.trim() });
+  document.querySelectorAll("[data-reset]").forEach((b) => (b.onclick = () => wsSend({ t: "admin-reset", user: b.dataset.reset })));
+  document.querySelectorAll("[data-rm]").forEach((b) => (b.onclick = () => { if (confirm(`Remove ${b.dataset.rm}? Their devices are signed out right away.`)) wsSend({ t: "admin-remove", user: b.dataset.rm }); }));
+  document.querySelectorAll("[data-rmdev]").forEach((b) => (b.onclick = () => wsSend({ t: "admin-remove-device", id: b.dataset.rmdev })));
+}
+
+function showInvite(m) {
+  S.inviteOpen = true;
+  const msg = `You're invited to Beam!\nOpen ${location.origin} (or the Beam app), tap "I have an invite code", and enter:\nUsername: ${m.user}\nInvite code: ${m.code}\nThen choose your own PIN. The code works for 7 days.`;
+  sheetOnClose = null;
+  openSheet(`<h2>${m.reset ? "New code for " : "Invite "}${esc(m.name)}</h2>
+    <p>Send ${esc(m.name)} their username and this code. They'll choose their own PIN.</p>
+    <div class="list"><div class="item"><span>Username</span><b>${esc(m.user)}</b></div></div>
+    <div class="code">${esc(m.code)}</div><p><small>Works once, for 7 days.</small></p>
+    <div class="actions"><button class="btn ghost" id="cp">Copy message</button><button class="btn primary" id="ok">Done</button></div>`, () => { S.inviteOpen = false; if (S.adminOpen) { showPeople(); wsSend({ t: "admin-list" }); } });
+  $("#cp").onclick = () => navigator.clipboard.writeText(msg).then(() => toast("Copied"));
+  $("#ok").onclick = closeSheet;
 }
 
 // ---------- start ----------

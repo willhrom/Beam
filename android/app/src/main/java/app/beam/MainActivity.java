@@ -36,6 +36,7 @@ public class MainActivity extends Activity implements Beam.Listener {
   private TextView status, empty;
   private LinearLayout transfers;
   private String peersKey = "";
+  private boolean updateOffered;
   private String pickFor;
   private AlertDialog incomingDialog, pairDialog;
   private String incomingTid;
@@ -94,6 +95,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     beam.kick();
     beam.nearby.discover(true);
     render();
+    if (beam.needLogin) showSignIn(null);
     // show any request that arrived while we were away
     for (Transfer t : beam.tx.values()) if (t.incoming && Transfer.ASKING.equals(t.state)) { showIncoming(t); break; }
   }
@@ -146,10 +148,18 @@ public class MainActivity extends Activity implements Beam.Listener {
     if ("incoming".equals(type)) showIncoming((Transfer) arg);
     else if ("pairing".equals(type)) showPairing();
     else if ("toast".equals(type)) Toast.makeText(this, (String) arg, Toast.LENGTH_SHORT).show();
+    else if ("login".equals(type)) showSignIn(null);
   }
 
   private void render() {
+    if (Updater.available != null && Updater.available.version > Updater.current() && !updateOffered) {
+      updateOffered = true;
+      Ui.dialog(this).setTitle("Beam update available").setMessage("Version 1.0." + Updater.available.version + " is ready to install.")
+          .setPositiveButton("Install", (d, w) -> startActivity(new Intent(this, UpdateActivity.class)))
+          .setNegativeButton("Later", null).show();
+    }
     status.setText(!beam.prefs.enabled ? "Off — turn on in Settings"
+        : beam.needLogin ? "Sign in to use Beam"
         : !beam.online ? (beam.nearby.usable() ? "No internet · offline sharing with nearby phones" : "Connecting…")
         : "Visible as " + beam.prefs.name + " · " + (beam.prefs.nearby ? "Everyone nearby" : "My devices only"));
 
@@ -161,7 +171,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       peersKey = key.toString();
       peersGrid.removeAllViews();
       for (Beam.Peer p : all) {
-        LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id), noteFor(p), beam.isOfflineOnly(p.id));
+        LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id) || p.mine, noteFor(p), beam.isOfflineOnly(p.id));
         b.setOnClickListener(v -> chooseWhat(p.id));
         peersGrid.addView(b);
       }
@@ -373,6 +383,8 @@ public class MainActivity extends Activity implements Beam.Listener {
   }
 
   // ---------- settings & pairing ----------
+  private final AlertDialog[] self0 = new AlertDialog[1];
+
   private void showSettings() {
     LinearLayout l = Ui.col(this);
     int p = Ui.dp(this, 20);
@@ -390,9 +402,20 @@ public class MainActivity extends Activity implements Beam.Listener {
     l.addView(aa);
     l.addView(Ui.text(this, "Device code " + Crypto.shortId(beam.me.id), 12, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 8, 0, 0));
 
+    l.addView(label("Account"));
+    String who = beam.account == null ? "Not signed in" : beam.account.optString("name") + "  (" + beam.account.optString("username") + (beam.account.optBoolean("admin") ? " · admin" : "") + ")";
+    l.addView(Ui.text(this, who, 14, Ui.TEXT, false));
+    LinearLayout ar = Ui.row(this);
+    if (beam.account != null && beam.account.optBoolean("admin")) {
+      ar.addView(Ui.button(this, "Manage people", Ui.ACCENT, Color.WHITE, v -> open(Uri.parse(Beam.SERVER), null)), Ui.margins(this, -2, -2, 0, 0, 8, 0));
+    }
+    ar.addView(Ui.button(this, "Change PIN", 0x18FFFFFF, Ui.TEXT, v -> { self0[0].dismiss(); showChangePin(); }), Ui.margins(this, -2, -2, 0, 0, 8, 0));
+    ar.addView(Ui.button(this, "Sign out", 0x22F87171, Ui.BAD, v -> Ui.dialog(this).setMessage("Sign out of Beam on this phone?")
+        .setPositiveButton("Sign out", (d, w) -> { self0[0].dismiss(); beam.logout(); }).setNegativeButton("Cancel", null).show()));
+    l.addView(ar, Ui.margins(this, -1, -2, 0, 8, 0, 0));
     l.addView(label("My devices"));
-    if (beam.prefs.paired.isEmpty()) l.addView(Ui.text(this, "None yet. Paired devices find each other anywhere, not just on the same WiFi.", 13, Ui.DIM, false));
-    final AlertDialog[] self = new AlertDialog[1];
+    l.addView(Ui.text(this, "Devices signed in to your account find each other automatically. You can also pair with someone else's device.", 13, Ui.DIM, false));
+    final AlertDialog[] self = self0;
     for (Prefs.Paired pd : new ArrayList<>(beam.prefs.paired.values())) {
       LinearLayout r = Ui.row(this);
       r.addView(Ui.oneLine(Ui.text(this, pd.name + "  " + Crypto.shortId(pd.id), 14, Ui.TEXT, false)), new LinearLayout.LayoutParams(0, -2, 1));
@@ -408,6 +431,15 @@ public class MainActivity extends Activity implements Beam.Listener {
     pr.addView(new View(this), Ui.lp(Ui.dp(this, 10), 1));
     pr.addView(Ui.button(this, "Enter a code", 0x18FFFFFF, Ui.TEXT, v -> { self[0].dismiss(); beam.pairJoin(); }), new LinearLayout.LayoutParams(0, -2, 1));
     l.addView(pr, Ui.margins(this, -1, -2, 0, 10, 0, 0));
+    l.addView(label("Updates"));
+    LinearLayout ur = Ui.row(this);
+    ur.addView(Ui.text(this, "Version 1.0." + Updater.current(), 14, Ui.TEXT, false), new LinearLayout.LayoutParams(0, -2, 1));
+    boolean newer = Updater.available != null && Updater.available.version > Updater.current();
+    ur.addView(Ui.button(this, newer ? "Install 1.0." + Updater.available.version : "Check for updates", newer ? Ui.ACCENT : 0x18FFFFFF, newer ? Color.WHITE : Ui.TEXT, v -> {
+      if (Updater.available != null && Updater.available.version > Updater.current()) { self0[0].dismiss(); startActivity(new Intent(this, UpdateActivity.class)); }
+      else Updater.check(beam, true);
+    }));
+    l.addView(ur);
     PowerManager pm = getSystemService(PowerManager.class);
     if (!pm.isIgnoringBatteryOptimizations(getPackageName())) {
       l.addView(Ui.button(this, "Allow background use (battery)", 0x18FFFFFF, Ui.TEXT, v -> openBatterySetting()), Ui.margins(this, -1, -2, 0, 10, 0, 0));
@@ -429,6 +461,69 @@ public class MainActivity extends Activity implements Beam.Listener {
       beam.updateServer();
     });
     self[0].show();
+  }
+
+  // ---------- signing in ----------
+  private AlertDialog signInDialog;
+
+  /** mode: "signin", "invite" or "setup" (null = pick the right one). */
+  private void showSignIn(String mode) {
+    if (signInDialog != null) { signInDialog.setOnDismissListener(null); signInDialog.dismiss(); signInDialog = null; }
+    if (!beam.needLogin) return;
+    if (mode == null) mode = beam.needSetup ? "setup" : "signin";
+    final String m = mode;
+    LinearLayout l = Ui.col(this);
+    String intro = "setup".equals(m) ? "Create the admin account. You'll add everyone else later."
+        : "invite".equals(m) ? "Use the username and invite code you were given, then choose your own PIN."
+        : "Sign in once on this phone. It stays signed in.";
+    l.addView(Ui.text(this, intro, 14, Ui.DIM, false));
+    EditText code = field(l, "setup".equals(m) ? "Setup code" : "Invite code", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS, !"signin".equals(m));
+    EditText name = field(l, "Your name", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS, "setup".equals(m));
+    EditText user = field(l, "Username", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI, true);
+    EditText pin = field(l, "signin".equals(m) ? "PIN" : "Choose a PIN (4–12 digits)", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD, true);
+    EditText pin2 = field(l, "PIN again", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD, !"signin".equals(m));
+    if (beam.loginError != null) { l.addView(Ui.text(this, beam.loginError, 14, Ui.BAD, false), Ui.margins(this, -1, -2, 0, 8, 0, 0)); beam.loginError = null; }
+    AlertDialog.Builder b = Ui.dialog(this)
+        .setTitle("setup".equals(m) ? "Set up Beam" : "invite".equals(m) ? "Join Beam" : "Sign in to Beam")
+        .setView(pad(l))
+        .setCancelable(false)
+        .setPositiveButton("setup".equals(m) ? "Create" : "invite".equals(m) ? "Join" : "Sign in", null);
+    if ("signin".equals(m)) b.setNeutralButton("I have an invite code", null);
+    else if ("invite".equals(m)) b.setNeutralButton("I have a PIN", null);
+    signInDialog = b.create();
+    signInDialog.setOnShowListener(x -> {
+      signInDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+        String u = user.getText().toString().trim(), p = pin.getText().toString();
+        if (!"signin".equals(m) && !p.equals(pin2.getText().toString())) { Toast.makeText(this, "The PINs don't match", Toast.LENGTH_SHORT).show(); return; }
+        if ("setup".equals(m)) beam.setup(code.getText().toString().trim(), name.getText().toString().trim(), u, p);
+        else if ("invite".equals(m)) beam.join(u, code.getText().toString().trim(), p);
+        else beam.login(u, p);
+      });
+      android.widget.Button n = signInDialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+      if (n != null) n.setOnClickListener(v -> showSignIn("signin".equals(m) ? "invite" : "signin"));
+    });
+    signInDialog.show();
+  }
+
+  private EditText field(LinearLayout l, String hint, int type, boolean show) {
+    EditText e = new EditText(this);
+    e.setHint(hint);
+    e.setInputType(type);
+    e.setSingleLine(true);
+    if (show) l.addView(e, Ui.margins(this, -1, -2, 0, 6, 0, 0));
+    return e;
+  }
+
+  private void showChangePin() {
+    LinearLayout l = Ui.col(this);
+    int t = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD;
+    EditText old = field(l, "Current PIN", t, true), p1 = field(l, "New PIN (4–12 digits)", t, true), p2 = field(l, "New PIN again", t, true);
+    Ui.dialog(this).setTitle("Change PIN").setView(pad(l))
+        .setPositiveButton("Change", (d, w) -> {
+          if (!p1.getText().toString().equals(p2.getText().toString())) { Toast.makeText(this, "The new PINs don't match", Toast.LENGTH_SHORT).show(); return; }
+          beam.changePin(old.getText().toString(), p1.getText().toString());
+        })
+        .setNegativeButton("Cancel", null).show();
   }
 
   private TextView label(String s) {

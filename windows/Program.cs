@@ -22,6 +22,7 @@ namespace Beam
     static class Program
     {
         public const string Server = "__BEAM_URL__";
+        public const string Repo = "__REPO__";
 
         [STAThread]
         static void Main(string[] args)
@@ -31,7 +32,15 @@ namespace Beam
             int si = Array.IndexOf(args, "--send");
             if (si >= 0) for (int i = si + 1; i < args.Length; i++) if (File.Exists(args[i])) files.Add(Path.GetFullPath(args[i]));
 
-            using var mutex = new Mutex(true, "Beam.SingleInstance", out bool first);
+            bool updated = Array.Exists(args, a => a == "--updated");
+            var mutex = new Mutex(true, "Beam.SingleInstance", out bool first);
+            // After an update, the old version is still closing: wait for it to let go.
+            for (int i = 0; updated && !first && i < 60; i++)
+            {
+                Thread.Sleep(250);
+                mutex.Dispose();
+                mutex = new Mutex(true, "Beam.SingleInstance", out first);
+            }
             using var showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "Beam.ShowWindow");
             if (!first)
             {
@@ -56,6 +65,7 @@ namespace Beam
             Application.SetCompatibleTextRenderingDefault(false);
 
             bool background = Array.Exists(args, a => a == "--background") || ToastNotificationManagerCompat.WasCurrentProcessToastActivated();
+            if (updated) Updater.CleanUp();
             var form = new MainForm(!background || files.Count > 0);
             if (files.Count > 0) form.QueueShare(files);
             new Thread(() =>
@@ -66,6 +76,7 @@ namespace Beam
                 }
             }) { IsBackground = true }.Start();
             Application.Run(new ApplicationContext());
+            GC.KeepAlive(mutex);
         }
     }
 
@@ -77,6 +88,9 @@ namespace Beam
         readonly Dictionary<string, (FileStream stream, string path)> saves = new();
         readonly Uri server = new Uri(Program.Server);
         bool online, quitting, pageReady;
+        public bool Busy;
+        readonly Updater updater;
+        readonly ToolStripMenuItem updateItem = new ToolStripMenuItem("Check for updates");
         CoreWebView2Environment env;
         readonly List<string> shareQueue = new();
         System.Windows.Forms.Timer shareTimer;
@@ -106,6 +120,9 @@ namespace Beam
             startupItem.Click += (s, e) => SetStartup(!startupItem.Checked);
             menu.Items.Add(startupItem);
             menu.Items.Add("Reload", null, (s, e) => web.CoreWebView2?.Reload());
+            updateItem.Click += (s, e) => updater.CheckNow(true);
+            menu.Items.Add(updateItem);
+            menu.Items.Add(new ToolStripMenuItem("Version 1.0." + Updater.Current) { Enabled = false });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Quit Beam", null, (s, e) => Quit());
             tray.ContextMenuStrip = menu;
@@ -123,6 +140,8 @@ namespace Beam
             startupItem.Checked = IsStartup();
             InstallExplorerMenus();
             StartPipeServer();
+            updater = new Updater(this);
+            updater.Start();
 
             // Create the window handles without showing it, so the page loads in the background.
             CreateHandle();
@@ -313,7 +332,17 @@ namespace Beam
             base.OnFormClosing(e);
         }
 
-        void Quit()
+        /// <summary>Restart into the freshly installed version.</summary>
+        public void RestartForUpdate(string exe)
+        {
+            var args = "--updated" + (Visible ? "" : " --background");
+            try { Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = false }); } catch { return; }
+            Quit();
+        }
+
+        public void Balloon(string title, string text) => tray.ShowBalloonTip(5000, title, text, ToolTipIcon.Info);
+
+        public void Quit()
         {
             quitting = true;
             tray.Visible = false;
@@ -349,6 +378,7 @@ namespace Beam
             {
                 case "status":
                     online = d.TryGetProperty("online", out var o) && o.ValueKind == JsonValueKind.True;
+                    Busy = d.TryGetProperty("busy", out var bz) && bz.ValueKind == JsonValueKind.True;
                     int peers = d.TryGetProperty("peers", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
                     tray.Text = online ? $"Beam — {peers} device{(peers == 1 ? "" : "s")} nearby" : "Beam — connecting…";
                     break;
@@ -483,5 +513,113 @@ namespace Beam
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid id, uint flags, IntPtr token, out string path);
+    }
+    /// <summary>
+    /// Keeps Beam up to date: checks the latest release every few hours, downloads it in the
+    /// background, and swaps it in (a quick restart) when no transfer is running.
+    /// </summary>
+    sealed class Updater
+    {
+        static readonly string ManifestUrl = $"https://github.com/{Program.Repo}/releases/download/windows/windows.json";
+        public static int Current => typeof(Updater).Assembly.GetName().Version?.Build ?? 0;
+        static string Exe => Environment.ProcessPath;
+        static string NewPath => Exe + ".new";
+        static string OldPath => Exe + ".old";
+
+        readonly MainForm form;
+        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 6 * 3600 * 1000 };
+        readonly System.Windows.Forms.Timer applyTimer = new System.Windows.Forms.Timer { Interval = 15000 };
+        static readonly System.Net.Http.HttpClient http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+        bool checking;
+        int ready; // version downloaded and waiting to be applied
+
+        public Updater(MainForm form)
+        {
+            this.form = form;
+            timer.Tick += (s, e) => CheckNow(false);
+            applyTimer.Tick += (s, e) => TryApply();
+        }
+
+        public void Start()
+        {
+            timer.Start();
+            var first = new System.Windows.Forms.Timer { Interval = 30000 };
+            first.Tick += (s, e) => { first.Stop(); first.Dispose(); CheckNow(false); };
+            first.Start();
+        }
+
+        /// <summary>Removes the previous version left behind by the last update.</summary>
+        public static void CleanUp()
+        {
+            new Thread(() =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    try { if (File.Exists(OldPath)) File.Delete(OldPath); return; } catch { Thread.Sleep(500); }
+                }
+            }) { IsBackground = true }.Start();
+        }
+
+        public async void CheckNow(bool loud)
+        {
+            if (checking || Program.Repo.StartsWith("__")) return;
+            checking = true;
+            try
+            {
+                var json = await http.GetStringAsync(ManifestUrl);
+                var d = JsonDocument.Parse(json).RootElement;
+                int version = d.GetProperty("version").GetInt32();
+                if (version <= Current || version <= ready)
+                {
+                    if (loud) form.Balloon("Beam", version <= Current ? "Beam is up to date." : "An update is ready and will install shortly.");
+                    return;
+                }
+                // Download next to Beam.exe, check it, then wait for a quiet moment.
+                var url = d.GetProperty("url").GetString();
+                var want = d.GetProperty("sha256").GetString().ToLowerInvariant();
+                using (var res = await http.GetAsync(url, System.Net.Http.HttpCompletionOption.ResponseHeadersRead))
+                {
+                    res.EnsureSuccessStatusCode();
+                    using var src = await res.Content.ReadAsStreamAsync();
+                    using var dst = new FileStream(NewPath, FileMode.Create, FileAccess.Write);
+                    await src.CopyToAsync(dst);
+                }
+                string got;
+                using (var f = File.OpenRead(NewPath)) got = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(f)).ToLowerInvariant();
+                if (got != want) { File.Delete(NewPath); if (loud) form.Balloon("Beam", "The update download was damaged. It'll try again later."); return; }
+                ready = version;
+                if (loud) form.Balloon("Beam", "Updating to version 1.0." + version + "…");
+                applyTimer.Start();
+                TryApply();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                if (loud) form.Balloon("Beam", "Beam can't update itself in this folder. Move Beam.exe to a folder you own, like Documents.");
+            }
+            catch
+            {
+                if (loud) form.Balloon("Beam", "Couldn't check for updates right now.");
+            }
+            finally { checking = false; }
+        }
+
+        // Swap in the new version once nothing is being sent or received.
+        void TryApply()
+        {
+            if (ready == 0 || form.Busy || !File.Exists(NewPath)) return;
+            applyTimer.Stop();
+            try
+            {
+                if (File.Exists(OldPath)) File.Delete(OldPath);
+                File.Move(Exe, OldPath);       // Windows lets a running program be renamed
+                File.Move(NewPath, Exe);
+            }
+            catch
+            {
+                try { if (!File.Exists(Exe) && File.Exists(OldPath)) File.Move(OldPath, Exe); } catch { }
+                return;
+            }
+            form.RestartForUpdate(Exe);
+        }
     }
 }

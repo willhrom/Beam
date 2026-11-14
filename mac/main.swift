@@ -5,8 +5,105 @@ import WebKit
 import UserNotifications
 import ServiceManagement
 import UniformTypeIdentifiers
+import CryptoKit
 
 let serverURL = URL(string: "__BEAM_URL__")!
+let repo = "__REPO__"
+
+/// Keeps Beam up to date: checks the latest release every few hours, downloads it in the
+/// background, and swaps it in (a quick relaunch) when no transfer is running.
+final class Updater {
+  weak var app: AppDelegate?
+  var ready: URL?          // the new Beam.app, unpacked and waiting
+  var readyVersion = 0
+  var checking = false
+  static var current: Int { Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0") ?? 0 }
+
+  init(_ app: AppDelegate) { self.app = app }
+
+  func start() {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 30) { self.check(loud: false) }
+    Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { _ in self.check(loud: false) }
+    Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in self.tryApply() }
+  }
+
+  func say(_ text: String) { app?.notify(tag: "update", title: "Beam", body: text, request: false) }
+
+  func check(loud: Bool) {
+    guard !checking, !repo.hasPrefix("__"),
+          let url = URL(string: "https://github.com/\(repo)/releases/download/mac/mac.json") else { return }
+    checking = true
+    URLSession.shared.dataTask(with: url) { data, _, _ in
+      DispatchQueue.main.async {
+        defer { self.checking = false }
+        guard let data = data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let version = j["version"] as? Int, let zip = (j["url"] as? String).flatMap(URL.init(string:)),
+              let sha = (j["sha256"] as? String)?.lowercased() else {
+          if loud { self.say("Couldn't check for updates right now.") }
+          return
+        }
+        if version <= Updater.current || version <= self.readyVersion {
+          if loud { self.say(version <= Updater.current ? "Beam is up to date." : "An update is ready and will install shortly.") }
+          return
+        }
+        self.download(zip, sha: sha, version: version, loud: loud)
+      }
+    }.resume()
+  }
+
+  func download(_ zip: URL, sha: String, version: Int, loud: Bool) {
+    checking = true
+    URLSession.shared.downloadTask(with: zip) { file, _, _ in
+      defer { DispatchQueue.main.async { self.checking = false } }
+      guard let file = file, let data = try? Data(contentsOf: file, options: .mappedIfSafe) else { return }
+      let got = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+      guard got == sha else { DispatchQueue.main.async { if loud { self.say("The update download was damaged. It'll try again later.") } }; return }
+      // Unpack next to the installed app (same disk), so the swap is a simple rename.
+      let fm = FileManager.default
+      let installed = Bundle.main.bundleURL
+      guard let work = try? fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: installed, create: true) else { return }
+      let zipCopy = work.appendingPathComponent("Beam-mac.zip")
+      try? fm.removeItem(at: zipCopy)
+      guard (try? fm.copyItem(at: file, to: zipCopy)) != nil else { return }
+      let p = Process()
+      p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+      p.arguments = ["-x", "-k", zipCopy.path, work.path]
+      guard (try? p.run()) != nil else { return }
+      p.waitUntilExit()
+      let newApp = work.appendingPathComponent("Beam.app")
+      guard p.terminationStatus == 0, fm.fileExists(atPath: newApp.path) else { return }
+      DispatchQueue.main.async {
+        self.ready = newApp
+        self.readyVersion = version
+        if loud { self.say("Updating to version 1.0.\(version)…") }
+        self.tryApply()
+      }
+    }.resume()
+  }
+
+  /// Swap in the new version once nothing is being sent or received, then relaunch.
+  func tryApply() {
+    guard let newApp = ready, let app = app, !app.busy else { return }
+    let installed = Bundle.main.bundleURL
+    guard FileManager.default.isWritableFile(atPath: installed.deletingLastPathComponent().path) else {
+      ready = nil
+      say("Move Beam to your Applications folder so it can update itself.")
+      return
+    }
+    do {
+      _ = try FileManager.default.replaceItemAt(installed, withItemAt: newApp)
+    } catch {
+      ready = nil
+      return
+    }
+    ready = nil
+    let relaunch = Process()
+    relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+    relaunch.arguments = ["-c", "sleep 1; /usr/bin/open \"\(installed.path)\""]
+    try? relaunch.run()
+    NSApp.terminate(nil)
+  }
+}
 
 // Lets the page read a shared Finder file piece by piece (so big videos never load all at once).
 final class FileReader: NSObject, WKScriptMessageHandlerWithReply {
@@ -35,6 +132,8 @@ final class FileReader: NSObject, WKScriptMessageHandlerWithReply {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler, WKUIDelegate,
   WKNavigationDelegate, UNUserNotificationCenterDelegate, NSDraggingDestination {
   var shared: [String: URL] = [:]   // files handed to Beam from Finder, by id
+  var busy = false                   // a transfer is running (don't restart for an update)
+  lazy var updater = Updater(self)
   var pendingShare: [URL] = []
   var pageReady = false
   var statusItem: NSStatusItem!
@@ -66,6 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     // Finder: right-click → Services (or Quick Actions) → "Send with Beam"
     NSApp.servicesProvider = self
     NSUpdateDynamicServices()
+    updater.start()
   }
 
   // MARK: - Sending files from Finder
@@ -186,6 +286,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     menu.addItem(.separator())
     loginItem = menu.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
     menu.addItem(withTitle: "Reload", action: #selector(reload), keyEquivalent: "")
+    menu.addItem(withTitle: "Check for Updates…", action: #selector(checkUpdates), keyEquivalent: "")
+    let ver = menu.addItem(withTitle: "Version 1.0.\(Updater.current)", action: nil, keyEquivalent: "")
+    ver.isEnabled = false
     menu.addItem(.separator())
     menu.addItem(withTitle: "Quit Beam", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     for item in menu.items where item.action != #selector(NSApplication.terminate(_:)) { item.target = self }
@@ -197,6 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
 
   @objc func openFromMenu() { showWindow() }
   @objc func reload() { web.reload() }
+  @objc func checkUpdates() { updater.check(loud: true) }
 
   @objc func toggleLogin() {
     do {
@@ -274,6 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     switch op {
     case "status":
       online = d["online"] as? Bool ?? false
+      busy = d["busy"] as? Bool ?? false
       statusItem.button?.appearsDisabled = !online
       statusItem.button?.toolTip = online ? "Beam — \(d["peers"] as? Int ?? 0) devices nearby" : "Beam — connecting…"
     case "notify":

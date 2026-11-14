@@ -5,3 +5,4 @@ server/.wrangler/
 *.keystore
 *.jks
 *.p12
+server/.dev.vars

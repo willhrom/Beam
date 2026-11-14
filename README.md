@@ -23,6 +23,22 @@ Both routes speak the same protocol (`from` / `file` / `eof` / `done`), so a tra
 
 On the direct route each side signs Nearby's link token with its Beam key (`beam-nearby|<token hex>|<deviceId>`), so a paired device can't be impersonated and nobody can sit in the middle. Phones set to "my devices only" only show up for their paired devices.
 
+## Accounts
+
+Only people the admin adds can use Beam. The first person to open Beam enters the one-time **setup code** (the `BEAM_SETUP_CODE` repository secret) and becomes the admin. From Settings → Manage people, the admin adds someone (name + username) and gets an invite code for them; they enter their username + code on their first device and choose their own PIN. Further devices sign in with username + PIN and stay signed in.
+
+- Devices on the same account see each other anywhere and link up automatically (keys pinned like a pairing).
+- PINs are stored as salted PBKDF2 hashes. Five wrong PINs from one network lock that network out for 15 minutes; 25 wrong tries from anywhere in an hour lock the account for the rest of the hour.
+- The admin can reset a PIN (new invite code), sign out a single device, or remove a person; removed devices are disconnected immediately.
+- A device that isn't signed in can't see anyone or be seen.
+
+## Updates
+
+- Server and web app: live as soon as a change is pushed. The Mac and Windows apps load their interface from the server, so most changes reach them instantly too.
+- Each build publishes `android.json`, `mac.json` and `windows.json` (version + SHA-256) next to its download.
+- Windows and Mac: the app checks every 6 hours, downloads and verifies the new version in the background, and swaps it in with a quick restart when no transfer is running. Tray / menu bar → "Check for updates" checks now.
+- Android: an "Update available" notification; tapping it downloads, verifies and installs over the old version (Android asks you to confirm).
+
 ## Security
 
 - Files go **directly between devices** over a WebRTC data channel, encrypted with DTLS. The Cloudflare server only introduces devices and never sees file contents.
