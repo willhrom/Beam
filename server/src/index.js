@@ -102,7 +102,7 @@ export class Hub extends DurableObject {
   peersFor(a, all) {
     return all
       .filter((p) => this.visible(a, p.a))
-      .map((p) => ({ id: p.a.id, name: p.a.name, kind: p.a.kind, pub: p.a.pub, paired: a.watch.includes(p.a.id) }));
+      .map((p) => ({ id: p.a.id, name: p.a.name, kind: p.a.kind, pub: p.a.pub, paired: a.watch.includes(p.a.id), local: p.a.net === a.net }));
   }
 
   // Send fresh peer lists to everyone whose view of `changed` may have changed.

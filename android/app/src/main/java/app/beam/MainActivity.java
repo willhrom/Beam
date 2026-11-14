@@ -58,7 +58,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       need.add(Manifest.permission.POST_NOTIFICATIONS);
     }
     // Bluetooth + nearby Wi-Fi, for offline sharing with other phones
-    if (beam.prefs.offline) for (String p : Nearby.permissions()) if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) need.add(p);
+    for (String p : Nearby.permissions()) if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) need.add(p);
     if (!need.isEmpty()) requestPermissions(need.toArray(new String[0]), 2);
     else askBattery();
   }
@@ -198,7 +198,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     String sub;
     if (Transfer.FAILED.equals(t.state)) sub = t.reason;
     else if (Transfer.DONE.equals(t.state)) sub = (t.incoming ? "Received " : "Sent ") + t.describe() + (t.incoming && hasFiles(t) ? " · in Downloads/Beam" : "");
-    else sub = stateText(t.state) + " · " + t.describe() + (t.total > 0 ? " · " + fmtSize(t.total) : "");
+    else sub = stateText(t.state) + (t.direct() ? " · direct" : "") + " · " + t.describe() + (t.total > 0 ? " · " + fmtSize(t.total) : "");
     int subColor = Transfer.FAILED.equals(t.state) ? Ui.BAD : Transfer.DONE.equals(t.state) ? Ui.GOOD : Ui.DIM;
     words.addView(Ui.oneLine(Ui.text(this, sub, 12.5f, subColor, false)));
     top.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
@@ -385,11 +385,9 @@ public class MainActivity extends Activity implements Beam.Listener {
     Switch on = sw("Run in the background", beam.prefs.enabled);
     Switch nb = sw("Everyone nearby can see me", beam.prefs.nearby);
     Switch aa = sw("Auto-accept from my devices", beam.prefs.autoAccept);
-    Switch off = sw("Offline sharing with nearby phones (Bluetooth + Wi-Fi Direct)", beam.prefs.offline);
     l.addView(on);
     l.addView(nb);
     l.addView(aa);
-    l.addView(off);
     l.addView(Ui.text(this, "Device code " + Crypto.shortId(beam.me.id), 12, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 8, 0, 0));
 
     l.addView(label("My devices"));
@@ -425,10 +423,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       beam.prefs.nearby = nb.isChecked();
       beam.prefs.autoAccept = aa.isChecked();
       beam.prefs.enabled = on.isChecked();
-      boolean wantOffline = off.isChecked() && !beam.prefs.offline;
-      beam.prefs.offline = off.isChecked();
       beam.prefs.save();
-      if (wantOffline && !Nearby.allowed(this)) requestPermissions(Nearby.permissions(), 3);
       if (wasOn && !beam.prefs.enabled) BeamService.stop(this);
       else if (!wasOn && beam.prefs.enabled) BeamService.start(this);
       beam.updateServer();

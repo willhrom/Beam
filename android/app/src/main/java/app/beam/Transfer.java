@@ -32,9 +32,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * One send or receive: a direct, encrypted WebRTC data channel to the other device.
- * If the connection drops part-way, the sender reconnects and both sides carry on
- * from the last byte received (for up to 15 minutes).
+ * One send or receive. The bytes travel over a "route": the internet path (WebRTC) or the
+ * direct phone-to-phone path (Bluetooth discovery + Wi-Fi Direct, see Nearby). Both routes
+ * speak the same protocol, so if one drops the transfer carries on over whichever route
+ * is available, from the last byte received.
  */
 final class Transfer {
   static final String PREPARING = "preparing", WAITING = "waiting", ASKING = "asking", CONNECTING = "connecting",
@@ -55,16 +56,19 @@ final class Transfer {
     Item(String name, long size, String type, boolean text) { this.name = name; this.size = size; this.type = type; this.text = text; }
   }
 
-  /** One WebRTC connection attempt. A transfer may go through several if the network drops. */
-  private final class Conn {
-    final int gen;
-    PeerConnection pc;
-    DataChannel dc;
-    boolean gatherDone, gatherFired, startedPump, sentFrom, closed;
-    Runnable afterGather;
-    Conn(int gen) { this.gen = gen; }
-    boolean live() { return conn == this && active(); }
+  /** A path the bytes can travel over. */
+  interface Route {
+    boolean usable();
+    /** Sends a control message (JSON). */
+    void sendText(String s) throws IOException;
+    /** Sends file `i` from byte `off`, with the file/eof framing. Blocks until handed off. */
+    void sendFile(Transfer t, int i, long off, InputStream in, long len) throws IOException;
+    void close();
+    boolean direct(); // phone-to-phone (no internet)
   }
+
+  /** Thrown when the route went away mid-send; the drop handling takes it from there. */
+  static final class Stopped extends IOException { Stopped() { super("Stopped"); } }
 
   final Beam beam;
   final String tid, peerId, peerName, peerKind;
@@ -75,15 +79,16 @@ final class Transfer {
   volatile String state;
   String reason, offerSdp;
   int gen;
-  boolean offline; // going over Bluetooth + direct Wi-Fi (Nearby) instead of WebRTC
+  Route offeredOn; // incoming: the direct route the offer arrived on (accepting uses it)
   final long created = System.currentTimeMillis();
 
-  private volatile Conn conn;
+  volatile Route route;
+  private Route pumpRoute;
   private final Object lock = new Object();
   private long lastUi, pausedAt;
-  private boolean everOpen;
+  private boolean everOpen, discovering;
 
-  // receive state (touched on the WebRTC thread, under `this`)
+  // receive state (guarded by `this`)
   private int cur = -1;
   private boolean curDone = true;
   private long got;
@@ -122,76 +127,7 @@ final class Transfer {
 
   boolean active() { return !DONE.equals(state) && !FAILED.equals(state); }
 
-  // ---------- WebRTC setup ----------
-  private static PeerConnectionFactory factory;
-  private static synchronized PeerConnectionFactory factory(Context c) {
-    if (factory == null) {
-      PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(c).createInitializationOptions());
-      factory = PeerConnectionFactory.builder().createPeerConnectionFactory();
-    }
-    return factory;
-  }
-
-  private PeerConnection.RTCConfiguration config() {
-    List<PeerConnection.IceServer> list = new ArrayList<>();
-    JSONArray ice = beam.ice;
-    for (int i = 0; ice != null && i < ice.length(); i++) {
-      JSONObject s = ice.optJSONObject(i);
-      if (s == null) continue;
-      List<String> urls = new ArrayList<>();
-      JSONArray u = s.optJSONArray("urls");
-      if (u != null) for (int k = 0; k < u.length(); k++) urls.add(u.optString(k));
-      else if (s.has("urls")) urls.add(s.optString("urls"));
-      if (urls.isEmpty()) continue;
-      PeerConnection.IceServer.Builder b = PeerConnection.IceServer.builder(urls);
-      if (s.has("username")) b.setUsername(s.optString("username"));
-      if (s.has("credential")) b.setPassword(s.optString("credential"));
-      list.add(b.createIceServer());
-    }
-    return new PeerConnection.RTCConfiguration(list);
-  }
-
-  private PeerConnection.Observer observer(final Conn c) {
-    return new PeerConnection.Observer() {
-      public void onSignalingChange(PeerConnection.SignalingState s) {}
-      public void onIceConnectionChange(PeerConnection.IceConnectionState s) {
-        if (s == PeerConnection.IceConnectionState.FAILED) beam.main.post(() -> dropped(c));
-      }
-      public void onIceConnectionReceivingChange(boolean b) {}
-      public void onIceGatheringChange(PeerConnection.IceGatheringState s) {
-        if (s == PeerConnection.IceGatheringState.COMPLETE) beam.main.post(() -> { c.gatherDone = true; fireGather(c); });
-      }
-      public void onIceCandidate(IceCandidate x) {}
-      public void onIceCandidatesRemoved(IceCandidate[] x) {}
-      public void onAddStream(MediaStream s) {}
-      public void onRemoveStream(MediaStream s) {}
-      public void onDataChannel(DataChannel channel) { if (incoming) setupReceive(c, channel); }
-      public void onRenegotiationNeeded() {}
-    };
-  }
-
-  /** Runs `r` on the main thread once all network routes are known (or after 2.5 s). */
-  private void whenGathered(final Conn c, Runnable r) {
-    beam.main.post(() -> {
-      c.afterGather = r;
-      if (c.gatherDone) fireGather(c);
-      else beam.main.postDelayed(() -> fireGather(c), 2500);
-    });
-  }
-
-  private void fireGather(Conn c) {
-    if (c.afterGather == null || c.gatherFired) return;
-    c.gatherFired = true;
-    c.afterGather.run();
-  }
-
-  private abstract static class Sdp implements SdpObserver {
-    public void onCreateSuccess(SessionDescription d) {}
-    public void onSetSuccess() {}
-    public void onCreateFailure(String e) { failed(e); }
-    public void onSetFailure(String e) { failed(e); }
-    abstract void failed(String e);
-  }
+  boolean direct() { Route r = route; return r != null && r.direct(); }
 
   void ui() {
     lastUi = System.currentTimeMillis();
@@ -199,111 +135,69 @@ final class Transfer {
   }
 
   /** Progress changed; refresh the screen at most every 300 ms. Safe from any thread. */
-  void progressUi() { progress(); }
-
-  private void progress() {
+  void progressUi() {
     long now = System.currentTimeMillis();
     if (now - lastUi < 300) return;
     lastUi = now;
     beam.main.post(() -> beam.transferChanged(this));
   }
 
-  // ---------- sending ----------
+  // =====================================================================================
+  // Starting
+  // =====================================================================================
+
   void startSend() {
     state = PREPARING;
     ui();
-    if (offline) beam.nearby.startSend(this, beam.nearby.peerById(peerId));
+    Beam.Peer near = beam.nearby.peerById(peerId);
+    Beam.Peer online = beam.onlinePeer(peerId);
+    // Same network → internet path (it's direct on the LAN anyway). Right next to us but
+    // not on our network → phone-to-phone, no data used. Otherwise → internet.
+    if (near != null && (online == null || !online.local)) beam.nearby.startSend(this, near, false);
     else connectOut("offer");
   }
 
-  /** Opens a new connection: the first offer, or a resume after a drop. */
-  private void connectOut(final String mode) {
-    closeConn();
-    final Conn c = new Conn(++gen);
-    conn = c;
-    c.pc = factory(beam.app).createPeerConnection(config(), observer(c));
-    if (c.pc == null) { fail("WebRTC unavailable"); return; }
-    c.dc = c.pc.createDataChannel("beam", new DataChannel.Init());
-    c.dc.registerObserver(new DataChannel.Observer() {
-      public void onBufferedAmountChange(long previous) { synchronized (lock) { lock.notifyAll(); } }
-      public void onStateChange() {
-        if (c.dc.state() == DataChannel.State.CLOSED) beam.main.post(() -> dropped(c));
-        synchronized (lock) { lock.notifyAll(); }
-      }
-      public void onMessage(DataChannel.Buffer b) {
-        if (b.binary) return;
-        final String s = text(b);
-        beam.main.post(() -> {
-          if (!c.live()) return;
-          try {
-            JSONObject m = new JSONObject(s);
-            switch (m.optString("t")) {
-              case "from": startPump(c, m.optInt("i", 0), Math.max(0, m.optLong("off", 0))); break;
-              case "ok": finish(); break;
-              case "cancel": fail("Cancelled"); break;
-            }
-          } catch (Exception ignored) {}
-        });
-      }
-    });
-    final Sdp failer = new Sdp() { void failed(String e) { beam.main.post(() -> dropped(c)); } };
-    c.pc.createOffer(new Sdp() {
-      @Override public void onCreateSuccess(SessionDescription desc) {
-        c.pc.setLocalDescription(new Sdp() {
-          @Override public void onSetSuccess() { whenGathered(c, () -> sendOffer(c, mode)); }
-          void failed(String e) { failer.failed(e); }
-        }, desc);
-      }
-      void failed(String e) { failer.failed(e); }
-    }, new MediaConstraints());
-    if ("resume".equals(mode)) {
-      beam.main.postDelayed(() -> { if (conn == c && RECONNECTING.equals(state)) dropped(c); }, 20000);
+  void accept() {
+    if (!ASKING.equals(state)) return;
+    if (offeredOn != null) { sendFromOver(offeredOn); return; }
+    state = CONNECTING;
+    ui();
+    answerConn(offerSdp, gen);
+  }
+
+  /** Receiver: a route is ready; tell the sender where to start (0, or wherever we got to). */
+  void sendFromOver(Route r) {
+    if (!active()) return;
+    if (route != r) attach(r);
+    state = RECEIVING;
+    pausedAt = 0;
+    ui();
+    String from;
+    synchronized (this) {
+      from = curDone ? "{\"t\":\"from\",\"i\":" + (cur + 1) + ",\"off\":0}" : "{\"t\":\"from\",\"i\":" + cur + ",\"off\":" + got + "}";
     }
+    try { r.sendText(from); } catch (IOException e) { routeDropped(r); }
   }
 
-  private void sendOffer(Conn c, String mode) {
-    if (!c.live()) return;
-    try {
-      String sdp = c.pc.getLocalDescription().description;
-      JSONObject d = new JSONObject().put("k", mode).put("tid", tid).put("gen", c.gen).put("sdp", sdp)
-          .put("sig", beam.me.sign("beam-" + mode + "|" + tid + "|" + peerId + "|" + sdp)).put("pub", beam.me.pub);
-      if ("offer".equals(mode)) {
-        JSONArray files = new JSONArray();
-        for (Item i : items) {
-          JSONObject f = new JSONObject().put("name", i.name).put("size", i.size).put("type", i.type);
-          if (i.text) f.put("text", true);
-          files.put(f);
-        }
-        d.put("name", beam.prefs.name).put("kind", "android").put("files", files);
-        state = WAITING;
-        ui();
-        beam.main.postDelayed(() -> {
-          if (WAITING.equals(state)) {
-            try { beam.signal(peerId, new JSONObject().put("k", "cancel").put("tid", tid)); } catch (Exception ignored) {}
-            fail("No response");
-          }
-        }, Beam.OFFER_TIMEOUT);
-      }
-      beam.signal(peerId, d);
-    } catch (Exception e) {
-      fail("Setup failed");
-    }
+  /** Makes `r` the current route, releasing the old one. */
+  void attach(Route r) {
+    Route old = route;
+    route = r;
+    if (old != null && old != r) old.close();
   }
 
-  void onAnswer(String sdp, int answerGen) {
-    final Conn c = conn;
-    if (c == null || c.gen != answerGen) return;
-    if (WAITING.equals(state)) { state = CONNECTING; ui(); }
-    c.pc.setRemoteDescription(new Sdp() { void failed(String e) { beam.main.post(() -> dropped(c)); } },
-        new SessionDescription(SessionDescription.Type.ANSWER, sdp));
-  }
+  // =====================================================================================
+  // Sending (route-independent)
+  // =====================================================================================
 
-  private void startPump(final Conn c, final int i0, final long off0) {
-    if (c.startedPump || !c.live()) return;
+  /** The receiver told us where to start. Runs the send loop for this route. */
+  void startPump(final Route r, final int i0, final long off0) {
+    if (pumpRoute == r || route != r || !active()) return;
     if (i0 < 0 || i0 > items.size() || (i0 < items.size() && off0 > items.get(i0).size)) { fail("Bad resume point"); return; }
-    c.startedPump = true;
+    pumpRoute = r;
     everOpen = true;
     pausedAt = 0;
+    stopDiscovering();
     state = SENDING;
     long d = off0;
     for (int k = 0; k < i0; k++) d += items.get(k).size;
@@ -311,40 +205,32 @@ final class Transfer {
     ui();
     final ContentResolver cr = beam.app.getContentResolver();
     new Thread(() -> {
-      byte[] buf = new byte[CHUNK];
       try {
         for (int i = i0; i < items.size(); i++) {
+          if (route != r || !SENDING.equals(state)) throw new Stopped();
           Item it = items.get(i);
-          long sent = i == i0 ? off0 : 0;
-          sendText(c, "{\"t\":\"file\",\"i\":" + i + ",\"off\":" + sent + "}");
-          InputStream in = openAt(cr, it, sent);
-          try {
-            while (sent < it.size) {
-              int want = (int) Math.min(CHUNK, it.size - sent);
-              int n = readFully(in, buf, want);
-              if (n <= 0) throw new IOException(it.name + " is shorter than expected");
-              sendBinary(c, buf, n);
-              sent += n;
-              done += n;
-              progress();
-            }
-          } finally {
-            in.close();
+          long off = i == i0 ? off0 : 0;
+          try (InputStream in = openAt(cr, it, off)) {
+            r.sendFile(this, i, off, in, it.size - off);
           }
-          sendText(c, "{\"t\":\"eof\",\"i\":" + i + "}");
         }
-        sendText(c, "{\"t\":\"done\"}");
-        beam.main.post(() -> { if (c.live() && SENDING.equals(state)) { state = FINISHING; ui(); } });
+        r.sendText("{\"t\":\"done\"}");
+        beam.main.post(() -> { if (route == r && SENDING.equals(state)) { state = FINISHING; ui(); } });
       } catch (Stopped s) {
-        // the connection went away; dropped() takes it from here
+        // the route went away; routeDropped() takes it from here
       } catch (Exception e) {
         final String msg = e.getMessage();
-        beam.main.post(() -> { if (c.live()) fail(msg != null ? msg : "Transfer failed"); });
+        beam.main.post(() -> { if (route == r) fail(msg != null ? msg : "Transfer failed"); });
       }
     }, "beam-send").start();
   }
 
-  private static InputStream openAt(ContentResolver cr, Item it, long off) throws IOException {
+  void addDone(long n) {
+    done += n;
+    progressUi();
+  }
+
+  static InputStream openAt(ContentResolver cr, Item it, long off) throws IOException {
     if (it.text) {
       ByteArrayInputStream in = new ByteArrayInputStream(it.textValue.getBytes(StandardCharsets.UTF_8));
       in.skip(off);
@@ -366,16 +252,16 @@ final class Transfer {
     while (left > 0) {
       long s = in.skip(left);
       if (s <= 0) {
-        int r = in.read(scratch, 0, (int) Math.min(scratch.length, left));
-        if (r < 0) throw new IOException(it.name + " is shorter than expected");
-        s = r;
+        int rd = in.read(scratch, 0, (int) Math.min(scratch.length, left));
+        if (rd < 0) throw new IOException(it.name + " is shorter than expected");
+        s = rd;
       }
       left -= s;
     }
     return in;
   }
 
-  private static int readFully(InputStream in, byte[] buf, int want) throws IOException {
+  static int readFully(InputStream in, byte[] buf, int want) throws IOException {
     int n = 0;
     while (n < want) {
       int r = in.read(buf, n, want - n);
@@ -385,224 +271,51 @@ final class Transfer {
     return n;
   }
 
-  private static final class Stopped extends IOException { Stopped() { super("Stopped"); } }
+  // =====================================================================================
+  // Receiving (route-independent): every route feeds control messages and bytes in here
+  // =====================================================================================
 
-  private boolean usable(Conn c) {
-    try {
-      return c.live() && c.dc != null && c.dc.state() == DataChannel.State.OPEN;
-    } catch (Exception e) {
-      return false; // channel already released
-    }
-  }
-
-  private void waitRoom(Conn c) throws IOException {
-    synchronized (lock) {
-      while (true) {
-        if (!usable(c)) throw new Stopped();
-        long buffered;
-        try { buffered = c.dc.bufferedAmount(); } catch (Exception e) { throw new Stopped(); }
-        if (buffered <= HIGH_WATER) break;
-        try { lock.wait(200); } catch (InterruptedException e) { throw new Stopped(); }
+  synchronized void rxControl(JSONObject m, Route r) throws IOException {
+    if (!active() || route != r) return;
+    switch (m.optString("t")) {
+      case "file": {
+        int i = m.optInt("i", -1);
+        long off = m.optLong("off", 0);
+        if (i == cur && !curDone && off == got) return; // resuming the same file
+        if (!(curDone && i == cur + 1 && off == 0 && i < items.size())) throw new IOException("Bad data");
+        cur = i;
+        got = 0;
+        curDone = false;
+        openOutput(items.get(cur));
+        return;
       }
-    }
-  }
-
-  private void sendBinary(Conn c, byte[] buf, int n) throws IOException {
-    while (true) {
-      waitRoom(c);
-      try {
-        if (c.dc.send(new DataChannel.Buffer(ByteBuffer.wrap(buf, 0, n), true))) return;
-      } catch (IllegalStateException e) {
-        throw new Stopped();
+      case "eof": {
+        Item it = items.get(Math.max(cur, 0));
+        if (m.optInt("i", -1) != cur || curDone || got != it.size) throw new IOException("File was incomplete");
+        closeOutput(it);
+        curDone = true;
+        return;
       }
-      synchronized (lock) { try { lock.wait(100); } catch (InterruptedException e) { throw new Stopped(); } }
+      case "done":
+        if (!curDone || cur != items.size() - 1) throw new IOException("File was incomplete");
+        r.sendText("{\"t\":\"ok\"}");
+        beam.main.post(this::finish);
+        return;
+      case "cancel":
+        beam.main.post(() -> fail("Cancelled"));
     }
   }
 
-  private void sendText(Conn c, String s) throws IOException {
-    waitRoom(c);
-    byte[] b = s.getBytes(StandardCharsets.UTF_8);
-    try {
-      if (!c.dc.send(new DataChannel.Buffer(ByteBuffer.wrap(b), false))) throw new Stopped();
-    } catch (IllegalStateException e) {
-      throw new Stopped();
-    }
-  }
-
-  private static String text(DataChannel.Buffer b) {
-    byte[] bytes = new byte[b.data.remaining()];
-    b.data.get(bytes);
-    return new String(bytes, StandardCharsets.UTF_8);
-  }
-
-  // ---------- dropped connections ----------
-  /** The connection went away (WiFi blip, out of range, network switch). Pause and try to pick back up. */
-  private void dropped(Conn c) {
-    if (conn != c || !active() || ASKING.equals(state)) return;
-    if (!incoming && !everOpen) { fail("Couldn't connect"); return; }
-    closeConn();
-    state = PAUSED;
-    if (pausedAt == 0) pausedAt = System.currentTimeMillis();
-    ui();
-    if (!incoming) {
-      beam.main.postDelayed(this::retry, 2000 + (long) (Math.random() * 1000));
-    } else {
-      beam.main.postDelayed(() -> {
-        if (PAUSED.equals(state) && System.currentTimeMillis() - pausedAt >= RESUME_WINDOW) fail("Connection lost");
-      }, RESUME_WINDOW + 1000);
-    }
-  }
-
-  /** The server says the other device isn't connected right now. */
-  void peerUnreachable() {
-    if (RECONNECTING.equals(state) && conn != null) dropped(conn);
-    else if (PAUSED.equals(state)) { /* keep waiting */ }
-    else fail("Device went offline");
-  }
-
-  private void retry() {
-    if (!PAUSED.equals(state)) return;
-    if (System.currentTimeMillis() - pausedAt > RESUME_WINDOW) { fail("Connection lost"); return; }
-    if (!beam.online) { beam.main.postDelayed(this::retry, 3000); return; }
-    state = RECONNECTING;
-    ui();
-    connectOut("resume");
-  }
-
-  // ---------- receiving ----------
-  void accept() {
-    if (!ASKING.equals(state)) return;
-    if (offline) { beam.nearby.accept(this); return; }
-    state = CONNECTING;
-    ui();
-    answerConn(offerSdp, gen);
-  }
-
-  /** The sender reconnected after a drop. */
-  void onResume(String sdp, int resumeGen) {
-    if (!(PAUSED.equals(state) || RECEIVING.equals(state) || CONNECTING.equals(state) || RECONNECTING.equals(state))) return;
-    state = RECONNECTING;
-    if (pausedAt == 0) pausedAt = System.currentTimeMillis();
-    ui();
-    answerConn(sdp, resumeGen);
-  }
-
-  private void answerConn(String sdp, int g) {
-    closeConn();
-    gen = g;
-    final Conn c = new Conn(g);
-    conn = c;
-    c.pc = factory(beam.app).createPeerConnection(config(), observer(c));
-    if (c.pc == null) { fail("WebRTC unavailable"); return; }
-    final Sdp failer = new Sdp() { void failed(String e) { beam.main.post(() -> dropped(c)); } };
-    c.pc.setRemoteDescription(new Sdp() {
-      @Override public void onSetSuccess() {
-        c.pc.createAnswer(new Sdp() {
-          @Override public void onCreateSuccess(SessionDescription desc) {
-            c.pc.setLocalDescription(new Sdp() {
-              @Override public void onSetSuccess() { whenGathered(c, () -> sendAnswer(c)); }
-              void failed(String e) { failer.failed(e); }
-            }, desc);
-          }
-          void failed(String e) { failer.failed(e); }
-        }, new MediaConstraints());
-      }
-      void failed(String e) { failer.failed(e); }
-    }, new SessionDescription(SessionDescription.Type.OFFER, sdp));
-  }
-
-  private void sendAnswer(Conn c) {
-    if (!c.live()) return;
-    try {
-      String sdp = c.pc.getLocalDescription().description;
-      beam.signal(peerId, new JSONObject().put("k", "answer").put("tid", tid).put("gen", c.gen).put("sdp", sdp)
-          .put("sig", beam.me.sign("beam-answer|" + tid + "|" + peerId + "|" + sdp)).put("pub", beam.me.pub));
-    } catch (Exception e) {
-      fail("Setup failed");
-    }
-  }
-
-  private void setupReceive(final Conn c, final DataChannel channel) {
-    c.dc = channel;
-    channel.registerObserver(new DataChannel.Observer() {
-      public void onBufferedAmountChange(long previous) {}
-      public void onStateChange() {
-        DataChannel.State s = channel.state();
-        if (s == DataChannel.State.OPEN) beam.main.post(() -> opened(c));
-        else if (s == DataChannel.State.CLOSED) beam.main.post(() -> dropped(c));
-      }
-      public void onMessage(DataChannel.Buffer b) {
-        if (!c.live()) return;
-        try {
-          onData(c, b);
-        } catch (Exception e) {
-          final String msg = e.getMessage();
-          beam.main.post(() -> fail(msg != null ? msg : "Transfer failed"));
-        }
-      }
-    });
-    if (channel.state() == DataChannel.State.OPEN) beam.main.post(() -> opened(c));
-  }
-
-  /** Tell the sender where to start: the beginning, or wherever we got to before a drop. */
-  private void opened(Conn c) {
-    if (!c.live() || c.sentFrom) return;
-    c.sentFrom = true;
-    state = RECEIVING;
-    pausedAt = 0;
-    ui();
-    String from;
-    synchronized (this) {
-      from = curDone ? "{\"t\":\"from\",\"i\":" + (cur + 1) + ",\"off\":0}" : "{\"t\":\"from\",\"i\":" + cur + ",\"off\":" + got + "}";
-    }
-    try { sendText(c, from); } catch (IOException ignored) {}
-  }
-
-  private synchronized void onData(Conn c, DataChannel.Buffer b) throws Exception {
-    if (!c.live()) return;
-    if (!b.binary) {
-      JSONObject m = new JSONObject(text(b));
-      switch (m.optString("t")) {
-        case "file": {
-          int i = m.optInt("i", -1);
-          long off = m.optLong("off", 0);
-          if (i == cur && !curDone && off == got) break; // resuming the same file
-          if (!(curDone && i == cur + 1 && off == 0 && i < items.size())) throw new IOException("Bad data");
-          cur = i;
-          got = 0;
-          curDone = false;
-          openOutput(items.get(cur));
-          break;
-        }
-        case "eof": {
-          Item it = items.get(cur);
-          if (m.optInt("i", -1) != cur || curDone || got != it.size) throw new IOException("File was incomplete");
-          closeOutput(it);
-          curDone = true;
-          break;
-        }
-        case "done":
-          if (!curDone || cur != items.size() - 1) throw new IOException("File was incomplete");
-          sendText(c, "{\"t\":\"ok\"}");
-          beam.main.post(this::finish);
-          break;
-        case "cancel":
-          beam.main.post(() -> fail("Cancelled"));
-          break;
-      }
-      return;
-    }
+  synchronized void rxBytes(Route r, byte[] b, int off, int n) throws IOException {
+    if (!active() || route != r) throw new Stopped();
     if (curDone || cur < 0) throw new IOException("Bad data");
     Item it = items.get(cur);
-    int n = b.data.remaining();
     if (got + n > it.size) throw new IOException("Too much data");
-    byte[] bytes = new byte[n];
-    b.data.get(bytes);
-    if (textBuf != null) textBuf.write(bytes);
-    else out.write(bytes);
+    if (textBuf != null) textBuf.write(b, off, n);
+    else out.write(b, off, n);
     got += n;
     done += n;
-    progress();
+    progressUi();
   }
 
   private void openOutput(Item it) throws IOException {
@@ -654,51 +367,442 @@ final class Transfer {
     }
   }
 
-  // ---------- ending ----------
+  // =====================================================================================
+  // Drops and switching routes
+  // =====================================================================================
+
+  /** A route went away (WiFi blip, out of range, network switch). Pause and pick back up. */
+  void routeDropped(Route r) {
+    if (route != r || !active() || ASKING.equals(state)) return;
+    if (!incoming && !everOpen) {
+      // Never got going on this route. If the other route can reach them, try that once.
+      if (r.direct() && beam.onlinePeer(peerId) != null && !triedOther) { triedOther = true; route = null; r.close(); connectOut("offer"); return; }
+      if (!r.direct() && beam.nearby.peerById(peerId) != null && !triedOther) { triedOther = true; route = null; r.close(); beam.nearby.startSend(this, beam.nearby.peerById(peerId), false); return; }
+      fail("Couldn't connect");
+      return;
+    }
+    route = null;
+    pumpRoute = null;
+    r.close();
+    state = PAUSED;
+    if (pausedAt == 0) pausedAt = System.currentTimeMillis();
+    synchronized (lock) { lock.notifyAll(); }
+    ui();
+    if (!incoming) {
+      startDiscovering(); // look for them nearby too, in case the internet is what dropped
+      beam.main.postDelayed(this::retry, 2000 + (long) (Math.random() * 1000));
+    } else {
+      beam.main.postDelayed(() -> {
+        if (PAUSED.equals(state) && System.currentTimeMillis() - pausedAt >= RESUME_WINDOW) fail("Connection lost");
+      }, RESUME_WINDOW + 1000);
+    }
+  }
+  private boolean triedOther;
+
+  /** The server says the other device isn't connected right now. */
+  void peerUnreachable() {
+    Route r = route;
+    if (RECONNECTING.equals(state) && r != null) routeDropped(r);
+    else if (PAUSED.equals(state)) { /* keep waiting */ }
+    else if (!direct()) fail("Device went offline");
+  }
+
+  /** Sender: reconnect over whichever route can reach them now, preferring phone-to-phone. */
+  private void retry() {
+    if (!PAUSED.equals(state)) return;
+    if (System.currentTimeMillis() - pausedAt > RESUME_WINDOW) { fail("Connection lost"); return; }
+    Beam.Peer near = beam.nearby.peerById(peerId);
+    if (near != null) {
+      state = RECONNECTING;
+      ui();
+      beam.nearby.startSend(this, near, true);
+    } else if (beam.online && beam.onlinePeer(peerId) != null) {
+      state = RECONNECTING;
+      ui();
+      connectOut("resume");
+    } else {
+      beam.main.postDelayed(this::retry, 3000);
+    }
+  }
+
+  /** Called when a resume attempt on some route didn't come through. */
+  void attemptFailed(Route r) {
+    if (route == r) routeDropped(r);
+  }
+
+  private void startDiscovering() {
+    if (discovering) return;
+    discovering = true;
+    beam.nearby.discover(true);
+  }
+
+  private void stopDiscovering() {
+    if (!discovering) return;
+    discovering = false;
+    beam.nearby.discover(false);
+  }
+
+  // =====================================================================================
+  // The internet route: a WebRTC data channel
+  // =====================================================================================
+
+  private final class Conn implements Route {
+    final int gen;
+    PeerConnection pc;
+    DataChannel dc;
+    boolean gatherDone, gatherFired, sentFrom, closed;
+    Runnable afterGather;
+    Conn(int gen) { this.gen = gen; }
+
+    public boolean direct() { return false; }
+
+    public boolean usable() {
+      try {
+        return route == this && active() && !closed && dc != null && dc.state() == DataChannel.State.OPEN;
+      } catch (Exception e) {
+        return false; // channel already released
+      }
+    }
+
+    private void waitRoom() throws IOException {
+      synchronized (lock) {
+        while (true) {
+          if (!usable()) throw new Stopped();
+          long buffered;
+          try { buffered = dc.bufferedAmount(); } catch (Exception e) { throw new Stopped(); }
+          if (buffered <= HIGH_WATER) break;
+          try { lock.wait(200); } catch (InterruptedException e) { throw new Stopped(); }
+        }
+      }
+    }
+
+    public void sendText(String s) throws IOException {
+      waitRoom();
+      byte[] b = s.getBytes(StandardCharsets.UTF_8);
+      try {
+        if (!dc.send(new DataChannel.Buffer(ByteBuffer.wrap(b), false))) throw new Stopped();
+      } catch (IllegalStateException e) {
+        throw new Stopped();
+      }
+    }
+
+    private void sendBinary(byte[] buf, int n) throws IOException {
+      while (true) {
+        waitRoom();
+        try {
+          if (dc.send(new DataChannel.Buffer(ByteBuffer.wrap(buf, 0, n), true))) return;
+        } catch (IllegalStateException e) {
+          throw new Stopped();
+        }
+        synchronized (lock) { try { lock.wait(100); } catch (InterruptedException e) { throw new Stopped(); } }
+      }
+    }
+
+    public void sendFile(Transfer t, int i, long off, InputStream in, long len) throws IOException {
+      sendText("{\"t\":\"file\",\"i\":" + i + ",\"off\":" + off + "}");
+      byte[] buf = new byte[CHUNK];
+      long sent = 0;
+      while (sent < len) {
+        int n = readFully(in, buf, (int) Math.min(CHUNK, len - sent));
+        if (n <= 0) throw new IOException(items.get(i).name + " is shorter than expected");
+        sendBinary(buf, n);
+        sent += n;
+        t.addDone(n);
+      }
+      sendText("{\"t\":\"eof\",\"i\":" + i + "}");
+    }
+
+    public void close() {
+      if (closed) return;
+      closed = true;
+      synchronized (lock) { lock.notifyAll(); }
+      // Give a sender thread a moment to notice before the native objects are freed.
+      beam.main.postDelayed(() -> {
+        try { if (dc != null) { dc.unregisterObserver(); dc.close(); dc.dispose(); } } catch (Exception ignored) {}
+        try { if (pc != null) pc.dispose(); } catch (Exception ignored) {}
+      }, 400);
+    }
+  }
+
+  private static PeerConnectionFactory factory;
+  private static synchronized PeerConnectionFactory factory(Context c) {
+    if (factory == null) {
+      PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(c).createInitializationOptions());
+      factory = PeerConnectionFactory.builder().createPeerConnectionFactory();
+    }
+    return factory;
+  }
+
+  private PeerConnection.RTCConfiguration config() {
+    List<PeerConnection.IceServer> list = new ArrayList<>();
+    JSONArray ice = beam.ice;
+    for (int i = 0; ice != null && i < ice.length(); i++) {
+      JSONObject s = ice.optJSONObject(i);
+      if (s == null) continue;
+      List<String> urls = new ArrayList<>();
+      JSONArray u = s.optJSONArray("urls");
+      if (u != null) for (int k = 0; k < u.length(); k++) urls.add(u.optString(k));
+      else if (s.has("urls")) urls.add(s.optString("urls"));
+      if (urls.isEmpty()) continue;
+      PeerConnection.IceServer.Builder b = PeerConnection.IceServer.builder(urls);
+      if (s.has("username")) b.setUsername(s.optString("username"));
+      if (s.has("credential")) b.setPassword(s.optString("credential"));
+      list.add(b.createIceServer());
+    }
+    return new PeerConnection.RTCConfiguration(list);
+  }
+
+  private PeerConnection.Observer observer(final Conn c) {
+    return new PeerConnection.Observer() {
+      public void onSignalingChange(PeerConnection.SignalingState s) {}
+      public void onIceConnectionChange(PeerConnection.IceConnectionState s) {
+        if (s == PeerConnection.IceConnectionState.FAILED) beam.main.post(() -> routeDropped(c));
+      }
+      public void onIceConnectionReceivingChange(boolean b) {}
+      public void onIceGatheringChange(PeerConnection.IceGatheringState s) {
+        if (s == PeerConnection.IceGatheringState.COMPLETE) beam.main.post(() -> { c.gatherDone = true; fireGather(c); });
+      }
+      public void onIceCandidate(IceCandidate x) {}
+      public void onIceCandidatesRemoved(IceCandidate[] x) {}
+      public void onAddStream(MediaStream s) {}
+      public void onRemoveStream(MediaStream s) {}
+      public void onDataChannel(DataChannel channel) { if (incoming) setupReceive(c, channel); }
+      public void onRenegotiationNeeded() {}
+    };
+  }
+
+  /** Runs `r` on the main thread once all network routes are known (or after 2.5 s). */
+  private void whenGathered(final Conn c, Runnable r) {
+    beam.main.post(() -> {
+      c.afterGather = r;
+      if (c.gatherDone) fireGather(c);
+      else beam.main.postDelayed(() -> fireGather(c), 2500);
+    });
+  }
+
+  private void fireGather(Conn c) {
+    if (c.afterGather == null || c.gatherFired) return;
+    c.gatherFired = true;
+    c.afterGather.run();
+  }
+
+  private abstract static class Sdp implements SdpObserver {
+    public void onCreateSuccess(SessionDescription d) {}
+    public void onSetSuccess() {}
+    public void onCreateFailure(String e) { failed(e); }
+    public void onSetFailure(String e) { failed(e); }
+    abstract void failed(String e);
+  }
+
+  private static String text(DataChannel.Buffer b) {
+    byte[] bytes = new byte[b.data.remaining()];
+    b.data.get(bytes);
+    return new String(bytes, StandardCharsets.UTF_8);
+  }
+
+  /** Sender: open a WebRTC connection — the first offer, or a resume after a drop. */
+  private void connectOut(final String mode) {
+    final Conn c = new Conn(++gen);
+    attach(c);
+    c.pc = factory(beam.app).createPeerConnection(config(), observer(c));
+    if (c.pc == null) { fail("WebRTC unavailable"); return; }
+    c.dc = c.pc.createDataChannel("beam", new DataChannel.Init());
+    c.dc.registerObserver(new DataChannel.Observer() {
+      public void onBufferedAmountChange(long previous) { synchronized (lock) { lock.notifyAll(); } }
+      public void onStateChange() {
+        if (c.dc.state() == DataChannel.State.CLOSED) beam.main.post(() -> routeDropped(c));
+        synchronized (lock) { lock.notifyAll(); }
+      }
+      public void onMessage(DataChannel.Buffer b) {
+        if (b.binary) return;
+        final String s = text(b);
+        beam.main.post(() -> onSenderMessage(c, s));
+      }
+    });
+    final Sdp failer = new Sdp() { void failed(String e) { beam.main.post(() -> routeDropped(c)); } };
+    c.pc.createOffer(new Sdp() {
+      @Override public void onCreateSuccess(SessionDescription desc) {
+        c.pc.setLocalDescription(new Sdp() {
+          @Override public void onSetSuccess() { whenGathered(c, () -> sendOffer(c, mode)); }
+          void failed(String e) { failer.failed(e); }
+        }, desc);
+      }
+      void failed(String e) { failer.failed(e); }
+    }, new MediaConstraints());
+    if ("resume".equals(mode)) {
+      beam.main.postDelayed(() -> { if (route == c && RECONNECTING.equals(state)) routeDropped(c); }, 20000);
+    }
+  }
+
+  /** Sender: a control message from the receiver, on any route. */
+  void onSenderMessage(Route r, String s) {
+    if (route != r || !active()) return;
+    try {
+      JSONObject m = new JSONObject(s);
+      switch (m.optString("t")) {
+        case "from": startPump(r, m.optInt("i", 0), Math.max(0, m.optLong("off", 0))); break;
+        case "ok": finish(); break;
+        case "cancel": fail("Cancelled"); break;
+      }
+    } catch (Exception ignored) {}
+  }
+
+  private void sendOffer(Conn c, String mode) {
+    if (route != c || !active()) return;
+    try {
+      String sdp = c.pc.getLocalDescription().description;
+      JSONObject d = new JSONObject().put("k", mode).put("tid", tid).put("gen", c.gen).put("sdp", sdp)
+          .put("sig", beam.me.sign("beam-" + mode + "|" + tid + "|" + peerId + "|" + sdp)).put("pub", beam.me.pub);
+      if ("offer".equals(mode)) {
+        d.put("name", beam.prefs.name).put("kind", "android").put("files", filesJson());
+        markWaiting();
+      }
+      beam.signal(peerId, d);
+    } catch (Exception e) {
+      fail("Setup failed");
+    }
+  }
+
+  JSONArray filesJson() throws Exception {
+    JSONArray files = new JSONArray();
+    for (Item i : items) {
+      JSONObject f = new JSONObject().put("name", i.name).put("size", i.size).put("type", i.type);
+      if (i.text) f.put("text", true);
+      files.put(f);
+    }
+    return files;
+  }
+
+  /** Sender: the offer is out; give the other person two minutes to accept. */
+  void markWaiting() {
+    if (!PREPARING.equals(state) && !CONNECTING.equals(state)) return;
+    state = WAITING;
+    ui();
+    beam.main.postDelayed(() -> {
+      if (WAITING.equals(state)) {
+        if (!direct()) try { beam.signal(peerId, new JSONObject().put("k", "cancel").put("tid", tid)); } catch (Exception ignored) {}
+        fail("No response");
+      }
+    }, Beam.OFFER_TIMEOUT);
+  }
+
+  void onAnswer(String sdp, int answerGen) {
+    Route r = route;
+    if (!(r instanceof Conn) || ((Conn) r).gen != answerGen) return;
+    final Conn c = (Conn) r;
+    if (WAITING.equals(state)) { state = CONNECTING; ui(); }
+    c.pc.setRemoteDescription(new Sdp() { void failed(String e) { beam.main.post(() -> routeDropped(c)); } },
+        new SessionDescription(SessionDescription.Type.ANSWER, sdp));
+  }
+
+  /** Receiver: the sender reconnected over the internet after a drop. */
+  void onResume(String sdp, int resumeGen) {
+    if (!(PAUSED.equals(state) || RECEIVING.equals(state) || CONNECTING.equals(state) || RECONNECTING.equals(state))) return;
+    state = RECONNECTING;
+    if (pausedAt == 0) pausedAt = System.currentTimeMillis();
+    ui();
+    answerConn(sdp, resumeGen);
+  }
+
+  private void answerConn(String sdp, int g) {
+    gen = g;
+    final Conn c = new Conn(g);
+    attach(c);
+    c.pc = factory(beam.app).createPeerConnection(config(), observer(c));
+    if (c.pc == null) { fail("WebRTC unavailable"); return; }
+    final Sdp failer = new Sdp() { void failed(String e) { beam.main.post(() -> routeDropped(c)); } };
+    c.pc.setRemoteDescription(new Sdp() {
+      @Override public void onSetSuccess() {
+        c.pc.createAnswer(new Sdp() {
+          @Override public void onCreateSuccess(SessionDescription desc) {
+            c.pc.setLocalDescription(new Sdp() {
+              @Override public void onSetSuccess() { whenGathered(c, () -> sendAnswer(c)); }
+              void failed(String e) { failer.failed(e); }
+            }, desc);
+          }
+          void failed(String e) { failer.failed(e); }
+        }, new MediaConstraints());
+      }
+      void failed(String e) { failer.failed(e); }
+    }, new SessionDescription(SessionDescription.Type.OFFER, sdp));
+  }
+
+  private void sendAnswer(Conn c) {
+    if (route != c || !active()) return;
+    try {
+      String sdp = c.pc.getLocalDescription().description;
+      beam.signal(peerId, new JSONObject().put("k", "answer").put("tid", tid).put("gen", c.gen).put("sdp", sdp)
+          .put("sig", beam.me.sign("beam-answer|" + tid + "|" + peerId + "|" + sdp)).put("pub", beam.me.pub));
+    } catch (Exception e) {
+      fail("Setup failed");
+    }
+  }
+
+  private void setupReceive(final Conn c, final DataChannel channel) {
+    c.dc = channel;
+    channel.registerObserver(new DataChannel.Observer() {
+      public void onBufferedAmountChange(long previous) {}
+      public void onStateChange() {
+        DataChannel.State s = channel.state();
+        if (s == DataChannel.State.OPEN) beam.main.post(() -> opened(c));
+        else if (s == DataChannel.State.CLOSED) beam.main.post(() -> routeDropped(c));
+      }
+      public void onMessage(DataChannel.Buffer b) {
+        try {
+          if (b.binary) {
+            byte[] bytes = new byte[b.data.remaining()];
+            b.data.get(bytes);
+            rxBytes(c, bytes, 0, bytes.length);
+          } else {
+            rxControl(new JSONObject(text(b)), c);
+          }
+        } catch (Stopped s) {
+          // old route
+        } catch (Exception e) {
+          final String msg = e.getMessage();
+          beam.main.post(() -> { if (route == c) fail(msg != null ? msg : "Transfer failed"); });
+        }
+      }
+    });
+    if (channel.state() == DataChannel.State.OPEN) beam.main.post(() -> opened(c));
+  }
+
+  private void opened(Conn c) {
+    if (route != c || !active() || c.sentFrom) return;
+    c.sentFrom = true;
+    sendFromOver(c);
+  }
+
+  // =====================================================================================
+  // Ending
+  // =====================================================================================
+
   void finish() {
     if (!active()) return;
     state = DONE;
     ui();
     cleanupTemp();
-    final Conn c = conn;
-    beam.main.postDelayed(() -> { if (conn == c) closeConn(); }, 1500);
-    if (offline) beam.nearby.onFinish(this);
+    stopDiscovering();
+    final Route r = route;
+    beam.main.postDelayed(() -> { if (r != null) r.close(); }, 1500);
     if (incoming) beam.notify.received(this);
   }
 
   void fail(String why) {
     if (!active()) return;
-    final Conn c = conn;
-    if (c != null && c.dc != null) {
-      try {
-        if (c.dc.state() == DataChannel.State.OPEN) c.dc.send(new DataChannel.Buffer(ByteBuffer.wrap("{\"t\":\"cancel\"}".getBytes(StandardCharsets.UTF_8)), false));
-      } catch (Exception ignored) {}
-    }
+    final Route r = route;
+    if (r != null) try { if (r.usable()) r.sendText("{\"t\":\"cancel\"}"); } catch (Exception ignored) {}
     state = FAILED;
     reason = why;
     synchronized (lock) { lock.notifyAll(); }
-    if (offline) beam.nearby.onFail(this);
     if (incoming) new Thread(this::discardPartial).start();
     cleanupTemp();
+    stopDiscovering();
     ui();
-    beam.main.postDelayed(() -> { if (conn == c) closeConn(); }, 500);
+    beam.main.postDelayed(() -> { if (r != null) r.close(); }, 500);
   }
 
   private void cleanupTemp() {
     for (Item i : items) if (i.temp != null) { i.temp.delete(); i.temp = null; }
-  }
-
-  /** Releases the current connection. A sender thread still using it stops at its next check. */
-  private void closeConn() {
-    final Conn c = conn;
-    conn = null;
-    if (c == null || c.closed) return;
-    c.closed = true;
-    synchronized (lock) { lock.notifyAll(); }
-    // Give a sender thread a moment to notice before the native objects are freed.
-    beam.main.postDelayed(() -> {
-      try { if (c.dc != null) { c.dc.unregisterObserver(); c.dc.close(); c.dc.dispose(); } } catch (Exception ignored) {}
-      try { if (c.pc != null) c.pc.dispose(); } catch (Exception ignored) {}
-    }, 400);
   }
 }

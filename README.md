@@ -12,13 +12,16 @@ An AirDrop-style way to send files, photos, text and links between your devices.
 - **Nearby**: devices on the same WiFi (same public internet address) see each other automatically, like AirDrop's "Everyone".
 - **My devices**: pair once (Settings → Show a code / Enter a code, then check both screens show the same 6-digit number). Paired devices see each other anywhere, even on different networks, and can skip the Accept prompt.
 
-## Offline sharing (Android ↔ Android)
+## One engine, two routes
 
-With no internet or shared WiFi (a plane, a park, a dead zone), Android phones still find each other: Beam advertises over Bluetooth Low Energy and Google's Nearby Connections moves files over a direct Wi-Fi link between the phones. Offline devices show "· offline" under their name. When both phones can reach the server, Beam uses the normal internet path instead.
+Every device shows up once in the list, however Beam can reach it, and Beam picks the route:
 
-Each side signs Nearby's link token with its Beam key (`beam-nearby|<token hex>|<deviceId>`), so a paired device can't be impersonated and nobody can sit in the middle. Phones set to "my devices only" only show up for their paired devices.
+- **Internet route** (WebRTC): devices on the same WiFi, or anywhere for paired devices. Works on every platform.
+- **Direct route** (Android ↔ Android): phones find each other over Bluetooth Low Energy and send over a direct Wi-Fi link via Google's Nearby Connections, with no router or internet needed. Used when the other phone is right next to you but not on your network.
 
-Offline transfers don't resume after a drop yet, and text sent offline is limited to 30 KB.
+Both routes speak the same protocol (`from` / `file` / `eof` / `done`), so a transfer can start on one and finish on the other. If the route drops mid-transfer, the sender reconnects over whichever route can reach the other device, preferring the direct one, and carries on from the last byte received (for up to 15 minutes).
+
+On the direct route each side signs Nearby's link token with its Beam key (`beam-nearby|<token hex>|<deviceId>`), so a paired device can't be impersonated and nobody can sit in the middle. Phones set to "my devices only" only show up for their paired devices.
 
 ## Security
 

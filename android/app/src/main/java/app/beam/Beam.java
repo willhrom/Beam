@@ -36,7 +36,8 @@ final class Beam {
 
   static final class Peer {
     final String id, name, kind, pub;
-    String endpointId; // set when found offline over Bluetooth
+    String endpointId; // set when found nearby over Bluetooth
+    boolean local;     // the server says it's on our network
     Peer(String id, String name, String kind, String pub) { this.id = id; this.name = name; this.kind = kind; this.pub = pub; }
   }
 
@@ -178,6 +179,7 @@ final class Beam {
         for (int k = 0; a != null && k < a.length(); k++) {
           JSONObject p = a.getJSONObject(k);
           Peer peer = new Peer(p.getString("id"), p.optString("name", "Device"), p.optString("kind", "web"), p.optString("pub"));
+          peer.local = p.optBoolean("local");
           list.add(peer);
           Prefs.Paired pp = prefs.paired.get(peer.id);
           if (pp != null && pp.pub.equals(peer.pub) && !pp.name.equals(peer.name)) { pp.name = peer.name; save = true; }
@@ -290,10 +292,18 @@ final class Beam {
 
   private void onOffer(String from, JSONObject d) throws Exception {
     String tid = d.optString("tid");
-    if (tid.isEmpty() || tx.containsKey(tid)) return;
+    if (tid.isEmpty()) return;
     String pub = d.optString("pub"), sdp = d.optString("sdp");
     if (!trusted(from, pub)) return;
     if (!Crypto.verify(pub, d.optString("sig"), "beam-offer|" + tid + "|" + me.id + "|" + sdp)) return;
+    Transfer known = tx.get(tid);
+    if (known != null) {
+      // The sender switched this transfer to the internet route (e.g. the direct link failed).
+      if (!known.incoming || !known.peerId.equals(from)) return;
+      if (Transfer.ASKING.equals(known.state)) { known.offeredOn = null; known.offerSdp = sdp; known.gen = d.optInt("gen", 0); }
+      else if (known.active()) known.onResume(sdp, d.optInt("gen", 0));
+      return;
+    }
     JSONArray files = d.optJSONArray("files");
     if (files == null || files.length() == 0) return;
     List<Transfer.Item> items = new ArrayList<>();
@@ -320,7 +330,7 @@ final class Beam {
       main.postDelayed(() -> {
         if (Transfer.ASKING.equals(t.state)) {
           notify.cancelRequest(t);
-          if (t.offline) nearby.decline(t);
+          if (t.offeredOn != null) nearby.decline(t);
           t.fail("Expired");
         }
       }, OFFER_TIMEOUT);
@@ -331,8 +341,6 @@ final class Beam {
   // ---------- actions from the UI ----------
   Transfer send(Peer p, List<Transfer.Item> items) {
     Transfer t = new Transfer(this, Crypto.randomId(), false, p.id, p.name, p.kind, prefs.paired.containsKey(p.id), items);
-    // Over the internet when the server can reach them; otherwise Bluetooth + direct Wi-Fi.
-    t.offline = onlinePeer(p.id) == null && nearby.peerById(p.id) != null;
     tx.put(t.tid, t);
     t.startSend();
     changed();
@@ -348,7 +356,7 @@ final class Beam {
     Transfer t = tx.get(tid);
     if (t == null || !Transfer.ASKING.equals(t.state)) return;
     notify.cancelRequest(t);
-    if (t.offline) nearby.decline(t);
+    if (t.offeredOn != null) nearby.decline(t);
     else try { signal(t.peerId, new JSONObject().put("k", "decline").put("tid", tid)); } catch (Exception ignored) {}
     t.state = Transfer.FAILED;
     t.reason = "Declined";
@@ -359,7 +367,7 @@ final class Beam {
   void cancel(String tid) {
     Transfer t = tx.get(tid);
     if (t == null) return;
-    if (!t.offline && (Transfer.WAITING.equals(t.state) || Transfer.PREPARING.equals(t.state) || Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state))) {
+    if (!t.direct() && (Transfer.WAITING.equals(t.state) || Transfer.PREPARING.equals(t.state) || Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state))) {
       try { signal(t.peerId, new JSONObject().put("k", "cancel").put("tid", tid)); } catch (Exception ignored) {}
     }
     t.fail("Cancelled");
