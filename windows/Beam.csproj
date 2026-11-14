@@ -9,6 +9,7 @@
     <AssemblyName>Beam</AssemblyName>
     <RootNamespace>Beam</RootNamespace>
     <ApplicationIcon>beam.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <Product>Beam</Product>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
@@ -23,5 +24,8 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="beam.ico" />
+    <!-- The signed identity package and its certificate (built by the workflow), for the Share window. -->
+    <EmbeddedResource Include="identity\beam-share.cer" LogicalName="Beam.share.cer" />
+    <EmbeddedResource Include="identity-out\Beam.Share.msix" LogicalName="Beam.share.msix" Condition="Exists('identity-out\Beam.Share.msix')" />
   </ItemGroup>
 </Project>

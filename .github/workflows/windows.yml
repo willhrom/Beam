@@ -17,6 +17,29 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
+      # The signed identity package that puts Beam in the Windows Share window.
+      - name: Build the Share menu package
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.WINDOWS_SIGN_PFX_B64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
+        run: |
+          if (-not $env:PFX_B64) { Write-Host "::warning::No WINDOWS_SIGN_PFX_B64 secret, so this build can't add Beam to the Share window."; exit 0 }
+          $kit = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $pfx = Join-Path $env:RUNNER_TEMP "share.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+          New-Item -ItemType Directory -Force windows\identity-out | Out-Null
+          & "$($kit.FullName)\makeappx.exe" pack /d windows\identity /p windows\identity-out\Beam.Share.msix /nv /o
+          if ($LASTEXITCODE) { exit 1 }
+          & "$($kit.FullName)\signtool.exe" sign /fd SHA256 /f $pfx /p $env:PFX_PASSWORD /tr http://timestamp.digicert.com /td SHA256 windows\identity-out\Beam.Share.msix
+          if ($LASTEXITCODE) { exit 1 }
+          Remove-Item $pfx
+          # Check Windows accepts it: trust the certificate on this build machine and register the package.
+          Import-Certificate -FilePath windows\identity\beam-share.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\beam-ext" | Out-Null
+          Add-AppxPackage -Path windows\identity-out\Beam.Share.msix -ExternalLocation "$env:RUNNER_TEMP\beam-ext"
+          Get-AppxPackage Beam.Share | Format-List Name, Version, Status, SignatureKind
+          Get-AppxPackage Beam.Share | Remove-AppxPackage
       - name: Build
         shell: bash
         env:

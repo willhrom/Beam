@@ -66,6 +66,7 @@ GitHub Actions builds and publishes everything on push to `main`.
 |---|---|
 | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | Deploying the server and web app |
 | `ANDROID_KEYSTORE_B64`, `ANDROID_KEYSTORE_PASSWORD` | Signing the APK (key alias `beam`) |
+| `WINDOWS_SIGN_PFX_B64`, `WINDOWS_SIGN_PASSWORD` | Signing Beam's small Windows identity package, which puts Beam in the Windows Share window (certificate `CN=Beam Share`; its public half is `windows/identity/beam-share.cer`) |
 | `TURN_KEY_ID`, `TURN_KEY_API_TOKEN` *(optional)* | Cloudflare Realtime TURN relay, for networks where devices can't connect directly (e.g. some phone carriers) |
 
 Set the `BEAM_URL` variable if the server lives somewhere other than `https://beam.wahromyk.workers.dev`.

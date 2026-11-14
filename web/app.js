@@ -667,7 +667,7 @@ if (nativeKind === "windows") {
     if (!e.data || e.data.op !== "share") return;
     const files = [];
     for (const h of e.additionalObjects || []) { try { files.push(await h.getFile()); } catch {} }
-    shareFromDesktop(files);
+    shareFromDesktop(files, e.data.text || null);
   });
 }
 function nativeStatus() {
@@ -790,14 +790,14 @@ function pendingLabel() {
 }
 
 // Files handed over by the Mac or Windows app ("Send with Beam"): pick a device and go.
-function shareFromDesktop(files) {
-  if (!files.length) return;
-  S.pending = { files };
+function shareFromDesktop(files, text) {
+  if (!files.length && !text) return;
+  S.pending = { files, text: text || null };
   render();
   if (native) native.postMessage({ op: "show" });
   const others = S.peers;
   openSheet(`<h2>Send ${esc(pendingLabel())}</h2>
-    <p>${fmtSize(files.reduce((a, f) => a + f.size, 0))}. Choose a device.</p>
+    <p>${files.length ? fmtSize(files.reduce((a, f) => a + f.size, 0)) + ". " : ""}Choose a device.</p>
     <div class="list">${others.map((p) => `<div class="item"><span>${esc(p.name)} <span class="sub">${S.paired[p.id] ? "My device" : "Nearby"}</span></span><button class="btn primary small" data-to="${p.id}">Send</button></div>`).join("") || '<div class="item"><span class="sub">Looking for devices… they\'ll also appear on the main screen.</span></div>'}</div>
     <div class="actions"><button class="btn ghost" id="cx">Cancel</button></div>`);
   $("#cx").onclick = () => { S.pending = null; closeSheet(); render(); };

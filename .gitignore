@@ -6,3 +6,4 @@ server/.wrangler/
 *.jks
 *.p12
 server/.dev.vars
+windows/identity-out/

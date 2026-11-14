@@ -9,7 +9,10 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
+using System.Security.Cryptography.X509Certificates;
+using Windows.Management.Deployment;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -38,6 +41,10 @@ namespace Beam
             var files = new List<string>();
             int si = Array.IndexOf(args, "--send");
             if (si >= 0) for (int i = si + 1; i < args.Length; i++) if (File.Exists(args[i])) files.Add(Path.GetFullPath(args[i]));
+            // Opened from the Windows Share window: collect what was shared.
+            string shareText = null;
+            var shared = ShareMenu.ReadActivation();
+            if (shared != null) { files.AddRange(shared.Value.files); shareText = shared.Value.text; }
 
             bool updated = Array.Exists(args, a => a == "--updated");
             var mutex = new Mutex(true, "Beam.SingleInstance", out bool first);
@@ -52,7 +59,7 @@ namespace Beam
             if (!first)
             {
                 // Beam is already running: hand it the files (if any) and bring its window up.
-                if (files.Count > 0)
+                if (files.Count > 0 || shareText != null)
                 {
                     try
                     {
@@ -60,6 +67,7 @@ namespace Beam
                         pipe.Connect(3000);
                         using var w = new StreamWriter(pipe);
                         foreach (var f in files) w.WriteLine(f);
+                        if (shareText != null) w.WriteLine("TEXT\t" + Convert.ToBase64String(Encoding.UTF8.GetBytes(shareText)));
                     }
                     catch { }
                 }
@@ -73,8 +81,8 @@ namespace Beam
 
             bool background = Array.Exists(args, a => a == "--background") || ToastNotificationManagerCompat.WasCurrentProcessToastActivated();
             if (updated) Updater.CleanUp();
-            var form = new MainForm(!background || files.Count > 0);
-            if (files.Count > 0) form.QueueShare(files);
+            var form = new MainForm(!background || files.Count > 0 || shareText != null);
+            if (files.Count > 0 || shareText != null) form.QueueShare(files, shareText);
             if (Array.Exists(args, a => a == "--installed"))
                 form.Balloon("Beam is installed", "Find it in the Start menu. It also starts with Windows and lives here in the tray.");
             new Thread(() =>
@@ -101,6 +109,7 @@ namespace Beam
         readonly ProgressPopup popup = new ProgressPopup();
         readonly Updater updater;
         readonly ToolStripMenuItem updateItem = new ToolStripMenuItem("Check for updates");
+        readonly ToolStripMenuItem shareItem = new ToolStripMenuItem("Add Beam to the Windows Share menu") { Visible = false };
         CoreWebView2Environment env;
         readonly List<string> shareQueue = new();
         System.Windows.Forms.Timer shareTimer;
@@ -132,6 +141,8 @@ namespace Beam
             menu.Items.Add("Reload", null, (s, e) => web.CoreWebView2?.Reload());
             updateItem.Click += (s, e) => updater.CheckNow(true);
             menu.Items.Add(updateItem);
+            shareItem.Click += (s, e) => AddToShareMenu(true);
+            menu.Items.Add(shareItem);
             menu.Items.Add(new ToolStripMenuItem("Version 1.0." + Updater.Current) { Enabled = false });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Quit Beam", null, (s, e) => Quit());
@@ -154,6 +165,9 @@ namespace Beam
             popup.Clicked += ShowMain;
             updater = new Updater(this);
             updater.Start();
+            var shareCheck = new System.Windows.Forms.Timer { Interval = 4000 };
+            shareCheck.Tick += (s, e) => { shareCheck.Stop(); shareCheck.Dispose(); CheckShareMenu(); };
+            shareCheck.Start();
 
             // Create the window handles without showing it, so the page loads in the background.
             CreateHandle();
@@ -238,6 +252,35 @@ namespace Beam
             }) { IsBackground = true }.Start();
         }
 
+        // ---------- the Windows Share window ----------
+        void CheckShareMenu()
+        {
+            if (!Installer.IsInstalledCopy || !ShareMenu.Available) return;
+            var state = ShareMenu.State();
+            shareItem.Visible = state == ShareMenu.Status.Missing;
+            if (state == ShareMenu.Status.Current) return;
+            if (state == ShareMenu.Status.Outdated) { AddToShareMenu(false); return; } // already trusted: update quietly
+            using var k = Registry.CurrentUser.CreateSubKey(@"Software\Beam");
+            if (k.GetValue("shareMenuAsked") != null) return;
+            k.SetValue("shareMenuAsked", 1);
+            ShowMain();
+            var answer = MessageBox.Show(this,
+                "Add Beam to the Windows Share menu?\n\nYou'll be able to send photos, videos and files to your devices straight from the Share button in Photos, File Explorer and other apps.\n\nWindows will ask for permission once.",
+                "Beam", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (answer == DialogResult.Yes) AddToShareMenu(true);
+        }
+
+        async void AddToShareMenu(bool askPermission)
+        {
+            shareItem.Enabled = false;
+            string error = await ShareMenu.Register(askPermission);
+            shareItem.Enabled = true;
+            shareItem.Visible = ShareMenu.State() == ShareMenu.Status.Missing;
+            if (!askPermission) return;
+            if (error == null) Balloon("Beam is in the Share menu", "In Photos or File Explorer, choose Share, then Beam.");
+            else Balloon("Couldn't add Beam to the Share menu", error);
+        }
+
         // ---------- "Send with Beam" from File Explorer ----------
         void InstallExplorerMenus()
         {
@@ -282,8 +325,16 @@ namespace Beam
                         using var r = new StreamReader(pipe);
                         var got = new List<string>();
                         string line;
-                        while ((line = r.ReadLine()) != null) if (File.Exists(line)) got.Add(line);
-                        if (got.Count > 0) BeginInvoke(new Action(() => QueueShare(got)));
+                        string text = null;
+                        while ((line = r.ReadLine()) != null)
+                        {
+                            if (line.StartsWith("TEXT\t"))
+                            {
+                                try { text = Encoding.UTF8.GetString(Convert.FromBase64String(line.Substring(5))); } catch { }
+                            }
+                            else if (File.Exists(line)) got.Add(line);
+                        }
+                        if (got.Count > 0 || text != null) BeginInvoke(new Action(() => QueueShare(got, text)));
                     }
                     catch { Thread.Sleep(500); }
                 }
@@ -291,9 +342,12 @@ namespace Beam
         }
 
         // Collect files for a moment (Explorer may launch us once per file), then hand them to the page.
-        public void QueueShare(IEnumerable<string> paths)
+        string shareTextQueue;
+
+        public void QueueShare(IEnumerable<string> paths, string text = null)
         {
             foreach (var p in paths) if (!shareQueue.Contains(p)) shareQueue.Add(p);
+            if (!string.IsNullOrWhiteSpace(text)) shareTextQueue = shareTextQueue == null ? text : shareTextQueue + "\n" + text;
             if (shareTimer == null)
             {
                 shareTimer = new System.Windows.Forms.Timer { Interval = 700 };
@@ -306,14 +360,17 @@ namespace Beam
 
         void FlushShare()
         {
-            if (!pageReady || env == null || web.CoreWebView2 == null || shareQueue.Count == 0) return;
+            if (!pageReady || env == null || web.CoreWebView2 == null || (shareQueue.Count == 0 && shareTextQueue == null)) return;
             var handles = new List<object>();
             foreach (var p in shareQueue)
             {
                 try { handles.Add(env.CreateWebFileSystemFileHandle(p, CoreWebView2FileSystemHandlePermission.ReadOnly)); } catch { }
             }
             shareQueue.Clear();
-            if (handles.Count > 0) web.CoreWebView2.PostWebMessageAsJson("{\"op\":\"share\"}", handles);
+            var msg = JsonSerializer.Serialize(new { op = "share", text = shareTextQueue });
+            shareTextQueue = null;
+            if (handles.Count > 0) web.CoreWebView2.PostWebMessageAsJson(msg, handles);
+            else web.CoreWebView2.PostWebMessageAsJson(msg);
         }
 
         // ---------- window ----------
@@ -537,6 +594,143 @@ namespace Beam
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid id, uint flags, IntPtr token, out string path);
     }
+    /// <summary>
+    /// Puts Beam in the Windows Share window. Windows only lists apps that have a package
+    /// identity there, so Beam registers a small signed identity package that points at the
+    /// installed Beam.exe. Its certificate has to be trusted on the PC first, which needs
+    /// admin permission once.
+    /// </summary>
+    static class ShareMenu
+    {
+        const string PackageName = "Beam.Share", Publisher = "CN=Beam Share";
+        const string PackageVersion = "1.0.1.0"; // keep in step with identity/AppxManifest.xml
+        public enum Status { Missing, Outdated, Current }
+
+        static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Beam", "identity");
+
+        static byte[] Resource(string name)
+        {
+            using var s = typeof(ShareMenu).Assembly.GetManifestResourceStream(name);
+            if (s == null) return null;
+            using var m = new MemoryStream();
+            s.CopyTo(m);
+            return m.ToArray();
+        }
+
+        public static bool Available =>
+            OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041) &&
+            typeof(ShareMenu).Assembly.GetManifestResourceInfo("Beam.share.msix") != null;
+
+        static Windows.ApplicationModel.Package Registered()
+        {
+            try { foreach (var p in new PackageManager().FindPackagesForUser("", PackageName, Publisher)) return p; } catch { }
+            return null;
+        }
+
+        public static Status State()
+        {
+            var p = Registered();
+            if (p == null) return Status.Missing;
+            var v = p.Id.Version;
+            return new Version(v.Major, v.Minor, v.Build, v.Revision) >= Version.Parse(PackageVersion) ? Status.Current : Status.Outdated;
+        }
+
+        static bool Trusted(X509Certificate2 cert)
+        {
+            try
+            {
+                using var store = new X509Store(StoreName.TrustedPeople, StoreLocation.LocalMachine);
+                store.Open(OpenFlags.ReadOnly);
+                return store.Certificates.Find(X509FindType.FindByThumbprint, cert.Thumbprint, false).Count > 0;
+            }
+            catch { return false; }
+        }
+
+        /// <returns>null when Beam is in the Share menu, otherwise what went wrong.</returns>
+        public static async Task<string> Register(bool askPermission)
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                var cerPath = Path.Combine(Dir, "beam-share.cer");
+                var msixPath = Path.Combine(Dir, "Beam.Share.msix");
+                var cerBytes = Resource("Beam.share.cer");
+                var msixBytes = Resource("Beam.share.msix");
+                if (cerBytes == null || msixBytes == null) return "This copy of Beam can't add itself to the Share menu.";
+                File.WriteAllBytes(cerPath, cerBytes);
+                File.WriteAllBytes(msixPath, msixBytes);
+
+                var cert = new X509Certificate2(cerBytes);
+                if (!Trusted(cert))
+                {
+                    if (!askPermission) return "Needs permission";
+                    // Trust Beam's certificate for packages on this PC (Windows asks for admin permission).
+                    bool ok = await Task.Run(() =>
+                    {
+                        try
+                        {
+                            using var p = Process.Start(new ProcessStartInfo("certutil.exe", $"-addstore TrustedPeople \"{cerPath}\"")
+                            { UseShellExecute = true, Verb = "runas", WindowStyle = ProcessWindowStyle.Hidden });
+                            p.WaitForExit();
+                            return p.ExitCode == 0;
+                        }
+                        catch { return false; } // permission declined
+                    });
+                    if (!ok || !Trusted(cert)) return "Windows didn't give permission, so Beam can't add itself to the Share menu. You can try again from the Beam icon in the tray.";
+                }
+
+                var options = new AddPackageOptions { ExternalLocationUri = new Uri(Installer.Dir + Path.DirectorySeparatorChar) };
+                var result = await new PackageManager().AddPackageByUriAsync(new Uri(msixPath), options);
+                return result.IsRegistered ? null : "Windows said: " + (result.ErrorText ?? "unknown error");
+            }
+            catch (Exception e)
+            {
+                return e.Message;
+            }
+        }
+
+        /// <summary>If Beam was opened from the Share window, returns what was shared (and tells Windows it's handled).</summary>
+        public static (List<string> files, string text)? ReadActivation()
+        {
+            if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041)) return null;
+            try
+            {
+                if (Windows.ApplicationModel.AppInstance.GetActivatedEventArgs() is not Windows.ApplicationModel.Activation.ShareTargetActivatedEventArgs share) return null;
+                var op = share.ShareOperation;
+                op.ReportStarted();
+                var data = op.Data;
+                var files = new List<string>();
+                string text = null;
+                if (data.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.StorageItems))
+                {
+                    var items = data.GetStorageItemsAsync().AsTask().GetAwaiter().GetResult();
+                    var temp = Path.Combine(Path.GetTempPath(), "Beam share", Guid.NewGuid().ToString("N"));
+                    foreach (var item in items)
+                    {
+                        if (item is not Windows.Storage.StorageFile f) continue;
+                        if (!string.IsNullOrEmpty(f.Path) && File.Exists(f.Path)) { files.Add(f.Path); continue; }
+                        // Some apps share files that aren't on disk; keep a copy we can read.
+                        Directory.CreateDirectory(temp);
+                        var copy = f.CopyAsync(Windows.Storage.StorageFolder.GetFolderFromPathAsync(temp).AsTask().GetAwaiter().GetResult(),
+                            f.Name, Windows.Storage.NameCollisionOption.GenerateUniqueName).AsTask().GetAwaiter().GetResult();
+                        files.Add(copy.Path);
+                    }
+                }
+                if (data.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.WebLink))
+                    text = data.GetWebLinkAsync().AsTask().GetAwaiter().GetResult()?.ToString();
+                else if (data.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.Text))
+                    text = data.GetTextAsync().AsTask().GetAwaiter().GetResult();
+                op.ReportDataRetrieved();
+                op.ReportCompleted();
+                return (files, string.IsNullOrWhiteSpace(text) ? null : text);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
     /// <summary>
     /// A small card in the lower-right corner of the screen showing a transfer's progress
     /// while Beam's window isn't in front. It never takes focus; clicking it opens Beam.
@@ -915,7 +1109,7 @@ namespace Beam
             var data = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Beam");
             // The program can't delete itself while running, so a short-lived helper finishes the job.
             Try(() => Process.Start(new ProcessStartInfo("cmd.exe",
-                $"/c ping 127.0.0.1 -n 3 > nul & rmdir /s /q \"{Dir}\" & rmdir /s /q \"{data}\"")
+                $"/c ping 127.0.0.1 -n 3 > nul & powershell -NoProfile -Command \"Get-AppxPackage Beam.Share | Remove-AppxPackage\" & rmdir /s /q \"{Dir}\" & rmdir /s /q \"{data}\"")
             { CreateNoWindow = true, UseShellExecute = false }));
             MessageBox.Show("Beam was removed.", "Beam");
         }
