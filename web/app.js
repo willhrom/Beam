@@ -139,6 +139,11 @@ window.addEventListener("online", () => { backoff = 1000; connect(); });
 async function onServer(m) {
   switch (m.t) {
     case "challenge":
+      // Beam was updated on the server: reload to pick up the new version (once nothing is moving).
+      if (m.v) {
+        if (S.serverVersion && m.v !== S.serverVersion) return reloadWhenIdle();
+        S.serverVersion = m.v;
+      }
       wsSend({ t: "hello", pub: Id.pub, sig: await Id.sign("beam-hello:" + m.nonce), name: S.name, kind, nearby: S.nearby, watch: Object.keys(S.paired) });
       break;
     case "welcome":
@@ -213,6 +218,11 @@ async function onServer(m) {
       if (S.pairing) { S.pairing.error = m.reason; showPairJoin(); }
       break;
   }
+}
+function reloadWhenIdle() {
+  const busy = [...S.tx.values()].some((t) => !["done", "failed"].includes(t.state));
+  if (busy) return setTimeout(reloadWhenIdle, 5000);
+  location.reload();
 }
 function updateServer() { wsSend({ t: "update", name: S.name, nearby: S.nearby, watch: Object.keys(S.paired) }); }
 

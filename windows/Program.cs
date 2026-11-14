@@ -27,6 +27,12 @@ namespace Beam
         [STAThread]
         static void Main(string[] args)
         {
+            if (Array.Exists(args, a => a == "--uninstall")) { Installer.Uninstall(); return; }
+            // Opened from Downloads (or anywhere else)? Install into the user's Programs folder and run from there.
+            if (!Installer.IsInstalledCopy && !Array.Exists(args, a => a == "--portable"))
+            {
+                if (Installer.Install(args)) return;
+            }
             // "Send with Beam" from Explorer runs: Beam.exe --send <file> [<file> ...]
             var files = new List<string>();
             int si = Array.IndexOf(args, "--send");
@@ -140,6 +146,7 @@ namespace Beam
             startupItem.Checked = IsStartup();
             InstallExplorerMenus();
             StartPipeServer();
+            ListenForQuit();
             updater = new Updater(this);
             updater.Start();
 
@@ -215,6 +222,17 @@ namespace Beam
             t.Start();
         }
 
+        // Another copy of Beam (the installer, or Uninstall) asks this one to close.
+        void ListenForQuit()
+        {
+            new Thread(() =>
+            {
+                using var ev = new EventWaitHandle(false, EventResetMode.AutoReset, Installer.QuitEvent);
+                ev.WaitOne();
+                try { BeginInvoke(new Action(Quit)); } catch { Environment.Exit(0); }
+            }) { IsBackground = true }.Start();
+        }
+
         // ---------- "Send with Beam" from File Explorer ----------
         void InstallExplorerMenus()
         {
@@ -234,18 +252,7 @@ namespace Beam
             try
             {
                 // Right-click → Send to → Beam (handles many files at once)
-                var link = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SendTo), "Beam.lnk");
-                var shellType = Type.GetTypeFromProgID("WScript.Shell");
-                if (shellType != null)
-                {
-                    dynamic shell = Activator.CreateInstance(shellType);
-                    dynamic lnk = shell.CreateShortcut(link);
-                    lnk.TargetPath = exe;
-                    lnk.Arguments = "--send";
-                    lnk.IconLocation = exe + ",0";
-                    lnk.Description = "Send with Beam";
-                    lnk.Save();
-                }
+                Installer.CreateLink(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SendTo), "Beam.lnk"), exe, "--send", "Send with Beam");
             }
             catch { }
         }
@@ -620,6 +627,117 @@ namespace Beam
                 return;
             }
             form.RestartForUpdate(Exe);
+        }
+    }
+    /// <summary>
+    /// Installs Beam for the current user (no admin rights needed): copies it to
+    /// %LOCALAPPDATA%\Programs\Beam, adds a Start menu shortcut and an entry in
+    /// Settings → Apps so it can be uninstalled like any other app.
+    /// </summary>
+    static class Installer
+    {
+        public const string QuitEvent = "Beam.Quit";
+        const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\Beam";
+        public static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Beam");
+        public static string Exe => Path.Combine(Dir, "Beam.exe");
+        static string StartMenuLink => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Beam.lnk");
+
+        public static bool IsInstalledCopy =>
+            string.Equals(Path.GetFullPath(Environment.ProcessPath), Path.GetFullPath(Exe), StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>Asks a running Beam to quit and waits for it to close.</summary>
+        static bool CloseRunning()
+        {
+            if (!Mutex.TryOpenExisting("Beam.SingleInstance", out var m)) return true;
+            m.Dispose();
+            try { using var ev = new EventWaitHandle(false, EventResetMode.AutoReset, QuitEvent); ev.Set(); } catch { }
+            for (int i = 0; i < 40; i++)
+            {
+                Thread.Sleep(250);
+                if (!Mutex.TryOpenExisting("Beam.SingleInstance", out var m2)) return true;
+                m2.Dispose();
+            }
+            return false;
+        }
+
+        /// <returns>true if this process should exit (the installed copy has been started).</returns>
+        public static bool Install(string[] args)
+        {
+            try
+            {
+                if (!CloseRunning())
+                {
+                    MessageBox.Show("Beam is already running. Right-click the Beam icon in the system tray, choose Quit Beam, then open this file again.", "Beam");
+                    return true;
+                }
+                Directory.CreateDirectory(Dir);
+                var src = Environment.ProcessPath;
+                if (File.Exists(Exe))
+                {
+                    var old = Exe + ".old";
+                    try { if (File.Exists(old)) File.Delete(old); } catch { }
+                    try { File.Delete(Exe); } catch { File.Move(Exe, old); }
+                }
+                File.Copy(src, Exe);
+                CreateLink(StartMenuLink, Exe, "", "Beam: send files to your devices");
+                using (var k = Registry.CurrentUser.CreateSubKey(UninstallKey))
+                {
+                    var v = typeof(Installer).Assembly.GetName().Version;
+                    k.SetValue("DisplayName", "Beam");
+                    k.SetValue("DisplayVersion", $"1.0.{v?.Build ?? 0}");
+                    k.SetValue("Publisher", "Beam");
+                    k.SetValue("DisplayIcon", Exe + ",0");
+                    k.SetValue("InstallLocation", Dir);
+                    k.SetValue("UninstallString", $"\"{Exe}\" --uninstall");
+                    k.SetValue("NoModify", 1, RegistryValueKind.DWord);
+                    k.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+                    k.SetValue("EstimatedSize", (int)(new FileInfo(Exe).Length / 1024), RegistryValueKind.DWord);
+                }
+                // Start the installed copy (passing along any files to send) and step aside.
+                var pass = string.Join(" ", Array.ConvertAll(args, a => "\"" + a + "\""));
+                Process.Start(new ProcessStartInfo(Exe, pass) { UseShellExecute = false });
+                return true;
+            }
+            catch (Exception e)
+            {
+                // Couldn't install; just run from where we are.
+                Debug.WriteLine(e);
+                return false;
+            }
+        }
+
+        public static void CreateLink(string link, string target, string args, string description)
+        {
+            var shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType == null) return;
+            dynamic shell = Activator.CreateInstance(shellType);
+            dynamic lnk = shell.CreateShortcut(link);
+            lnk.TargetPath = target;
+            lnk.Arguments = args;
+            lnk.IconLocation = target + ",0";
+            lnk.Description = description;
+            lnk.Save();
+        }
+
+        public static void Uninstall()
+        {
+            if (MessageBox.Show("Remove Beam from this PC? This signs this PC out of Beam and deletes its settings.", "Beam",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            CloseRunning();
+            void Try(Action a) { try { a(); } catch { } }
+            Try(() => { using var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true); k?.DeleteValue("Beam", false); });
+            Try(() => Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\*\shell\Beam", false));
+            Try(() => Registry.CurrentUser.DeleteSubKeyTree(@"Software\Beam", false));
+            Try(() => Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false));
+            Try(() => File.Delete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SendTo), "Beam.lnk")));
+            Try(() => File.Delete(StartMenuLink));
+            Try(() => ToastNotificationManagerCompat.Uninstall());
+            var data = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Beam");
+            // The program can't delete itself while running, so a short-lived helper finishes the job.
+            Try(() => Process.Start(new ProcessStartInfo("cmd.exe",
+                $"/c ping 127.0.0.1 -n 3 > nul & rmdir /s /q \"{Dir}\" & rmdir /s /q \"{data}\"")
+            { CreateNoWindow = true, UseShellExecute = false }));
+            MessageBox.Show("Beam was removed.", "Beam");
         }
     }
 }

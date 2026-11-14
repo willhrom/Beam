@@ -106,7 +106,7 @@ export class Hub extends DurableObject {
     this.ctx.acceptWebSocket(server);
     const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
     server.serializeAttachment({ nonce, net: netKey(req.headers.get("CF-Connecting-IP")), tries: 0 });
-    send(server, { t: "challenge", nonce });
+    send(server, { t: "challenge", nonce, v: (this.env.VERSION && this.env.VERSION.id) || "" });
     return new Response(null, { status: 101, webSocket: client });
   }
 
