@@ -74,6 +74,8 @@ namespace Beam
             if (updated) Updater.CleanUp();
             var form = new MainForm(!background || files.Count > 0);
             if (files.Count > 0) form.QueueShare(files);
+            if (Array.Exists(args, a => a == "--installed"))
+                form.Balloon("Beam is installed", "Find it in the Start menu. It also starts with Windows and lives here in the tray.");
             new Thread(() =>
             {
                 while (showSignal.WaitOne())
@@ -694,7 +696,7 @@ namespace Beam
                     k.SetValue("EstimatedSize", (int)(new FileInfo(Exe).Length / 1024), RegistryValueKind.DWord);
                 }
                 // Start the installed copy (passing along any files to send) and step aside.
-                var pass = string.Join(" ", Array.ConvertAll(args, a => "\"" + a + "\""));
+                var pass = string.Join(" ", Array.ConvertAll(args, a => "\"" + a + "\"")) + " --installed";
                 Process.Start(new ProcessStartInfo(Exe, pass) { UseShellExecute = false });
                 return true;
             }
