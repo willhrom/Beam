@@ -411,7 +411,7 @@ namespace Beam
             {
                 try
                 {
-                    if (Directory.Exists(p)) handles.Add(env.CreateWebFileSystemDirectoryHandle(p, CoreWebView2FileSystemHandlePermission.Read));
+                    if (Directory.Exists(p)) handles.Add(env.CreateWebFileSystemDirectoryHandle(p, CoreWebView2FileSystemHandlePermission.ReadOnly));
                     else handles.Add(env.CreateWebFileSystemFileHandle(p, CoreWebView2FileSystemHandlePermission.ReadOnly));
                 }
                 catch { }
