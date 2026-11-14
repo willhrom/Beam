@@ -48,7 +48,7 @@ GitHub Actions builds and publishes everything on push to `main`.
 | Secret | Used for |
 |---|---|
 | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | Deploying the server and web app |
-| `ANDROID_KEYSTORE_B64`, `ANDROID_KEYSTORE_PASSWORD` | Signing the APK (key alias defaults to `weather`; set the `ANDROID_KEY_ALIAS` variable if yours differs) |
+| `ANDROID_KEYSTORE_B64`, `ANDROID_KEYSTORE_PASSWORD` | Signing the APK (key alias `beam`) |
 | `TURN_KEY_ID`, `TURN_KEY_API_TOKEN` *(optional)* | Cloudflare Realtime TURN relay, for networks where devices can't connect directly (e.g. some phone carriers) |
 
 Set the `BEAM_URL` variable if the server lives somewhere other than `https://beam.wahromyk.workers.dev`.
