@@ -212,7 +212,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     words.addView(Ui.oneLine(Ui.text(this, (t.incoming ? "From " : "To ") + t.peerName, 14, Ui.TEXT, true)));
     String sub;
     if (Transfer.FAILED.equals(t.state)) sub = t.reason;
-    else if (Transfer.DONE.equals(t.state)) sub = (t.incoming ? "Received " : "Sent ") + t.describe() + (t.incoming && hasFiles(t) ? " · in Downloads/Beam" : "");
+    else if (Transfer.DONE.equals(t.state)) sub = (t.incoming ? "Received " : "Sent ") + t.describe() + (t.incoming && t.savedWhere() != null ? " · " + t.savedWhere() : "");
     else sub = stateText(t.state) + (t.direct() ? " · direct" : "") + " · " + t.describe() + (t.total > 0 ? " · " + fmtSize(t.total) : "");
     int subColor = Transfer.FAILED.equals(t.state) ? Ui.BAD : Transfer.DONE.equals(t.state) ? Ui.GOOD : Ui.DIM;
     words.addView(Ui.oneLine(Ui.text(this, sub, 12.5f, subColor, false)));

@@ -3,7 +3,7 @@
 An AirDrop-style way to send files, photos, text and links between your devices.
 
 - **Web app**: https://beam.wahromyk.workers.dev works on any device with a modern browser (iPhone, Windows, Chromebook…). You can install it as an app from the browser menu.
-- **Android app**: runs in the background, appears in the share sheet, and asks to accept from a notification. Download: `https://github.com/<you>/beam/releases/download/android/beam.apk`
+- **Android app**: saves received photos to the gallery (Pictures/Beam), videos to the gallery (Movies/Beam) and everything else to Files (Downloads/Beam). It runs in the background, appears in the share sheet, and asks to accept from a notification. Download: `https://github.com/<you>/beam/releases/download/android/beam.apk`
 - **Windows app**: lives in the system tray, starts with Windows, shows Accept/Decline notifications, and saves to Downloads. Download: `https://github.com/<you>/beam/releases/download/windows/Beam.exe`
 - **Progress card**: while the Mac or Windows app is sending or receiving and its window isn't in front, a small card in the lower-right corner of the screen shows the progress. Clicking it opens Beam.
 - **Mac app**: lives in the menu bar, stays reachable in the background, and saves straight to Downloads. Download: `https://github.com/<you>/beam/releases/download/mac/Beam-mac.zip`

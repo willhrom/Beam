@@ -122,13 +122,22 @@ final class Notify {
         b.setContentIntent(openApp());
       }
     } else {
-      b.setContentTitle("From " + t.peerName).setContentText("Saved " + t.describe() + " to Downloads/Beam");
+      String where = t.savedWhere();
+      b.setContentTitle("From " + t.peerName).setContentText("Saved " + t.describe() + (where != null ? " " + where : ""));
       Intent open;
       if (t.items.size() == 1 && first.saved != null) {
         open = new Intent(Intent.ACTION_VIEW).setDataAndType(first.saved, first.type).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
         open.setClipData(ClipData.newRawUri("", first.saved));
       } else {
-        open = new Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        // Several photos/videos: open the first one in the gallery app. Files: open Downloads.
+        boolean allMedia = true;
+        for (Transfer.Item it : t.items) if (it.text || it.place == null || it.place == Transfer.Place.FILES) allMedia = false;
+        if (allMedia && first.saved != null) {
+          open = new Intent(Intent.ACTION_VIEW).setDataAndType(first.saved, Transfer.mimeOf(first)).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+          open.setClipData(ClipData.newRawUri("", first.saved));
+        } else {
+          open = new Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        }
       }
       b.setContentIntent(PendingIntent.getActivity(c, id, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
     }

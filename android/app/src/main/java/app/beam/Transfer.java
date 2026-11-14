@@ -53,6 +53,7 @@ final class Transfer {
     File temp;        // outgoing copy we made (deleted after)
     String textValue; // outgoing text, or received text
     Uri saved;        // received file
+    Transfer.Place place; // where it was saved
     Item(String name, long size, String type, boolean text) { this.name = name; this.size = size; this.type = type; this.text = text; }
   }
 
@@ -341,22 +342,65 @@ final class Transfer {
       return;
     }
     textBuf = null;
+    String mime = mimeOf(it);
+    ContentResolver cr = beam.app.getContentResolver();
+    it.place = placeFor(mime);
+    pendingUri = null;
+    if (it.place != Place.FILES) {
+      // Photos and videos go where the gallery looks: Pictures/Beam and Movies/Beam.
+      try {
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.MediaColumns.DISPLAY_NAME, it.name);
+        v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+        v.put(MediaStore.MediaColumns.RELATIVE_PATH, (it.place == Place.PHOTOS ? Environment.DIRECTORY_PICTURES : Environment.DIRECTORY_MOVIES) + "/Beam");
+        v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        pendingUri = cr.insert(it.place == Place.PHOTOS
+            ? MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            : MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), v);
+      } catch (Exception e) {
+        pendingUri = null; // a type the gallery doesn't take: save it as a file instead
+      }
+      if (pendingUri == null) it.place = Place.FILES;
+    }
+    if (pendingUri == null) {
+      ContentValues v = new ContentValues();
+      v.put(MediaStore.Downloads.DISPLAY_NAME, it.name);
+      v.put(MediaStore.Downloads.MIME_TYPE, mime);
+      v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Beam");
+      v.put(MediaStore.Downloads.IS_PENDING, 1);
+      pendingUri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+    }
+    if (pendingUri == null) throw new IOException("Couldn't save " + it.name);
+    out = cr.openOutputStream(pendingUri);
+    if (out == null) throw new IOException("Couldn't save " + it.name);
+  }
+
+  enum Place { PHOTOS, VIDEOS, FILES }
+
+  static String mimeOf(Item it) {
     String mime = it.type;
     int dot = it.name.lastIndexOf('.');
     if (dot > 0) {
       String m = MimeTypeMap.getSingleton().getMimeTypeFromExtension(it.name.substring(dot + 1).toLowerCase());
       if (m != null) mime = m;
     }
-    ContentValues v = new ContentValues();
-    v.put(MediaStore.Downloads.DISPLAY_NAME, it.name);
-    v.put(MediaStore.Downloads.MIME_TYPE, mime);
-    v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Beam");
-    v.put(MediaStore.Downloads.IS_PENDING, 1);
-    ContentResolver cr = beam.app.getContentResolver();
-    pendingUri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
-    if (pendingUri == null) throw new IOException("Couldn't save to Downloads");
-    out = cr.openOutputStream(pendingUri);
-    if (out == null) throw new IOException("Couldn't save to Downloads");
+    return mime == null ? "application/octet-stream" : mime;
+  }
+
+  static Place placeFor(String mime) {
+    if (mime.startsWith("image/") && !mime.equals("image/svg+xml")) return Place.PHOTOS;
+    if (mime.startsWith("video/")) return Place.VIDEOS;
+    return Place.FILES;
+  }
+
+  /** Where this transfer's files ended up, in words: "in your gallery", "in Downloads/Beam", or both. */
+  String savedWhere() {
+    boolean media = false, files = false;
+    for (Item i : items) {
+      if (i.text || i.saved == null) continue;
+      if (i.place == Place.FILES) files = true; else media = true;
+    }
+    return media && files ? "in your gallery and Downloads/Beam" : media ? "in your gallery" : files ? "in Downloads/Beam" : null;
   }
 
   private void closeOutput(Item it) throws IOException {
