@@ -18,7 +18,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Puts your devices in the Android share sheet's top row (like AirDrop's row of people):
+ * Puts your devices in the Android share sheet's top row:
  * share a video, tap "Will's Mac", and it goes straight there.
  */
 final class Shortcuts {

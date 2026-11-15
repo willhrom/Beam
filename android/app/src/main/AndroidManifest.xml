@@ -70,7 +70,7 @@
         android:foregroundServiceType="specialUse">
       <property
           android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-          android:value="Stays reachable so nearby devices the user owns can send files to this phone, like AirDrop." />
+          android:value="Stays reachable so nearby devices the user owns can send files to this phone at any time." />
     </service>
     <service
         android:name=".UpdateJob"

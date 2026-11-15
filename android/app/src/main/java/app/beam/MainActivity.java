@@ -37,6 +37,17 @@ public class MainActivity extends Activity implements Beam.Listener {
   private android.widget.Button manyBtn;
   private LinearLayout transfers;
   private String peersKey = "";
+  // Views kept between redraws, so animations aren't cut short and progress updates are cheap.
+  private final java.util.Map<String, LinearLayout> bubbles = new java.util.HashMap<>();
+  private final java.util.Map<String, String> bubbleKeys = new java.util.HashMap<>();
+  private final java.util.Map<String, View> cards = new java.util.HashMap<>();
+  private final java.util.Map<String, String> cardKeys = new java.util.HashMap<>();
+  private final java.util.Map<String, ProgressBar> bars = new java.util.HashMap<>();
+  private final java.util.Map<String, String> txSeen = new java.util.HashMap<>();
+  private final java.util.Set<String> peersSeen = new java.util.HashSet<>();
+  private android.widget.FrameLayout overlay;
+  private View radarBox;
+  private android.animation.ValueAnimator radarAnim, pulseAnim;
   private boolean updateOffered;
   private String pickFor;
   private AlertDialog incomingDialog, pairDialog;
@@ -105,6 +116,8 @@ public class MainActivity extends Activity implements Beam.Listener {
 
   @Override protected void onDestroy() {
     if (signInDialog != null) { signInDialog.dismiss(); signInDialog = null; }
+    if (radarAnim != null) radarAnim.cancel();
+    if (pulseAnim != null) pulseAnim.cancel();
     super.onDestroy();
   }
 
@@ -158,13 +171,57 @@ public class MainActivity extends Activity implements Beam.Listener {
     gp.gravity = Gravity.CENTER_HORIZONTAL;
     root.addView(peersGrid, gp);
 
+    // "Looking for devices": a ring keeps spreading out of a dot, like the web app's sonar.
+    android.widget.FrameLayout rb = new android.widget.FrameLayout(this);
+    View ring = new View(this);
+    android.graphics.drawable.GradientDrawable rg = new android.graphics.drawable.GradientDrawable();
+    rg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+    rg.setStroke(Ui.dp(this, 2), Ui.ACCENT2);
+    ring.setBackground(rg);
+    android.widget.FrameLayout.LayoutParams rlp = new android.widget.FrameLayout.LayoutParams(Ui.dp(this, 90), Ui.dp(this, 90), Gravity.CENTER);
+    rb.addView(ring, rlp);
+    View dot = new View(this);
+    android.graphics.drawable.GradientDrawable dg = new android.graphics.drawable.GradientDrawable();
+    dg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+    dg.setColor(Ui.ACCENT2);
+    dot.setBackground(dg);
+    rb.addView(dot, new android.widget.FrameLayout.LayoutParams(Ui.dp(this, 14), Ui.dp(this, 14), Gravity.CENTER));
+    radarBox = rb;
+    radarAnim = Fx.radar(ring);
+    root.addView(rb, Ui.margins(this, -1, Ui.dp(this, 150), 0, 10, 0, 0));
+
     empty = Ui.text(this, "", 14, Ui.DIM, false);
     empty.setGravity(Gravity.CENTER);
-    root.addView(empty, Ui.margins(this, -1, -2, 0, 30, 0, 30));
+    root.addView(empty, Ui.margins(this, -1, -2, 0, 0, 0, 30));
 
     transfers = Ui.col(this);
     root.addView(transfers, Ui.margins(this, -1, -2, 0, 16, 0, 0));
-    setContentView(sv);
+
+    // A see-through layer over everything, for bursts.
+    android.widget.FrameLayout frame = new android.widget.FrameLayout(this);
+    frame.addView(sv, new android.widget.FrameLayout.LayoutParams(-1, -1));
+    overlay = new android.widget.FrameLayout(this);
+    overlay.setClickable(false);
+    overlay.setFocusable(false);
+    frame.addView(overlay, new android.widget.FrameLayout.LayoutParams(-1, -1));
+    setContentView(frame);
+
+    // While sending, the device you're sending to gently pulses.
+    pulseAnim = android.animation.ValueAnimator.ofFloat(0, 1);
+    pulseAnim.setDuration(900);
+    pulseAnim.setRepeatCount(android.animation.ValueAnimator.INFINITE);
+    pulseAnim.setRepeatMode(android.animation.ValueAnimator.REVERSE);
+    pulseAnim.addUpdateListener(a -> {
+      float f = (float) a.getAnimatedValue();
+      for (Transfer t : beam.tx.values()) {
+        if (!(Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state))) continue;
+        LinearLayout b = bubbles.get(t.peerId);
+        if (b == null || b.getChildCount() == 0) continue;
+        View circle = b.getChildAt(0);
+        circle.setScaleX(1f + 0.07f * f);
+        circle.setScaleY(1f + 0.07f * f);
+      }
+    });
   }
 
   @Override public void onChange() { render(); }
@@ -188,27 +245,101 @@ public class MainActivity extends Activity implements Beam.Listener {
         : "Visible as " + beam.prefs.name + " · " + (beam.prefs.nearby ? "Everyone nearby" : "My devices only")
           + (beam.prefs.enabled ? "" : "\nOnly while Beam is open. To receive when it's closed, turn on \"Stay reachable\" in Settings."));
 
-    // peers (rebuilt only when something about them changed)
-    StringBuilder key = new StringBuilder();
+    // peers: each bubble is rebuilt only when something about that device changed
     List<Beam.Peer> all = beam.allPeers();
-    for (Beam.Peer p : all) key.append(p.id).append(p.name).append(noteFor(p)).append(beam.prefs.paired.containsKey(p.id)).append(beam.isOfflineOnly(p.id)).append('|');
-    if (!key.toString().equals(peersKey)) {
-      peersKey = key.toString();
-      peersGrid.removeAllViews();
-      for (Beam.Peer p : all) {
-        LinearLayout b = Ui.peerBubble(this, p, beam.prefs.paired.containsKey(p.id) || p.mine, noteFor(p), beam.isOfflineOnly(p.id));
+    List<View> want = new ArrayList<>();
+    java.util.Set<String> ids = new java.util.HashSet<>();
+    int fresh = 0;
+    for (Beam.Peer p : all) {
+      ids.add(p.id);
+      boolean mine = beam.prefs.paired.containsKey(p.id) || p.mine;
+      String k = p.name + "|" + noteFor(p) + "|" + mine + "|" + beam.isOfflineOnly(p.id) + "|" + p.kind;
+      LinearLayout b = bubbles.get(p.id);
+      if (b == null || !k.equals(bubbleKeys.get(p.id))) {
+        b = Ui.peerBubble(this, p, mine, noteFor(p), beam.isOfflineOnly(p.id));
         b.setOnClickListener(v -> chooseWhat(p.id));
-        peersGrid.addView(b);
+        Fx.squishOnTouch(b);
+        bubbles.put(p.id, b);
+        bubbleKeys.put(p.id, k);
       }
+      if (peersSeen.add(p.id)) Fx.popIn(b, fresh++);
+      want.add(b);
+    }
+    bubbles.keySet().retainAll(ids);
+    bubbleKeys.keySet().retainAll(ids);
+    peersSeen.retainAll(ids);
+    if (!sameChildren(peersGrid, want)) {
+      peersGrid.removeAllViews();
+      for (View v : want) { Fx.detach(v); peersGrid.addView(v); }
     }
     empty.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
+    boolean looking = all.isEmpty() && (beam.online || beam.nearby.usable());
+    radarBox.setVisibility(looking ? View.VISIBLE : View.GONE);
+    if (looking && Fx.on() && !radarAnim.isStarted()) radarAnim.start();
+    else if (!looking && radarAnim.isStarted()) radarAnim.cancel();
     manyBtn.setVisibility(all.size() > 1 ? View.VISIBLE : View.GONE);
     empty.setText(beam.online || beam.nearby.usable() ? "Looking for devices…\nOpen Beam on another device on this WiFi,\nor pair one in Settings." : "");
 
-    // transfers, newest first
-    transfers.removeAllViews();
+    // transfers, newest first: a card is rebuilt only when its state or contents change;
+    // progress just moves the existing bar.
     List<Transfer> list = new ArrayList<>(beam.tx.values());
-    for (int i = list.size() - 1; i >= 0; i--) transfers.addView(card(list.get(i)), Ui.margins(this, -1, -2, 0, 0, 0, 10));
+    List<View> wantCards = new ArrayList<>();
+    java.util.Set<String> tids = new java.util.HashSet<>();
+    boolean anyMoving = false;
+    for (int i = list.size() - 1; i >= 0; i--) {
+      Transfer t = list.get(i);
+      tids.add(t.tid);
+      int saved = 0;
+      for (Transfer.Item it : t.items) if (it.saved != null || it.textValue != null) saved++;
+      String k = t.state + "|" + t.reason + "|" + t.direct() + "|" + saved + "|" + t.describe();
+      View c = cards.get(t.tid);
+      if (c == null || !k.equals(cardKeys.get(t.tid))) {
+        c = card(t);
+        cards.put(t.tid, c);
+        cardKeys.put(t.tid, k);
+      }
+      ProgressBar bar = bars.get(t.tid);
+      if (bar != null && bar.getParent() != null && t.total > 0) bar.setProgress((int) (1000 * t.done / t.total));
+      wantCards.add(c);
+      if (Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state)) anyMoving = true;
+
+      // React to state changes.
+      String prev = txSeen.put(t.tid, t.state);
+      if (prev == null) Fx.slideIn(c);
+      else if (!prev.equals(t.state)) {
+        if (Transfer.DONE.equals(t.state)) {
+          LinearLayout b = bubbles.get(t.peerId);
+          View circle = b != null && b.getChildCount() > 0 ? b.getChildAt(0) : null;
+          Fx.bounce(circle);
+          View badge = c.findViewWithTag("badge");
+          Fx.bounce(badge);
+          final View target = t.incoming || circle == null ? badge : circle;
+          final int n = t.incoming ? 18 : 12;
+          beam.main.postDelayed(() -> Fx.burst(overlay, target, n), 60);
+        } else if (Transfer.FAILED.equals(t.state) && !Transfer.ASKING.equals(prev)) {
+          Fx.shake(c);
+        }
+      }
+    }
+    cards.keySet().retainAll(tids);
+    cardKeys.keySet().retainAll(tids);
+    bars.keySet().retainAll(tids);
+    txSeen.keySet().retainAll(tids);
+    if (!sameChildren(transfers, wantCards)) {
+      transfers.removeAllViews();
+      for (View v : wantCards) { Fx.detach(v); transfers.addView(v, Ui.margins(this, -1, -2, 0, 0, 0, 10)); }
+    }
+    if (anyMoving && Fx.on() && !pulseAnim.isStarted()) pulseAnim.start();
+    else if (!anyMoving && pulseAnim.isStarted()) {
+      pulseAnim.cancel();
+      for (LinearLayout b : bubbles.values()) if (b.getChildCount() > 0) { b.getChildAt(0).setScaleX(1f); b.getChildAt(0).setScaleY(1f); }
+    }
+  }
+
+  private static boolean sameChildren(android.view.ViewGroup g, List<View> want) {
+    if (g.getChildCount() != want.size()) return false;
+    for (int i = 0; i < want.size(); i++) if (g.getChildAt(i) != want.get(i)) return false;
+    return true;
   }
 
   private String noteFor(Beam.Peer p) {
@@ -229,6 +360,17 @@ public class MainActivity extends Activity implements Beam.Listener {
     c.setBackground(Ui.round(Ui.CARD, Ui.dp(this, 14)));
 
     LinearLayout top = Ui.row(this);
+    top.setGravity(Gravity.CENTER_VERTICAL);
+    // A round badge: arrow while moving, check when done, cross when it failed.
+    boolean ok = Transfer.DONE.equals(t.state), bad = Transfer.FAILED.equals(t.state);
+    TextView badge = Ui.text(this, ok ? "✓" : bad ? "!" : t.incoming ? "↓" : "↑", 15, ok ? Ui.GOOD : bad ? Ui.BAD : Ui.ACCENT2, true);
+    badge.setGravity(Gravity.CENTER);
+    badge.setTag("badge");
+    android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+    bg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+    bg.setColor(ok ? 0x1F4ADE9A : bad ? 0x1FFF7B7B : 0x1F5CC8FF);
+    badge.setBackground(bg);
+    top.addView(badge, Ui.margins(this, Ui.dp(this, 34), Ui.dp(this, 34), 0, 0, 12, 0));
     LinearLayout words = Ui.col(this);
     words.addView(Ui.oneLine(Ui.text(this, (t.incoming ? "From " : "To ") + t.peerName, 14, Ui.TEXT, true)));
     String sub;
@@ -256,10 +398,14 @@ public class MainActivity extends Activity implements Beam.Listener {
       bar.setProgress(t.total > 0 ? (int) (1000 * t.done / t.total) : 0);
       bar.setProgressTintList(android.content.res.ColorStateList.valueOf(Ui.ACCENT2));
       c.addView(bar, Ui.margins(this, -1, Ui.dp(this, 8), 0, 8, 0, 0));
+      bars.put(t.tid, bar);
     }
 
     if (t.incoming && Transfer.DONE.equals(t.state)) {
+      int shown = 0, more = 0;
       for (Transfer.Item it : t.items) {
+        // Long batches list the first few files; thousands of rows would make the screen crawl.
+        if (!it.text && it.saved != null && ++shown > 25) { more++; continue; }
         if (it.text && it.textValue != null) {
           TextView tv = Ui.text(this, it.textValue, 14, Ui.TEXT, false);
           tv.setTextIsSelectable(true);
@@ -282,6 +428,7 @@ public class MainActivity extends Activity implements Beam.Listener {
           c.addView(r, Ui.margins(this, -1, -2, 0, 8, 0, 0));
         }
       }
+      if (more > 0) c.addView(Ui.text(this, "and " + more + " more file" + (more == 1 ? "" : "s"), 13, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 8, 0, 0));
     }
     return c;
   }

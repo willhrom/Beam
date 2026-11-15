@@ -926,6 +926,7 @@ function render() {
   if (acct.dataset.html !== chip) { acct.innerHTML = chip; acct.dataset.html = chip; }
   const box = $("#peers");
   const ids = new Set(S.peers.map((p) => p.id));
+  const fresh = [];
   for (const el of [...box.children]) if (!ids.has(el.dataset.id)) el.remove();
   for (const p of S.peers) {
     let el = box.querySelector(`[data-id="${p.id}"]`);
@@ -951,11 +952,16 @@ function render() {
           if (peer && (files.length || text)) sendItems(peer, files, text || null);
         })();
       };
+      el.style.setProperty("--i", box.children.length);
       box.appendChild(el);
+      el.addEventListener("pointerdown", () => FX.pulse(el.querySelector(".avatar"), "tapped", 500));
+      fresh.push(el);
     }
     if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     el.classList.toggle("mine", paired);
   }
+  // A new device pops in with a little ping from the beam.
+  fresh.forEach((el, i) => setTimeout(() => { if (el.isConnected) { FX.pulse(el.querySelector(".avatar"), "ping", 1000); FX.spark(FX.you(), el.querySelector(".avatar"), { ms: 600 }); } }, 120 + i * 90));
   $("#empty").style.display = S.peers.length ? "none" : "";
   $("#empty").innerHTML = !S.user && !S.online && ws && ws.readyState === 1 ? "Sign in to use Beam" : S.online
     ? "Looking for devices<small>Open Beam on another device that's signed in as you, or on this WiFi.</small>"
@@ -1122,7 +1128,7 @@ function renderTx(t) {
   nativeProgressSoon();
   const box = $("#transfers");
   let el = box.querySelector(`[data-tid="${t.tid}"]`);
-  if (!S.tx.has(t.tid)) { if (el) el.remove(); return; }
+  if (!S.tx.has(t.tid)) { FX.stop(t); if (el) el.remove(); return; }
   if (!el) {
     el = document.createElement("div");
     el.dataset.tid = t.tid;
@@ -1185,7 +1191,106 @@ function renderTx(t) {
     el.querySelectorAll("[data-reveal]").forEach((b) => (b.onclick = () => native && native.postMessage({ op: "reveal", path: b.dataset.reveal })));
   }
   if (t.dir === "out") renderRing(t);
+  FX.onTx(t, el);
 }
+
+// ---------- animations ----------
+// Small moments of motion that show what's happening: devices pop in, sparks travel along
+// the beam while a transfer runs, and a finished transfer lands with a burst.
+// All of it is skipped when the system asks for reduced motion.
+const FX = {
+  calm: () => !window.matchMedia || window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+  layer() {
+    let l = document.getElementById("fx");
+    if (!l) { l = document.createElement("div"); l.id = "fx"; l.setAttribute("aria-hidden", "true"); document.body.appendChild(l); }
+    return l;
+  },
+  center(el) {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (!r.width && !r.height) return null;
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  },
+  you() { return document.querySelector(".you-dot"); },
+  peerAvatar(id) { const el = document.querySelector(`#peers [data-id="${id}"] .avatar`); return el; },
+  // A glowing spark that arcs from one element to another.
+  spark(fromEl, toEl, opts = {}) {
+    if (this.calm() || document.hidden) return;
+    const a = this.center(fromEl), b = this.center(toEl);
+    if (!a || !b) return;
+    const d = document.createElement("i");
+    d.className = "spark" + (opts.big ? " big" : "") + (opts.good ? " good" : "");
+    this.layer().appendChild(d);
+    const bend = (opts.bend ?? (Math.random() * 2 - 1)) * Math.min(120, Math.hypot(b.x - a.x, b.y - a.y) * 0.35);
+    const mx = (a.x + b.x) / 2 + bend, my = (a.y + b.y) / 2 - Math.abs(bend) * 0.4;
+    const frames = [];
+    for (let i = 0; i <= 16; i++) {
+      const t = i / 16, u = 1 - t;
+      const x = u * u * a.x + 2 * u * t * mx + t * t * b.x, y = u * u * a.y + 2 * u * t * my + t * t * b.y;
+      frames.push({ transform: `translate(${x}px, ${y}px) scale(${0.6 + Math.sin(t * Math.PI) * 0.7})`, opacity: t < 0.1 ? t * 10 : t > 0.85 ? (1 - t) / 0.15 : 1 });
+    }
+    const anim = d.animate(frames, { duration: opts.ms || 720, easing: "cubic-bezier(.45,.05,.35,1)" });
+    anim.onfinish = () => { d.remove(); if (opts.onland) opts.onland(); };
+  },
+  // A ring of particles bursting out of an element.
+  burst(el, opts = {}) {
+    if (this.calm() || document.hidden) return;
+    const c = this.center(el);
+    if (!c) return;
+    const n = opts.n || 14, colors = opts.colors || ["#5cc8ff", "#4ade9a", "#ffffff", "#2f6bff"];
+    for (let i = 0; i < n; i++) {
+      const p = document.createElement("i");
+      p.className = "bit" + (i % 3 === 0 ? " long" : "");
+      p.style.background = colors[i % colors.length];
+      this.layer().appendChild(p);
+      const ang = (i / n) * Math.PI * 2 + Math.random() * 0.4, dist = (opts.size || 54) * (0.7 + Math.random() * 0.6);
+      const rot = (ang * 180) / Math.PI + 90;
+      p.animate([
+        { transform: `translate(${c.x}px, ${c.y}px) rotate(${rot}deg) scale(1)`, opacity: 1 },
+        { transform: `translate(${c.x + Math.cos(ang) * dist}px, ${c.y + Math.sin(ang) * dist + 10}px) rotate(${rot + 120}deg) scale(.4)`, opacity: 0 },
+      ], { duration: 650 + Math.random() * 350, easing: "cubic-bezier(.15,.7,.3,1)" }).onfinish = () => p.remove();
+    }
+  },
+  // Re-runs a one-shot CSS animation class on an element.
+  pulse(el, cls, ms = 900) {
+    if (!el || this.calm()) return;
+    el.classList.remove(cls);
+    void el.offsetWidth;
+    el.classList.add(cls);
+    setTimeout(() => el.classList.remove(cls), ms);
+  },
+  // While a transfer moves, sparks stream along the beam between you and the other device.
+  stream(t) {
+    if (t.fxTimer || this.calm()) return;
+    const tick = () => {
+      if (!S.tx.has(t.tid) || !["sending", "receiving"].includes(t.state)) return this.stop(t);
+      const peer = this.peerAvatar(t.peer.id), you = this.you();
+      if (!peer || !you) return;
+      if (t.dir === "out") this.spark(you, peer, { ms: 760 });
+      else this.spark(peer, you, { ms: 760 });
+    };
+    tick();
+    t.fxTimer = setInterval(tick, 420);
+  },
+  stop(t) { if (t.fxTimer) { clearInterval(t.fxTimer); t.fxTimer = 0; } },
+  // Called on every transfer redraw: reacts only when the state changes.
+  onTx(t, el) {
+    const prev = t.fxState;
+    if (prev === t.state) return;
+    t.fxState = t.state;
+    const moving = t.state === "sending" || t.state === "receiving";
+    if (moving) this.stream(t); else this.stop(t);
+    if (!prev) this.pulse(el, "enter", 600);
+    if (t.state === "done" && prev !== "done") {
+      const peer = this.peerAvatar(t.peer.id);
+      const target = t.dir === "out" ? peer : el.querySelector(".tx-ico");
+      if (peer) this.pulse(peer, "landed", 1100);
+      this.pulse(el.querySelector(".tx-ico"), "pop", 700);
+      setTimeout(() => this.burst(target || el.querySelector(".tx-ico"), { n: t.dir === "in" ? 18 : 12, size: t.dir === "in" ? 64 : 50 }), 60);
+    }
+    if (t.state === "failed" && prev && prev !== "asking") this.pulse(el, "shake", 600);
+  },
+};
 
 let statusTimer = 0;
 function nativeStatusSoon() { if (native && !statusTimer) statusTimer = setTimeout(() => { statusTimer = 0; nativeStatus(); }, 500); }
@@ -1381,7 +1486,7 @@ function showSettings() {
     !native && "Notification" in window && Notification.permission !== "granted" ? '<div class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></div>' : "",
   ].join("");
   openSheet(`<div class="set-head"><h2>Settings</h2></div>
-    <div class="who"><span class="avatar">${initial}</span><span>${S.user ? esc(S.user.name) : "Not signed in"}<small>${S.user ? "Username " + esc(S.user.username) + (S.user.admin ? ". You manage this Beam" : "") : ""}</small></span></div>
+    <div class="set-who"><span class="set-avatar">${initial}</span><span>${S.user ? esc(S.user.name) : "Not signed in"}<small>${S.user ? "Username " + esc(S.user.username) + (S.user.admin ? ". You manage this Beam" : "") : ""}</small></span></div>
 
     <h3>This device</h3>
     <div class="group">

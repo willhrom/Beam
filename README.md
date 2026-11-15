@@ -1,6 +1,6 @@
 # Beam
 
-An AirDrop-style way to send files, photos, text and links between your devices.
+A fast, private way to send files, photos, text and links between your devices.
 
 - **Web app**: works on any device with a modern browser (iPhone, Windows, Chromebook…). You can install it as an app from the browser menu.
 - **Android app**: runs in the background, appears in the share sheet, and asks to accept from a notification. Photos and videos go to the gallery; other files go to Downloads/Beam or a folder you pick in Settings.
@@ -12,7 +12,7 @@ Downloads are on this repository's **Releases** page. The apps keep themselves u
 
 ## How it finds devices
 
-- **Nearby**: devices on the same WiFi see each other automatically, like AirDrop's "Everyone".
+- **Nearby**: devices on the same WiFi see each other automatically.
 - **My devices**: devices signed in to the same account see each other anywhere. You can also pair with someone else's device (Settings → Show a code / Enter a code, then check both screens show the same 6-digit number).
 
 ## One engine, two routes

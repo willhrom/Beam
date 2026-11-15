@@ -157,7 +157,7 @@ namespace Beam
             menu.Items.Add("Quit Beam", null, (s, e) => Quit());
             tray.ContextMenuStrip = menu;
 
-            // First run: start with Windows by default (like AirDrop, it should just be there).
+            // First run: start with Windows by default, so Beam is always ready to receive.
             using (var k = Registry.CurrentUser.CreateSubKey(@"Software\Beam"))
             {
                 if (k.GetValue("launchedBefore") == null)
