@@ -209,18 +209,29 @@ export class Hub extends DurableObject {
     const stun = [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }];
     if (!TURN_KEY_ID || !TURN_KEY_API_TOKEN) return stun;
     if (this.ice && this.ice.exp > Date.now()) return this.ice.list;
+    // After a failure, wait a minute before asking Cloudflare again.
+    if (this.iceFailAt && Date.now() - this.iceFailAt < 60000) return stun;
     try {
-      const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${TURN_KEY_ID}/credentials/generate-ice-servers`, {
+      const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(TURN_KEY_ID.trim())}/credentials/generate-ice-servers`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${TURN_KEY_API_TOKEN}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${TURN_KEY_API_TOKEN.trim()}`, "Content-Type": "application/json" },
         body: JSON.stringify({ ttl: 86400 }),
       });
-      const j = await r.json();
+      const body = await r.text();
+      if (!r.ok) throw new Error(`Cloudflare said ${r.status}${r.status === 401 || r.status === 403 ? " (check the TURN key ID and API token)" : r.status === 404 ? " (TURN key ID not found)" : ""}`);
+      const j = JSON.parse(body);
       let list = Array.isArray(j.iceServers) ? j.iceServers : j.iceServers ? [j.iceServers] : [];
-      list = list.map((s) => ({ ...s, urls: (Array.isArray(s.urls) ? s.urls : [s.urls]).filter((u) => !/:53\b/.test(u)) }));
+      list = list.map((s) => ({ ...s, urls: (Array.isArray(s.urls) ? s.urls : [s.urls]).filter((u) => !/:53\b/.test(u)) }))
+        .filter((s) => s.urls.some((u) => /^turns?:/.test(u)));
+      if (!list.length) throw new Error("Cloudflare sent no relay addresses");
+      this.iceErr = null;
+      this.iceFailAt = 0;
       this.ice = { list: stun.concat(list), exp: Date.now() + 6 * 3600 * 1000 };
       return this.ice.list;
-    } catch {
+    } catch (e) {
+      this.iceErr = String((e && e.message) || e).slice(0, 160);
+      this.iceFailAt = Date.now();
+      console.error("TURN credentials failed:", this.iceErr);
       return stun;
     }
   }
@@ -422,7 +433,9 @@ export class Hub extends DurableObject {
     // Connection test: round-trip time and whether the relay is set up.
     if (m.t === "ping") {
       const { TURN_KEY_ID, TURN_KEY_API_TOKEN } = this.env;
-      return send(ws, { t: "pong", n: clean(m.n, 40), relay: !!(TURN_KEY_ID && TURN_KEY_API_TOKEN) });
+      const relay = !!(TURN_KEY_ID && TURN_KEY_API_TOKEN);
+      const ice = relay ? await this.turn() : null;
+      return send(ws, { t: "pong", n: clean(m.n, 40), relay, relayError: relay ? this.iceErr || null : null, ice });
     }
     // Fresh relay credentials (they expire, and some devices stay connected for days).
     if (m.t === "ice") return send(ws, { t: "ice", ice: await this.turn() });

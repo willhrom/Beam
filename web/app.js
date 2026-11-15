@@ -1444,6 +1444,8 @@ async function connectionTest() {
     const n = randId(), t0 = performance.now();
     pong = await new Promise((res) => { S.pingWait = { n, res }; wsSend({ t: "ping", n }); setTimeout(() => res(null), 6000); });
     ms = Math.round(performance.now() - t0);
+    // The answer carries fresh relay details, so the test doesn't use stale ones.
+    if (pong && Array.isArray(pong.ice) && pong.ice.length) { S.ice = pong.ice; S.iceAt = Date.now(); }
   }
   rows.server = pong ? row(true, "Beam server", `Connected, ${ms} ms round trip`) : row(false, "Beam server", S.online ? "Not answering" : S.user === null ? "Not signed in" : "Can't reach it. Check the internet connection");
   draw();
@@ -1458,7 +1460,7 @@ async function connectionTest() {
   // 3. Relay (TURN only)
   const turn = S.ice.filter((x) => [].concat(x.urls).some((u) => /^turns?:/.test(u)));
   let relayOk = false;
-  if (!turn.length) rows.relay = row(false, "Relay", pong && pong.relay ? "Set up on the server, reconnect to load it" : "Not set up yet");
+  if (!turn.length) rows.relay = row(false, "Relay", pong && pong.relay ? "The server couldn't get relay access" + (pong.relayError ? ": " + esc(pong.relayError) : "") : "Not set up yet");
   else {
     relayOk = (await candidatesWith(turn, true)).has("relay");
     rows.relay = row(relayOk, "Relay", relayOk ? "Ready for networks that block direct transfers" : "Can't reach the relay from this network");

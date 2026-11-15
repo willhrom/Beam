@@ -84,6 +84,9 @@ final class ConnTest {
     final boolean[] answered = { false };
     beam.pongWait = pong -> {
       answered[0] = true;
+      // The answer carries fresh relay details, so the test doesn't use stale ones.
+      org.json.JSONArray fresh = pong.optJSONArray("ice");
+      if (fresh != null && fresh.length() > 0) { beam.ice = fresh; beam.iceAt = System.currentTimeMillis(); }
       set(0, true, "Connected, " + (System.currentTimeMillis() - t0) + " ms round trip");
       afterServer(pong);
     };
@@ -104,7 +107,9 @@ final class ConnTest {
       // 3. Relay (TURN only)
       List<PeerConnection.IceServer> turn = Transfer.iceServers(beam.ice, "turn");
       if (turn.isEmpty()) {
-        set(2, false, pong != null && pong.optBoolean("relay") ? "Set up on the server, reopen Beam to load it" : "Not set up yet");
+        String why = pong != null ? pong.optString("relayError", "") : "";
+        if ("null".equals(why)) why = "";
+        set(2, false, pong != null && pong.optBoolean("relay") ? "The server couldn't get relay access" + (why.isEmpty() ? "" : ": " + why) : "Not set up yet");
         finish(pong != null, publicOk, false);
       } else {
         gather(turn, true, rt -> {
