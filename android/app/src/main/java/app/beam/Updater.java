@@ -86,7 +86,7 @@ final class Updater {
     }
   }
 
-  private static void notifyAvailable(Context c, Release r) {
+  static void notifyAvailable(Context c, Release r) {
     NotificationManager nm = c.getSystemService(NotificationManager.class);
     nm.createNotificationChannel(new NotificationChannel("update", "Updates", NotificationManager.IMPORTANCE_DEFAULT));
     PendingIntent pi = PendingIntent.getActivity(c, 7, new Intent(c, UpdateActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),

@@ -66,7 +66,11 @@ final class Beam {
   final Map<String, Transfer> tx = new LinkedHashMap<>();
   List<Peer> peers = new ArrayList<>();
   JSONArray ice;
+  long iceAt;
   boolean online, running;
+  /** Waiting for the server's answer to a connection test. */
+  interface PongWait { void got(JSONObject pong); }
+  PongWait pongWait;
   Pairing pairing;
   JSONObject account;          // {username, name, admin} once signed in
   boolean needLogin, needSetup;
@@ -94,7 +98,20 @@ final class Beam {
   void start() {
     if (running) return;
     running = true;
-    if (!updaterScheduled) { updaterScheduled = true; Updater.schedule(this); }
+    if (!updaterScheduled) {
+      updaterScheduled = true;
+      Updater.schedule(this);
+      // Relay credentials last a day; refresh them while Beam stays connected for days.
+      main.postDelayed(new Runnable() {
+        @Override public void run() {
+          if (online && System.currentTimeMillis() - iceAt > 4 * 3600 * 1000L) {
+            try { wsSend(new JSONObject().put("t", "ice")); } catch (Exception ignored) {}
+          }
+          main.postDelayed(this, 10 * 60 * 1000L);
+        }
+      }, 10 * 60 * 1000L);
+    }
+    UpdateJob.schedule(app);
     connect();
     nearby.refresh();
     Shortcuts.update(this);
@@ -194,7 +211,16 @@ final class Beam {
         backoff = 1000;
         JSONArray i = m.optJSONArray("ice");
         if (i != null && i.length() > 0) ice = i;
+        iceAt = System.currentTimeMillis();
         changed();
+        break;
+      case "ice": {
+        JSONArray fresh = m.optJSONArray("ice");
+        if (fresh != null && fresh.length() > 0) { ice = fresh; iceAt = System.currentTimeMillis(); }
+        break;
+      }
+      case "pong":
+        if (pongWait != null) { PongWait w = pongWait; pongWait = null; w.got(m); }
         break;
       case "peers": {
         List<Peer> list = new ArrayList<>();
@@ -354,10 +380,10 @@ final class Beam {
       else if (known.active()) known.onResume(sdp, d.optInt("gen", 0));
       return;
     }
-    JSONArray files = d.optJSONArray("files");
+    JSONArray files = Transfer.unpackFiles(d);
     if (files == null || files.length() == 0) return;
     List<Transfer.Item> items = new ArrayList<>();
-    for (int i = 0; i < Math.min(files.length(), 500); i++) {
+    for (int i = 0; i < Math.min(files.length(), Transfer.MAX_ITEMS); i++) {
       JSONObject f = files.getJSONObject(i);
       items.add(new Transfer.Item(Transfer.cleanName(f.optString("name")), Math.max(0, f.optLong("size")), f.optString("type", "application/octet-stream"), f.optBoolean("text")));
       items.get(items.size() - 1).path = Transfer.cleanPath(f.optString("path"));

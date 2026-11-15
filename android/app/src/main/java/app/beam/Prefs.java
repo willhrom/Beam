@@ -24,6 +24,9 @@ final class Prefs {
   private final SharedPreferences sp;
   String name;
   boolean nearby, autoAccept, enabled, offline;
+  boolean galleryMedia;  // photos and videos go to the gallery (otherwise with the other files)
+  String saveTree;       // folder picked for received files (a document tree Uri), or null = Downloads/Beam
+  String saveTreeName;   // that folder, in words
   final Map<String, Paired> paired = new LinkedHashMap<>();
   final List<String[]> recent = new ArrayList<>(); // {id, name, kind}, most recent first
 
@@ -37,6 +40,9 @@ final class Prefs {
     autoAccept = sp.getBoolean("autoAccept", true);
     enabled = sp.getBoolean("enabled", true);
     offline = sp.getBoolean("offline", true);
+    galleryMedia = sp.getBoolean("galleryMedia", true);
+    saveTree = sp.getString("saveTree", null);
+    saveTreeName = sp.getString("saveTreeName", null);
     try {
       JSONObject o = new JSONObject(sp.getString("paired", "{}"));
       for (Iterator<String> it = o.keys(); it.hasNext(); ) {
@@ -69,7 +75,8 @@ final class Prefs {
     org.json.JSONArray rec = new org.json.JSONArray();
     for (String[] r : recent) rec.put(new org.json.JSONArray().put(r[0]).put(r[1]).put(r[2]));
     sp.edit().putString("recent", rec.toString()).putString("name", name).putBoolean("nearby", nearby).putBoolean("autoAccept", autoAccept)
-        .putBoolean("enabled", enabled).putBoolean("offline", offline).putString("paired", o.toString()).apply();
+        .putBoolean("enabled", enabled).putBoolean("offline", offline).putString("paired", o.toString())
+        .putBoolean("galleryMedia", galleryMedia).putString("saveTree", saveTree).putString("saveTreeName", saveTreeName).apply();
   }
 
   List<String> watch() { return new ArrayList<>(paired.keySet()); }

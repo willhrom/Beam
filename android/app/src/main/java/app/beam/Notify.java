@@ -142,10 +142,14 @@ final class Notify {
       } else {
         // Several photos/videos: open the first one in the gallery app. Files: open Downloads.
         boolean allMedia = true;
-        for (Transfer.Item it : t.items) if (it.text || it.place == null || it.place == Transfer.Place.FILES) allMedia = false;
+        for (Transfer.Item it : t.items) if (it.text || it.place == null || it.place == Transfer.Place.FILES || it.place == Transfer.Place.FOLDER) allMedia = false;
         if (allMedia && first.saved != null) {
           open = new Intent(Intent.ACTION_VIEW).setDataAndType(first.saved, Transfer.mimeOf(first)).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
           open.setClipData(ClipData.newRawUri("", first.saved));
+        } else if (first.place == Transfer.Place.FOLDER && first.saved != null) {
+          // Saved to a folder picked in Settings: open that folder in the Files app.
+          open = new Intent(Intent.ACTION_VIEW).setDataAndType(Transfer.treeFolderUri(Uri.parse(Beam.get(c).prefs.saveTree)), android.provider.DocumentsContract.Document.MIME_TYPE_DIR)
+              .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
         } else {
           open = new Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         }

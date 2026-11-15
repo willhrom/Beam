@@ -30,7 +30,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends Activity implements Beam.Listener {
-  private static final int PICK = 1, PICK_FOLDER = 3;
+  private static final int PICK = 1, PICK_FOLDER = 3, PICK_SAVE_DIR = 4;
   private Beam beam;
   private GridLayout peersGrid;
   private TextView status, empty;
@@ -54,6 +54,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     requestWindowFeature(Window.FEATURE_NO_TITLE);
     beam = Beam.get(this);
     build();
+    UpdateJob.schedule(this);
     BeamService.start(this);
     List<String> need = new ArrayList<>();
     if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -424,6 +425,22 @@ public class MainActivity extends Activity implements Beam.Listener {
   @Override protected void onActivityResult(int req, int res, Intent data) {
     super.onActivityResult(req, res, data);
     if (res != RESULT_OK || data == null) return;
+    if (req == PICK_SAVE_DIR) {
+      Uri tree = data.getData();
+      if (tree == null) return;
+      try {
+        getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+      } catch (Exception e) {
+        Toast.makeText(this, "Beam can't save to that folder. Pick another one", Toast.LENGTH_LONG).show();
+        return;
+      }
+      releaseSaveDir();
+      beam.prefs.saveTree = tree.toString();
+      beam.prefs.saveTreeName = folderName(tree);
+      beam.prefs.save();
+      showSettings();
+      return;
+    }
     if (req == PICK_FOLDER) {
       final Uri tree = data.getData();
       if (tree == null) return;
@@ -503,6 +520,33 @@ public class MainActivity extends Activity implements Beam.Listener {
     l.addView(aa);
     l.addView(Ui.text(this, "Device code " + Crypto.shortId(beam.me.id), 12, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 8, 0, 0));
 
+    l.addView(label("Saving"));
+    Switch gm = sw("Photos and videos go to the gallery", beam.prefs.galleryMedia);
+    l.addView(gm);
+    l.addView(Ui.text(this, beam.prefs.galleryMedia ? "Other files save to:" : "Files save to:", 13, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 6, 0, 0));
+    LinearLayout fr = Ui.row(this);
+    fr.addView(Ui.text(this, beam.prefs.saveTree != null ? beam.prefs.saveTreeName : "Downloads/Beam", 14, Ui.TEXT, false), new LinearLayout.LayoutParams(0, -2, 1));
+    if (beam.prefs.saveTree != null) fr.addView(Ui.button(this, "Use Downloads", 0x18FFFFFF, Ui.TEXT, v -> {
+      releaseSaveDir();
+      beam.prefs.saveTree = null;
+      beam.prefs.saveTreeName = null;
+      beam.prefs.save();
+      self0[0].dismiss();
+      showSettings();
+    }), Ui.margins(this, -2, -2, 0, 0, 8, 0));
+    fr.addView(Ui.button(this, "Choose…", 0x18FFFFFF, Ui.TEXT, v -> {
+      self0[0].dismiss();
+      try { startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION), PICK_SAVE_DIR); }
+      catch (Exception e) { Toast.makeText(this, "No app on this phone can pick folders", Toast.LENGTH_LONG).show(); }
+    }));
+    l.addView(fr, Ui.margins(this, -1, -2, 0, 4, 0, 0));
+
+    LinearLayout tr = Ui.row(this);
+    tr.addView(Ui.button(this, "Transfer history", 0x18FFFFFF, Ui.TEXT, v -> { self0[0].dismiss(); showHistory(); }), new LinearLayout.LayoutParams(0, -2, 1));
+    tr.addView(new View(this), Ui.lp(Ui.dp(this, 10), 1));
+    tr.addView(Ui.button(this, "Test connection", 0x18FFFFFF, Ui.TEXT, v -> { self0[0].dismiss(); new ConnTest(this, beam).show(); }), new LinearLayout.LayoutParams(0, -2, 1));
+    l.addView(tr, Ui.margins(this, -1, -2, 0, 14, 0, 0));
+
     l.addView(label("Account"));
     String who = beam.account == null ? "Not signed in" : beam.account.optString("name") + "  (" + beam.account.optString("username") + (beam.account.optBoolean("admin") ? " · admin" : "") + ")";
     l.addView(Ui.text(this, who, 14, Ui.TEXT, false));
@@ -556,12 +600,109 @@ public class MainActivity extends Activity implements Beam.Listener {
       beam.prefs.nearby = nb.isChecked();
       beam.prefs.autoAccept = aa.isChecked();
       beam.prefs.enabled = on.isChecked();
+      beam.prefs.galleryMedia = gm.isChecked();
       beam.prefs.save();
       if (wasOn && !beam.prefs.enabled) BeamService.stop(this);
       else if (!wasOn && beam.prefs.enabled) BeamService.start(this);
       beam.updateServer();
     });
     self[0].show();
+  }
+
+  /** Lets go of the old picked folder's permission (Android only keeps a limited number). */
+  private void releaseSaveDir() {
+    if (beam.prefs.saveTree == null) return;
+    try { getContentResolver().releasePersistableUriPermission(Uri.parse(beam.prefs.saveTree), Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION); }
+    catch (Exception ignored) {}
+  }
+
+  /** "primary:Documents/Church" -> "Documents/Church"; an SD card shows as "SD card/…". */
+  static String folderName(Uri tree) {
+    try {
+      String id = android.provider.DocumentsContract.getTreeDocumentId(tree);
+      int colon = id.indexOf(':');
+      String vol = colon >= 0 ? id.substring(0, colon) : "", rest = colon >= 0 ? id.substring(colon + 1) : id;
+      String where = "primary".equals(vol) ? "" : vol.isEmpty() ? "" : "SD card/";
+      return rest.isEmpty() ? (where.isEmpty() ? "Phone storage" : "SD card") : where + rest;
+    } catch (Exception e) {
+      return "Chosen folder";
+    }
+  }
+
+  // ---------- history ----------
+  private void showHistory() {
+    org.json.JSONArray h = History.list(this);
+    LinearLayout l = Ui.col(this);
+    int p = Ui.dp(this, 20);
+    l.setPadding(p, Ui.dp(this, 8), p, Ui.dp(this, 8));
+    final AlertDialog[] self = new AlertDialog[1];
+    if (h.length() == 0) l.addView(Ui.text(this, "Nothing sent or received on this phone yet.", 14, Ui.DIM, false));
+    for (int i = 0; i < h.length(); i++) {
+      final org.json.JSONObject e = h.optJSONObject(i);
+      if (e == null) continue;
+      boolean in = e.optBoolean("in");
+      int count = e.optInt("count");
+      org.json.JSONArray names = e.optJSONArray("names");
+      String folder = e.optString("folder");
+      String what = !folder.isEmpty() ? "Folder \"" + folder + "\"" + (count > 1 ? " (" + count + " files)" : "")
+          : count > 0 ? (names != null && names.length() > 0 ? names.optString(0) : "File") + (count > 1 ? " and " + (count - 1) + " more" : "")
+          : !e.optString("text").isEmpty() ? "Text" : "Nothing";
+      List<String> meta = new ArrayList<>();
+      meta.add((in ? "From " : "To ") + e.optString("peer"));
+      if (e.optLong("size") > 0) meta.add(fmtSize(e.optLong("size")));
+      meta.add(whenText(e.optLong("at")));
+      LinearLayout row = Ui.row(this);
+      row.setGravity(Gravity.CENTER_VERTICAL);
+      TextView arrow = Ui.text(this, in ? "↓" : "↑", 16, in ? Ui.ACCENT : Ui.DIM, true);
+      arrow.setGravity(Gravity.CENTER);
+      row.addView(arrow, Ui.margins(this, Ui.dp(this, 26), -2, 0, 0, 10, 0));
+      LinearLayout txt = Ui.col(this);
+      txt.addView(Ui.text(this, what, 15, Ui.TEXT, false));
+      txt.addView(Ui.text(this, String.join(", ", meta), 12, Ui.DIM, false));
+      if (!e.optBoolean("ok")) txt.addView(Ui.text(this, e.optString("reason").isEmpty() ? "Didn't finish" : e.optString("reason"), 12, Ui.BAD, false));
+      else if (in && !e.optString("where").isEmpty()) txt.addView(Ui.text(this, "Saved " + e.optString("where"), 12, Ui.DIM, false));
+      row.addView(txt, new LinearLayout.LayoutParams(0, -2, 1));
+      final org.json.JSONArray uris = e.optJSONArray("uris");
+      final String text = e.optString("text");
+      if (in && uris != null && uris.length() > 0) {
+        row.addView(Ui.button(this, "Open", 0x18FFFFFF, Ui.TEXT, v -> openSaved(uris.optJSONObject(0))));
+      } else if (!text.isEmpty()) {
+        row.addView(Ui.button(this, "Copy", 0x18FFFFFF, Ui.TEXT, v -> {
+          getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("Beam", text));
+          Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
+        }));
+      }
+      l.addView(row, Ui.margins(this, -1, -2, 0, 8, 0, 8));
+    }
+    l.addView(Ui.text(this, "Kept on this phone only. The last " + History.MAX + " transfers.", 12, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 8, 0, 0));
+    ScrollView sv = new ScrollView(this);
+    sv.addView(l);
+    AlertDialog.Builder b = Ui.dialog(this).setTitle("Transfer history").setView(sv).setPositiveButton("Done", null);
+    if (h.length() > 0) b.setNeutralButton("Clear", (d, w) -> Ui.dialog(this).setMessage("Clear the transfer history on this phone? Files you received stay where they are.")
+        .setPositiveButton("Clear", (d2, w2) -> History.clear(this)).setNegativeButton("Cancel", null).show());
+    self[0] = b.show();
+  }
+
+  private void openSaved(org.json.JSONObject f) {
+    if (f == null) return;
+    try {
+      Uri u = Uri.parse(f.optString("uri"));
+      Intent i = new Intent(Intent.ACTION_VIEW).setDataAndType(u, f.optString("type", "*/*")).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+      i.setClipData(ClipData.newRawUri("", u));
+      startActivity(i);
+    } catch (Exception e) {
+      Toast.makeText(this, "That file was moved or deleted", Toast.LENGTH_SHORT).show();
+    }
+  }
+
+  String whenText(long ms) {
+    java.util.Calendar c = java.util.Calendar.getInstance(), now = java.util.Calendar.getInstance();
+    c.setTimeInMillis(ms);
+    String time = android.text.format.DateFormat.getTimeFormat(this).format(new java.util.Date(ms));
+    if (c.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) && c.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR)) return "Today " + time;
+    now.add(java.util.Calendar.DAY_OF_YEAR, -1);
+    if (c.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) && c.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR)) return "Yesterday " + time;
+    return new java.text.SimpleDateFormat("MMM d", java.util.Locale.getDefault()).format(new java.util.Date(ms)) + ", " + time;
   }
 
   // ---------- signing in ----------

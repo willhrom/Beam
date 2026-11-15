@@ -375,6 +375,21 @@ final class Transfer {
     ContentResolver cr = beam.app.getContentResolver();
     it.place = placeFor(mime);
     pendingUri = null;
+    if (it.place != Place.FILES && !beam.prefs.galleryMedia) it.place = Place.FILES;
+    if (it.place == Place.FILES && beam.prefs.saveTree != null) {
+      // A folder picked in Settings.
+      try {
+        pendingUri = createInTree(cr, Uri.parse(beam.prefs.saveTree), it.path, it.name, mime);
+      } catch (Exception e) {
+        pendingUri = null; // permission gone or folder deleted: fall back to Downloads/Beam
+      }
+      if (pendingUri != null) {
+        it.place = Place.FOLDER;
+        out = cr.openOutputStream(pendingUri, "w");
+        if (out == null) throw new IOException("Couldn't save " + it.name);
+        return;
+      }
+    }
     if (it.place != Place.FILES) {
       // Photos and videos go where the gallery looks: Pictures/Beam and Movies/Beam.
       try {
@@ -404,7 +419,52 @@ final class Transfer {
     if (out == null) throw new IOException("Couldn't save " + it.name);
   }
 
-  enum Place { PHOTOS, VIDEOS, FILES }
+  enum Place { PHOTOS, VIDEOS, FILES, FOLDER }
+
+  /** Folders already found or made inside the picked folder, for this transfer ("Trip/Day 1" -> its document). */
+  private final java.util.Map<String, Uri> treeDirs = new java.util.HashMap<>();
+
+  /** Creates `name` inside the picked folder, recreating the transfer's subfolders. */
+  private Uri createInTree(ContentResolver cr, Uri tree, String path, String name, String mime) throws Exception {
+    Uri dir = treeDirs.get("");
+    if (dir == null) {
+      dir = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, android.provider.DocumentsContract.getTreeDocumentId(tree));
+      treeDirs.put("", dir);
+    }
+    String sofar = "";
+    if (!path.isEmpty()) for (String part : path.split("/")) {
+      if (part.isEmpty()) continue;
+      sofar = sofar.isEmpty() ? part : sofar + "/" + part;
+      Uri known = treeDirs.get(sofar);
+      if (known == null) {
+        known = findChild(cr, tree, dir, part, true);
+        if (known == null) known = android.provider.DocumentsContract.createDocument(cr, dir, android.provider.DocumentsContract.Document.MIME_TYPE_DIR, part);
+        if (known == null) throw new IOException("Couldn't make folder " + part);
+        treeDirs.put(sofar, known);
+      }
+      dir = known;
+    }
+    // Android picks a free name itself ("photo (1).jpg") if this one is taken.
+    return android.provider.DocumentsContract.createDocument(cr, dir, mime, name);
+  }
+
+  /** The picked folder as a document (what the Files app opens). */
+  static Uri treeFolderUri(Uri tree) {
+    return android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, android.provider.DocumentsContract.getTreeDocumentId(tree));
+  }
+
+  private static Uri findChild(ContentResolver cr, Uri tree, Uri dir, String name, boolean wantDir) {
+    Uri kids = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(tree, android.provider.DocumentsContract.getDocumentId(dir));
+    try (android.database.Cursor c = cr.query(kids, new String[] {
+        android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID, android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE }, null, null, null)) {
+      while (c != null && c.moveToNext()) {
+        boolean isDir = android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(c.getString(2));
+        if (name.equals(c.getString(1)) && isDir == wantDir) return android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0));
+      }
+    } catch (Exception ignored) {}
+    return null;
+  }
 
   static String mimeOf(Item it) {
     String mime = it.type;
@@ -424,12 +484,17 @@ final class Transfer {
 
   /** Where this transfer's files ended up, in words: "in your gallery", "in Downloads/Beam", or both. */
   String savedWhere() {
-    boolean media = false, files = false;
+    boolean media = false, files = false, folder = false;
     for (Item i : items) {
       if (i.text || i.saved == null) continue;
-      if (i.place == Place.FILES) files = true; else media = true;
+      if (i.place == Place.FILES) files = true; else if (i.place == Place.FOLDER) folder = true; else media = true;
     }
-    return media && files ? "in your gallery and Downloads/Beam" : media ? "in your gallery" : files ? "in Downloads/Beam" : null;
+    List<String> parts = new ArrayList<>();
+    if (media) parts.add("your gallery");
+    if (folder) parts.add(beam.prefs.saveTreeName != null ? beam.prefs.saveTreeName : "your folder");
+    if (files) parts.add("Downloads/Beam");
+    if (parts.isEmpty()) return null;
+    return "in " + (parts.size() == 1 ? parts.get(0) : String.join(", ", parts.subList(0, parts.size() - 1)) + " and " + parts.get(parts.size() - 1));
   }
 
   private void closeOutput(Item it) throws IOException {
@@ -440,9 +505,11 @@ final class Transfer {
     }
     out.close();
     out = null;
-    ContentValues v = new ContentValues();
-    v.put(MediaStore.Downloads.IS_PENDING, 0);
-    beam.app.getContentResolver().update(pendingUri, v, null, null);
+    if (it.place != Place.FOLDER) {
+      ContentValues v = new ContentValues();
+      v.put(MediaStore.Downloads.IS_PENDING, 0);
+      beam.app.getContentResolver().update(pendingUri, v, null, null);
+    }
     it.saved = pendingUri;
     pendingUri = null;
   }
@@ -451,7 +518,10 @@ final class Transfer {
     try { if (out != null) out.close(); } catch (Exception ignored) {}
     out = null;
     if (pendingUri != null) {
-      try { beam.app.getContentResolver().delete(pendingUri, null, null); } catch (Exception ignored) {}
+      try {
+        if (android.provider.DocumentsContract.isDocumentUri(beam.app, pendingUri)) android.provider.DocumentsContract.deleteDocument(beam.app.getContentResolver(), pendingUri);
+        else beam.app.getContentResolver().delete(pendingUri, null, null);
+      } catch (Exception ignored) {}
       pendingUri = null;
     }
   }
@@ -614,7 +684,7 @@ final class Transfer {
   }
 
   private static PeerConnectionFactory factory;
-  private static synchronized PeerConnectionFactory factory(Context c) {
+  static synchronized PeerConnectionFactory factory(Context c) {
     if (factory == null) {
       PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(c).createInitializationOptions());
       factory = PeerConnectionFactory.builder().createPeerConnectionFactory();
@@ -623,8 +693,12 @@ final class Transfer {
   }
 
   private PeerConnection.RTCConfiguration config() {
+    return new PeerConnection.RTCConfiguration(iceServers(beam.ice, null));
+  }
+
+  /** The server's ICE list for WebRTC. `only`: keep just "stun" or "turn" addresses (null = all). */
+  static List<PeerConnection.IceServer> iceServers(JSONArray ice, String only) {
     List<PeerConnection.IceServer> list = new ArrayList<>();
-    JSONArray ice = beam.ice;
     for (int i = 0; ice != null && i < ice.length(); i++) {
       JSONObject s = ice.optJSONObject(i);
       if (s == null) continue;
@@ -632,13 +706,14 @@ final class Transfer {
       JSONArray u = s.optJSONArray("urls");
       if (u != null) for (int k = 0; k < u.length(); k++) urls.add(u.optString(k));
       else if (s.has("urls")) urls.add(s.optString("urls"));
+      if (only != null) urls.removeIf(x -> !x.startsWith(only + ":") && !x.startsWith(only + "s:"));
       if (urls.isEmpty()) continue;
       PeerConnection.IceServer.Builder b = PeerConnection.IceServer.builder(urls);
       if (s.has("username")) b.setUsername(s.optString("username"));
       if (s.has("credential")) b.setPassword(s.optString("credential"));
       list.add(b.createIceServer());
     }
-    return new PeerConnection.RTCConfiguration(list);
+    return list;
   }
 
   private PeerConnection.Observer observer(final Conn c) {
@@ -746,12 +821,44 @@ final class Transfer {
       JSONObject d = new JSONObject().put("k", mode).put("tid", tid).put("gen", c.gen).put("sdp", sdp)
           .put("sig", beam.me.sign("beam-" + mode + "|" + tid + "|" + peerId + "|" + sdp)).put("pub", beam.me.pub);
       if ("offer".equals(mode)) {
-        d.put("name", beam.prefs.name).put("kind", "android").put("files", filesJson());
+        d.put("name", beam.prefs.name).put("kind", "android");
+        packFiles(d, filesJson());
         markWaiting();
       }
       beam.signal(peerId, d);
     } catch (Exception e) {
       fail("Setup failed");
+    }
+  }
+
+  static final int MAX_ITEMS = 5000;
+
+  /** Big batches: the file list goes gzipped so the offer stays small (thousands of names fit). */
+  static void packFiles(JSONObject d, JSONArray files) throws Exception {
+    String json = files.toString();
+    if (json.length() < 40000) { d.put("files", files); return; }
+    ByteArrayOutputStream bo = new ByteArrayOutputStream();
+    try (java.util.zip.GZIPOutputStream gz = new java.util.zip.GZIPOutputStream(bo)) { gz.write(json.getBytes(StandardCharsets.UTF_8)); }
+    d.put("filesZ", android.util.Base64.encodeToString(bo.toByteArray(), android.util.Base64.NO_WRAP)).put("count", files.length());
+  }
+
+  /** The offer's file list, plain or gzipped. Null if it's missing or broken. */
+  static JSONArray unpackFiles(JSONObject d) {
+    JSONArray plain = d.optJSONArray("files");
+    if (plain != null) return plain;
+    String z = d.optString("filesZ", "");
+    if (z.isEmpty()) return null;
+    try (java.util.zip.GZIPInputStream in = new java.util.zip.GZIPInputStream(new ByteArrayInputStream(android.util.Base64.decode(z, android.util.Base64.DEFAULT)))) {
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      byte[] buf = new byte[64 * 1024];
+      int n;
+      while ((n = in.read(buf)) > 0) {
+        out.write(buf, 0, n);
+        if (out.size() > 4 * 1048576) return null;
+      }
+      return new JSONArray(out.toString("UTF-8"));
+    } catch (Exception e) {
+      return null;
     }
   }
 
@@ -876,6 +983,7 @@ final class Transfer {
   void finish() {
     if (!active()) return;
     state = DONE;
+    History.record(beam.app, this);
     ui();
     cleanupTemp();
     stopDiscovering();
@@ -888,8 +996,10 @@ final class Transfer {
     if (!active()) return;
     final Route r = route;
     if (r != null) try { if (r.usable()) r.sendText("{\"t\":\"cancel\"}"); } catch (Exception ignored) {}
+    boolean worthKeeping = !incoming || everOpen;
     state = FAILED;
     reason = why;
+    if (worthKeeping) History.record(beam.app, this);
     synchronized (lock) { lock.notifyAll(); }
     if (incoming) new Thread(this::discardPartial).start();
     cleanupTemp();

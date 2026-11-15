@@ -384,10 +384,10 @@ final class Nearby {
           return;
         }
         if ("resume".equals(type)) { l.close(); return; } // nothing to resume
-        org.json.JSONArray files = m.optJSONArray("files");
+        org.json.JSONArray files = Transfer.unpackFiles(m);
         if (tid.isEmpty() || files == null || files.length() == 0) { l.close(); return; }
         List<Transfer.Item> items = new ArrayList<>();
-        for (int i = 0; i < Math.min(files.length(), 500); i++) {
+        for (int i = 0; i < Math.min(files.length(), Transfer.MAX_ITEMS); i++) {
           JSONObject f = files.getJSONObject(i);
           items.add(new Transfer.Item(Transfer.cleanName(f.optString("name")), Math.max(0, f.optLong("size")),
               f.optString("type", "application/octet-stream"), f.optBoolean("text")));

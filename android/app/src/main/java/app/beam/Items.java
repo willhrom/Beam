@@ -43,7 +43,7 @@ final class Items {
   }
 
   private static void walk(ContentResolver cr, Uri tree, String docId, String path, List<Transfer.Item> out) {
-    if (out.size() >= 5000) return;
+    if (out.size() >= Transfer.MAX_ITEMS - 1) return;
     Uri children = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId);
     String[] cols = { android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID, android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
         android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE, android.provider.DocumentsContract.Document.COLUMN_SIZE };
@@ -59,7 +59,7 @@ final class Items {
           it.uri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, id);
           it.path = path;
           out.add(it);
-          if (out.size() >= 5000) return;
+          if (out.size() >= Transfer.MAX_ITEMS - 1) return;
         }
       }
     }

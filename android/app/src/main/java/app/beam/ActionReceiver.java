@@ -20,6 +20,7 @@ public class ActionReceiver extends BroadcastReceiver {
     switch (a) {
       case Intent.ACTION_BOOT_COMPLETED:
       case Intent.ACTION_MY_PACKAGE_REPLACED:
+        UpdateJob.schedule(c);
         BeamService.start(c);
         break;
       case ACCEPT: b.accept(tid); break;
