@@ -86,7 +86,7 @@ final class Ui {
   }
 
   static AlertDialog.Builder dialog(Context c) {
-    return new AlertDialog.Builder(c, android.R.style.Theme_DeviceDefault_Dialog_Alert);
+    return new AlertDialog.Builder(c, R.style.BeamDialog);
   }
 
   static String emoji(String kind) {

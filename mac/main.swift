@@ -114,12 +114,23 @@ final class ProgressPopup {
   }
 
   let panel: NSPanel
+  let card: Card
   let icon = NSImageView()
+  let haloView = NSView()
+  let halo = CAShapeLayer()
   let title = NSTextField(labelWithString: "")
   let detail = NSTextField(labelWithString: "")
   let percent = NSTextField(labelWithString: "")
-  let bar = NSProgressIndicator()
+  // A slim custom bar, so it can glide and shimmer.
+  let barView = NSView()
+  let fill = CALayer()
+  let shine = CAGradientLayer()
   var hideWork: DispatchWorkItem?
+  var shownState = ""
+  var showing = false
+  var gen = 0
+  var calm: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+  let blue = NSColor(red: 0.36, green: 0.78, blue: 1, alpha: 1)
 
   init(onClick: @escaping () -> Void) {
     let w: CGFloat = 324, h: CGFloat = 78
@@ -133,20 +144,28 @@ final class ProgressPopup {
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
     panel.appearance = NSAppearance(named: .darkAqua)
 
-    let card = Card(frame: NSRect(x: 0, y: 0, width: w, height: h))
+    card = Card(frame: NSRect(x: 0, y: 0, width: w, height: h))
     card.material = .hudWindow
     card.blendingMode = .behindWindow
     card.state = .active
     card.wantsLayer = true
     card.layer?.cornerRadius = 14
     card.layer?.masksToBounds = true
-    card.onClick = { [weak self] in
-      self?.panel.orderOut(nil)
-      onClick()
-    }
+
+    // A soft ring that breathes around the icon while data moves.
+    haloView.frame = NSRect(x: 4, y: 20, width: 54, height: 54)
+    haloView.wantsLayer = true
+    halo.frame = CGRect(x: 10, y: 10, width: 34, height: 34)
+    halo.path = CGPath(ellipseIn: CGRect(x: 0, y: 0, width: 34, height: 34), transform: nil)
+    halo.fillColor = nil
+    halo.lineWidth = 1.6
+    halo.strokeColor = blue.cgColor
+    halo.opacity = 0
+    haloView.layer?.addSublayer(halo)
 
     icon.frame = NSRect(x: 14, y: 30, width: 34, height: 34)
     icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 27, weight: .medium)
+    icon.wantsLayer = true
     title.frame = NSRect(x: 60, y: 46, width: w - 60 - 62, height: 18)
     title.font = .systemFont(ofSize: 13, weight: .semibold)
     title.lineBreakMode = .byTruncatingMiddle
@@ -158,43 +177,174 @@ final class ProgressPopup {
     detail.font = .systemFont(ofSize: 12)
     detail.textColor = .secondaryLabelColor
     detail.lineBreakMode = .byTruncatingTail
-    bar.frame = NSRect(x: 60, y: 11, width: w - 74, height: 10)
-    bar.style = .bar
-    bar.controlSize = .small
-    bar.isIndeterminate = false
-    bar.minValue = 0
-    bar.maxValue = 1
-    let parts: [NSView] = [icon, title, percent, detail, bar]
+
+    barView.frame = NSRect(x: 60, y: 13, width: w - 74, height: 4)
+    barView.wantsLayer = true
+    barView.layer?.backgroundColor = NSColor(white: 1, alpha: 0.1).cgColor
+    barView.layer?.cornerRadius = 2
+    barView.layer?.masksToBounds = true
+    fill.frame = CGRect(x: 0, y: 0, width: 0, height: 4)
+    fill.cornerRadius = 2
+    fill.backgroundColor = blue.cgColor
+    fill.masksToBounds = true
+    shine.colors = [NSColor(white: 1, alpha: 0).cgColor, NSColor(white: 1, alpha: 0.6).cgColor, NSColor(white: 1, alpha: 0).cgColor]
+    shine.startPoint = CGPoint(x: 0, y: 0.5)
+    shine.endPoint = CGPoint(x: 1, y: 0.5)
+    shine.frame = CGRect(x: -46, y: 0, width: 46, height: 4)
+    fill.addSublayer(shine)
+    barView.layer?.addSublayer(fill)
+
+    let parts: [NSView] = [haloView, icon, title, percent, detail, barView]
     for part in parts { card.addSubview(part) }
     panel.contentView = card
+    card.onClick = { [weak self] in
+      self?.slideAway()
+      onClick()
+    }
+  }
+
+  func target() -> NSRect {
+    let area = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? .zero
+    return NSRect(x: area.maxX - panel.frame.width - 16, y: area.minY + 16, width: panel.frame.width, height: panel.frame.height)
   }
 
   func set(show: Bool, title newTitle: String, detail newDetail: String, pct: Double, state: String, dir: String, hold: Int) {
     hideWork?.cancel()
     let ended = state == "done" || state == "failed"
     if !show || (ended && hold <= 0) {
-      panel.orderOut(nil)
+      slideAway()
       return
     }
-    let fraction = max(0, min(1, pct.isFinite ? pct : 0))
+    var fraction = max(0, min(1, pct.isFinite ? pct : 0))
+    if state == "done" { fraction = 1 }
     title.stringValue = newTitle
     detail.stringValue = newDetail
-    bar.doubleValue = fraction
     percent.stringValue = ended ? "" : "\(Int(fraction * 100))%"
     let symbol = state == "done" ? "checkmark.circle.fill" : state == "failed" ? "exclamationmark.circle.fill"
       : state == "paused" ? "pause.circle.fill" : dir == "out" ? "arrow.up.circle.fill" : "arrow.down.circle.fill"
     icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-    icon.contentTintColor = state == "done" ? .systemGreen : state == "failed" ? .systemRed
-      : state == "paused" ? .secondaryLabelColor : NSColor(red: 0.36, green: 0.78, blue: 1, alpha: 1)
-    if let area = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame {
-      panel.setFrameOrigin(NSPoint(x: area.maxX - panel.frame.width - 16, y: area.minY + 16))
+    let tint: NSColor = state == "done" ? .systemGreen : state == "failed" ? .systemRed : state == "paused" ? .secondaryLabelColor : blue
+    icon.contentTintColor = tint
+
+    // The bar glides to its new length.
+    CATransaction.begin()
+    CATransaction.setAnimationDuration(calm ? 0 : 0.35)
+    CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+    fill.frame = CGRect(x: 0, y: 0, width: barView.bounds.width * CGFloat(fraction), height: 4)
+    fill.backgroundColor = tint.cgColor
+    CATransaction.commit()
+    shine.frame = CGRect(x: -46, y: 0, width: 46, height: 4)
+
+    let active = state == "active"
+    if active && !calm {
+      if shine.animation(forKey: "sweep") == nil {
+        let sweep = CABasicAnimation(keyPath: "position.x")
+        sweep.fromValue = -23
+        sweep.toValue = barView.bounds.width + 23
+        sweep.duration = 1.3
+        sweep.repeatCount = .infinity
+        shine.add(sweep, forKey: "sweep")
+      }
+      if halo.animation(forKey: "breathe") == nil {
+        let grow = CABasicAnimation(keyPath: "transform.scale")
+        grow.fromValue = 1
+        grow.toValue = 1.45
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.7
+        fade.toValue = 0
+        let group = CAAnimationGroup()
+        group.animations = [grow, fade]
+        group.duration = 1.6
+        group.repeatCount = .infinity
+        halo.add(group, forKey: "breathe")
+      }
+    } else {
+      shine.removeAnimation(forKey: "sweep")
+      halo.removeAnimation(forKey: "breathe")
     }
-    panel.orderFrontRegardless()
+
+    if state != shownState {
+      if state == "done" || state == "failed" { pop(icon) }
+      if state == "failed" { shake() }
+      shownState = state
+    }
+
+    let to = target()
+    if !showing {
+      showing = true
+      gen += 1
+      if calm {
+        panel.setFrame(to, display: true)
+        panel.alphaValue = 1
+        panel.orderFrontRegardless()
+      } else {
+        // Slide up from just below the corner and fade in, with a little overshoot.
+        panel.alphaValue = 0
+        panel.setFrame(to.offsetBy(dx: 0, dy: -26), display: true)
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+          ctx.duration = 0.42
+          ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.45, 0.64, 1)
+          panel.animator().setFrame(to, display: true)
+          panel.animator().alphaValue = 1
+        }
+      }
+    } else if panel.frame.origin != to.origin && panel.alphaValue >= 1 {
+      panel.setFrame(to, display: true)
+    }
     if ended {
-      let work = DispatchWorkItem { [weak self] in self?.panel.orderOut(nil) }
+      let work = DispatchWorkItem { [weak self] in self?.slideAway() }
       hideWork = work
       DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(500, hold)), execute: work)
     }
+  }
+
+  /// Slide down a little and fade out.
+  func slideAway() {
+    hideWork?.cancel()
+    guard showing else { return }
+    showing = false
+    shownState = ""
+    gen += 1
+    let mine = gen
+    if calm { panel.orderOut(nil); return }
+    let from = panel.frame
+    NSAnimationContext.runAnimationGroup({ ctx in
+      ctx.duration = 0.24
+      ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+      panel.animator().setFrame(from.offsetBy(dx: 0, dy: -18), display: true)
+      panel.animator().alphaValue = 0
+    }, completionHandler: { [weak self] in
+      guard let self = self, self.gen == mine else { return }
+      self.panel.orderOut(nil)
+      self.panel.alphaValue = 1
+    })
+  }
+
+  /// The icon pops: shrinks, overshoots, settles. (View layers scale from their corner, so scale around the middle by hand.)
+  func pop(_ v: NSView) {
+    guard !calm, let layer = v.layer else { return }
+    let c = CGPoint(x: v.bounds.midX, y: v.bounds.midY)
+    func scaled(_ k: CGFloat) -> NSValue {
+      var t = CATransform3DMakeTranslation(c.x, c.y, 0)
+      t = CATransform3DScale(t, k, k, 1)
+      t = CATransform3DTranslate(t, -c.x, -c.y, 0)
+      return NSValue(caTransform3D: t)
+    }
+    let a = CAKeyframeAnimation(keyPath: "transform")
+    a.values = [scaled(0.5), scaled(1.22), scaled(0.94), scaled(1)]
+    a.keyTimes = [0, 0.45, 0.75, 1]
+    a.duration = 0.55
+    a.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeInEaseOut), CAMediaTimingFunction(name: .easeOut)]
+    layer.add(a, forKey: "pop")
+  }
+
+  func shake() {
+    guard !calm, let layer = card.layer else { return }
+    let a = CAKeyframeAnimation(keyPath: "transform.translation.x")
+    a.values = [0, -8, 8, -6, 6, -3, 3, 0]
+    a.duration = 0.45
+    layer.add(a, forKey: "shake")
   }
 }
 

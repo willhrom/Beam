@@ -1208,9 +1208,15 @@ namespace Beam
     sealed class ProgressPopup : Form
     {
         string title = "", detail = "", state = "active", dir = "in";
-        double pct;
+        double pct;           // where the bar is going
+        double shownPct;      // where the bar is drawn (eases toward pct)
         bool regionCorners;
         readonly System.Windows.Forms.Timer hideTimer = new System.Windows.Forms.Timer();
+        // Animation: one ~60 fps timer drives entering, leaving, the bar, the badge pop and the shake.
+        readonly System.Windows.Forms.Timer anim = new System.Windows.Forms.Timer { Interval = 15 };
+        readonly Stopwatch clock = Stopwatch.StartNew();
+        double enterAt = -1, leaveAt = -1, popAt = -1, shakeAt = -1;
+        int baseX, baseY;
         public event Action Clicked;
 
         public ProgressPopup()
@@ -1222,7 +1228,8 @@ namespace Beam
             BackColor = Color.FromArgb(23, 33, 54);
             Cursor = Cursors.Hand;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
-            hideTimer.Tick += (s, e) => { hideTimer.Stop(); Hide(); };
+            hideTimer.Tick += (s, e) => { hideTimer.Stop(); SlideAway(); };
+            anim.Tick += (s, e) => Step();
         }
 
         protected override bool ShowWithoutActivation => true;
@@ -1251,40 +1258,110 @@ namespace Beam
         }
 
         float K => DeviceDpi / 96f;
+        double Now => clock.Elapsed.TotalMilliseconds;
+        static bool Calm => !SystemInformation.UIEffectsEnabled; // "Animation effects" off in Windows settings
+
+        static double EaseOutBack(double t) { const double c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.Pow(t - 1, 3) + c1 * Math.Pow(t - 1, 2); }
+        static double EaseOutCubic(double t) => 1 - Math.Pow(1 - t, 3);
+        static double EaseInCubic(double t) => t * t * t;
 
         public void Set(bool show, string newTitle, string newDetail, double fraction, string newState, string newDir, int holdMs)
         {
             hideTimer.Stop();
             bool ended = newState == "done" || newState == "failed";
-            if (!show || (ended && holdMs <= 0)) { Hide(); return; }
+            if (!show || (ended && holdMs <= 0)) { SlideAway(); return; }
+            if (newState != state)
+            {
+                if (newState == "done") popAt = Now;
+                if (newState == "failed") { popAt = Now; shakeAt = Now; }
+            }
             title = newTitle ?? "";
             detail = newDetail ?? "";
             pct = Math.Max(0, Math.Min(1, fraction));
+            if (newState == "done") pct = 1;
             state = newState;
             dir = newDir;
             var area = Screen.PrimaryScreen.WorkingArea;
             int w = (int)(332 * K), h = (int)(78 * K), m = (int)(14 * K);
-            Bounds = new Rectangle(area.Right - w - m, area.Bottom - h - m, w, h);
-            if (regionCorners)
+            baseX = area.Right - w - m;
+            baseY = area.Bottom - h - m;
+            if (Width != w || Height != h)
             {
-                using var path = new GraphicsPath();
-                int r = (int)(20 * K);
-                path.AddArc(0, 0, r, r, 180, 90);
-                path.AddArc(w - r, 0, r, r, 270, 90);
-                path.AddArc(w - r, h - r, r, r, 0, 90);
-                path.AddArc(0, h - r, r, r, 90, 90);
-                path.CloseFigure();
-                Region = new Region(path);
+                Size = new Size(w, h);
+                if (regionCorners)
+                {
+                    using var path = new GraphicsPath();
+                    int r = (int)(20 * K);
+                    path.AddArc(0, 0, r, r, 180, 90);
+                    path.AddArc(w - r, 0, r, r, 270, 90);
+                    path.AddArc(w - r, h - r, r, r, 0, 90);
+                    path.AddArc(0, h - r, r, r, 90, 90);
+                    path.CloseFigure();
+                    Region = new Region(path);
+                }
             }
-            if (!Visible) Show();
+            if (!Visible || leaveAt >= 0)
+            {
+                // Slide up and fade in (or come back if it was on its way out).
+                if (!Visible) { shownPct = pct; Opacity = Calm ? 1 : 0; Location = new Point(baseX, baseY + (Calm ? 0 : (int)(28 * K))); Show(); }
+                leaveAt = -1;
+                enterAt = Calm ? -1 : Now;
+            }
+            if (Calm) { shownPct = pct; Location = new Point(baseX, baseY); Opacity = 1; }
+            if (!anim.Enabled && !Calm) anim.Start();
             Invalidate();
             if (ended) { hideTimer.Interval = Math.Max(500, holdMs); hideTimer.Start(); }
+        }
+
+        void SlideAway()
+        {
+            if (!Visible) return;
+            if (Calm) { Hide(); return; }
+            if (leaveAt < 0) leaveAt = Now;
+            enterAt = -1;
+            if (!anim.Enabled) anim.Start();
+        }
+
+        void Step()
+        {
+            if (!Visible) { anim.Stop(); enterAt = leaveAt = shakeAt = -1; return; }
+            double now = Now;
+            int x = baseX, y = baseY;
+            double opacity = 1;
+            if (enterAt >= 0)
+            {
+                double t = Math.Min(1, (now - enterAt) / 420);
+                y = baseY + (int)Math.Round((1 - EaseOutBack(t)) * 28 * K);
+                opacity = EaseOutCubic(Math.Min(1, t * 1.6));
+                if (t >= 1) enterAt = -1;
+            }
+            if (leaveAt >= 0)
+            {
+                double t = Math.Min(1, (now - leaveAt) / 260);
+                y = baseY + (int)Math.Round(EaseInCubic(t) * 22 * K);
+                opacity = 1 - EaseOutCubic(t);
+                if (t >= 1) { leaveAt = -1; anim.Stop(); Hide(); Opacity = 1; return; }
+            }
+            if (shakeAt >= 0)
+            {
+                double t = Math.Min(1, (now - shakeAt) / 480);
+                x = baseX + (int)Math.Round(Math.Sin(t * Math.PI * 5) * 8 * K * (1 - t));
+                if (t >= 1) shakeAt = -1;
+            }
+            if (Location.X != x || Location.Y != y) Location = new Point(x, y);
+            if (Math.Abs(Opacity - opacity) > 0.01) Opacity = opacity;
+            // The bar glides toward its target instead of jumping.
+            shownPct += (pct - shownPct) * 0.18;
+            if (Math.Abs(pct - shownPct) < 0.0005) shownPct = pct;
+            Invalidate();
+            bool running = state == "active";
+            if (enterAt < 0 && leaveAt < 0 && shakeAt < 0 && shownPct == pct && !running && (popAt < 0 || now - popAt > 700)) anim.Stop();
         }
 
         protected override void OnMouseClick(MouseEventArgs e)
         {
             base.OnMouseClick(e);
-            Hide();
+            SlideAway();
             Clicked?.Invoke();
         }
 
@@ -1302,11 +1379,24 @@ namespace Beam
 
             // round badge with an arrow (down = receiving, up = sending), tick, cross or pause
             float pad = 14 * k, d = 36 * k;
-            var badge = new RectangleF(pad, 13 * k, d, d);
+            double now = Now;
+            // Finishing pops the badge; while running, a soft ring breathes around it.
+            float pop = 1f;
+            if (popAt >= 0 && now - popAt < 700) { double t = (now - popAt) / 700; pop = (float)(t < 0.35 ? 0.6 + EaseOutBack(t / 0.35) * 0.55 : 1.15 - (t - 0.35) / 0.65 * 0.15); }
+            float bx = pad + d / 2, by = 13 * k + d / 2;
+            if (state == "active" && !Calm)
+            {
+                double ph = (now % 1600) / 1600;
+                float rr = d / 2 + (float)(ph * 8 * k);
+                using var halo = new Pen(Color.FromArgb((int)(110 * (1 - ph)), accent), 1.6f * k);
+                g.DrawEllipse(halo, bx - rr, by - rr, rr * 2, rr * 2);
+            }
+            var badge = new RectangleF(bx - d * pop / 2, by - d * pop / 2, d * pop, d * pop);
             using (var b = new SolidBrush(Color.FromArgb(38, accent))) g.FillEllipse(b, badge);
+            d *= pop;
             using (var pen = new Pen(accent, 2.2f * k) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
             {
-                float cx = badge.X + d / 2, cy = badge.Y + d / 2, a = 6.5f * k;
+                float cx = badge.X + d / 2, cy = badge.Y + d / 2, a = 6.5f * k * pop;
                 if (state == "done")
                     g.DrawLines(pen, new[] { new PointF(cx - a, cy + a * 0.1f), new PointF(cx - a * 0.3f, cy + a * 0.75f), new PointF(cx + a, cy - a * 0.65f) });
                 else if (state == "failed")
@@ -1327,7 +1417,7 @@ namespace Beam
                 }
             }
 
-            float left = badge.Right + 12 * k, right = ClientSize.Width - pad;
+            float left = pad + 36 * k + 12 * k, right = ClientSize.Width - pad;
             using var titleFont = new Font("Segoe UI Semibold", 13.5f * k, FontStyle.Regular, GraphicsUnit.Pixel);
             using var smallFont = new Font("Segoe UI", 12.5f * k, FontStyle.Regular, GraphicsUnit.Pixel);
             using var paper = new SolidBrush(Color.FromArgb(237, 242, 250));
@@ -1337,17 +1427,30 @@ namespace Beam
             bool running = state == "active" || state == "paused";
             float pctWidth = running ? g.MeasureString("100%", smallFont).Width + 4 * k : 0;
             g.DrawString(title, titleFont, paper, new RectangleF(left, 11 * k, right - left - pctWidth, 20 * k), oneLine);
-            if (running) g.DrawString((int)Math.Floor(pct * 100) + "%", smallFont, dim, new RectangleF(right - pctWidth, 12.5f * k, pctWidth, 20 * k), farRight);
+            if (running) g.DrawString((int)Math.Floor(shownPct * 100) + "%", smallFont, dim, new RectangleF(right - pctWidth, 12.5f * k, pctWidth, 20 * k), farRight);
             g.DrawString(detail, smallFont, dim, new RectangleF(left, 31 * k, right - left, 18 * k), oneLine);
 
             // progress bar
             var track = new RectangleF(left + 2 * k, ClientSize.Height - 18 * k, right - left - 2 * k, 4 * k);
             using (var trackBrush = new SolidBrush(Color.FromArgb(30, 255, 255, 255))) FillPill(g, trackBrush, track);
-            float fill = (float)(track.Width * pct);
+            float fill = (float)(track.Width * shownPct);
             if (fill >= track.Height)
             {
+                var fillRect = new RectangleF(track.X, track.Y, fill, track.Height);
                 using var fillBrush = new SolidBrush(accent);
-                FillPill(g, fillBrush, new RectangleF(track.X, track.Y, fill, track.Height));
+                FillPill(g, fillBrush, fillRect);
+                // A highlight sweeps along the filled part while data moves.
+                if (state == "active" && !Calm && fill > 30 * k)
+                {
+                    float sw = 46 * k, sx = track.X - sw + (float)((now % 1300) / 1300) * (fill + sw);
+                    var shine = new RectangleF(sx, track.Y, sw, track.Height);
+                    using var lg = new LinearGradientBrush(shine, Color.FromArgb(0, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), LinearGradientMode.Horizontal);
+                    lg.InterpolationColors = new ColorBlend { Colors = new[] { Color.FromArgb(0, 255, 255, 255), Color.FromArgb(150, 255, 255, 255), Color.FromArgb(0, 255, 255, 255) }, Positions = new[] { 0f, 0.5f, 1f } };
+                    var clip = g.Clip;
+                    using (var p = new GraphicsPath()) { p.AddRectangle(fillRect); g.SetClip(p); }
+                    g.FillRectangle(lg, shine);
+                    g.Clip = clip;
+                }
             }
         }
 

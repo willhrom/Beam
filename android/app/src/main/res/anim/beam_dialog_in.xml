@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pop-ups grow in from slightly small and below, with a little overshoot. -->
+<set xmlns:android="http://schemas.android.com/apk/res/android" android:shareInterpolator="false">
+  <scale android:fromXScale="0.86" android:toXScale="1" android:fromYScale="0.86" android:toYScale="1"
+      android:pivotX="50%" android:pivotY="50%" android:duration="340"
+      android:interpolator="@android:anim/overshoot_interpolator" />
+  <translate android:fromYDelta="6%" android:toYDelta="0" android:duration="340"
+      android:interpolator="@android:anim/decelerate_interpolator" />
+  <alpha android:fromAlpha="0" android:toAlpha="1" android:duration="200"
+      android:interpolator="@android:anim/decelerate_interpolator" />
+</set>

@@ -61,6 +61,7 @@ final class ConnTest {
 
   void show() {
     dlg.show();
+    Fx.stagger(rows);
     dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> { dlg.dismiss(); new ConnTest(a, beam).show(); });
     run();
   }

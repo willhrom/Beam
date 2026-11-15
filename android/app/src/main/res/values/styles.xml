@@ -14,5 +14,13 @@
     <item name="android:windowAnimationStyle">@null</item>
     <item name="android:colorAccent">#2F6BFF</item>
   </style>
+  <style name="BeamDialogAnim">
+    <item name="android:windowEnterAnimation">@anim/beam_dialog_in</item>
+    <item name="android:windowExitAnimation">@anim/beam_dialog_out</item>
+  </style>
+  <style name="BeamDialog" parent="android:Theme.DeviceDefault.Dialog.Alert">
+    <item name="android:windowAnimationStyle">@style/BeamDialogAnim</item>
+    <item name="android:colorAccent">#5CC8FF</item>
+  </style>
   <color name="bg">#0f1626</color>
 </resources>

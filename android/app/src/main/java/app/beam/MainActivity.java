@@ -828,6 +828,7 @@ public class MainActivity extends Activity implements Beam.Listener {
 
     ScrollView sv = new ScrollView(this);
     sv.addView(l);
+    Fx.stagger(l);
     self[0] = Ui.dialog(this).setTitle("Settings").setView(sv)
         .setPositiveButton("Done", null).create();
     self[0].setOnDismissListener(d -> {
@@ -914,6 +915,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     l.addView(Ui.text(this, "Kept on this phone only. The last " + History.MAX + " transfers.", 12, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 8, 0, 0));
     ScrollView sv = new ScrollView(this);
     sv.addView(l);
+    Fx.stagger(l);
     AlertDialog.Builder b = Ui.dialog(this).setTitle("Transfer history").setView(sv).setPositiveButton("Done", null);
     if (h.length() > 0) b.setNeutralButton("Clear", (d, w) -> Ui.dialog(this).setMessage("Clear the transfer history on this phone? Files you received stay where they are.")
         .setPositiveButton("Clear", (d2, w2) -> History.clear(this)).setNegativeButton("Cancel", null).show());

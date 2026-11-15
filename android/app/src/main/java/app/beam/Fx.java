@@ -260,4 +260,17 @@ final class Fx {
     overlay.addView(d, new FrameLayout.LayoutParams(Ui.dp(c, 9), Ui.dp(c, 9)));
     return d;
   }
+
+  /** The rows of a pop-up drift up into place one after another as it opens. */
+  static void stagger(ViewGroup g) {
+    if (!on()) return;
+    float dy = Ui.dp(g.getContext(), 12);
+    for (int i = 0; i < g.getChildCount(); i++) {
+      View v = g.getChildAt(i);
+      v.setAlpha(0f);
+      v.setTranslationY(dy);
+      v.animate().alpha(1f).translationY(0).setStartDelay(90 + Math.min(i, 14) * 28L).setDuration(320)
+          .setInterpolator(new DecelerateInterpolator(2f)).start();
+    }
+  }
 }
