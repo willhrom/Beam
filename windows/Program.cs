@@ -558,6 +558,7 @@ namespace Beam
                         done.stream.Dispose();
                         savedPaths.Add(Path.GetFullPath(done.path));
                         Js($"beamNative.saved({Q(id)}, {Q(done.path)})");
+                        if (Converter.Enabled && Converter.Wants(done.path)) ConvertLater(id, done.path);
                     }
                     break;
                 case "saveAbort":
@@ -566,8 +567,11 @@ namespace Beam
                 case "reveal":
                     // Only files Beam saved itself, in Downloads or the chosen folder.
                     var path = Str("path");
-                    if (path != null && File.Exists(path) && (savedPaths.Contains(Path.GetFullPath(path)) || Path.GetFullPath(path).StartsWith(Downloads() + "\\", StringComparison.OrdinalIgnoreCase)))
+                    if (path != null && File.Exists(path) && (savedPaths.Contains(Path.GetFullPath(path)) || Path.GetFullPath(path).StartsWith(Downloads() + "\\", StringComparison.OrdinalIgnoreCase) || Path.GetFullPath(path).StartsWith(SaveRoot().TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)))
                         Process.Start("explorer.exe", $"/select,\"{Path.GetFullPath(path)}\"");
+                    break;
+                case "setConvert":
+                    Converter.Enabled = d.TryGetProperty("on", out var cv) && cv.ValueKind == JsonValueKind.True;
                     break;
                 case "getSaveDir":
                     SendSaveDir();
@@ -633,6 +637,37 @@ namespace Beam
                 try { if (Directory.Exists(p)) return NormDir(p); } catch { }
             }
             return Downloads();
+        }
+
+        /// iPhone photos (HEIC) and HEVC videos don't open on many PCs. Convert them to JPG / H.264 MP4
+        /// in the background, then point the transfer card at the new file.
+        void ConvertLater(string id, string path)
+        {
+            Js($"beamNative.converting({Q(id)}, true)");
+            Task.Run(async () =>
+            {
+                string result = null, problem = null;
+                try { result = await Converter.Convert(path); }
+                catch (Converter.MissingCodec) { problem = "codec"; }
+                catch { problem = "failed"; }
+                BeginInvoke(new Action(() =>
+                {
+                    if (result != null)
+                    {
+                        savedPaths.Add(Path.GetFullPath(result));
+                        Js($"beamNative.converted({Q(id)}, {Q(result)})");
+                    }
+                    else
+                    {
+                        Js($"beamNative.converting({Q(id)}, false)");
+                        if (problem == "codec" && !Converter.Warned)
+                        {
+                            Converter.Warned = true;
+                            Balloon("Beam", "This PC can't convert iPhone photos and videos yet. Install \"HEVC Video Extensions\" from the Microsoft Store, then Beam converts them automatically.");
+                        }
+                    }
+                }));
+            });
         }
 
         void SendSaveDir()
@@ -1548,6 +1583,137 @@ namespace Beam
                 $"/c ping 127.0.0.1 -n 3 > nul & powershell -NoProfile -Command \"Get-AppxPackage Beam.Share | Remove-AppxPackage\" & rmdir /s /q \"{Dir}\" & rmdir /s /q \"{data}\"")
             { CreateNoWindow = true, UseShellExecute = false }));
             MessageBox.Show("Beam was removed.", "Beam");
+        }
+    }
+
+    /// Converts iPhone formats into ones every Windows app opens: HEIC/HEIF photos to JPG and
+    /// HEVC videos to H.264 MP4. Uses Windows' own codecs (HEVC Video Extensions must be installed).
+    /// The original is replaced only once the new file is complete.
+    static class Converter
+    {
+        public sealed class MissingCodec : Exception { }
+
+        public static bool Warned;
+
+        public static bool Enabled
+        {
+            get { try { using var k = Registry.CurrentUser.OpenSubKey(@"Software\Beam"); return !(k?.GetValue("convert") is int v && v == 0); } catch { return true; } }
+            set { try { using var k = Registry.CurrentUser.CreateSubKey(@"Software\Beam"); k.SetValue("convert", value ? 1 : 0, RegistryValueKind.DWord); } catch { } }
+        }
+
+        static readonly string[] Photos = { ".heic", ".heif", ".hif" };
+        static readonly string[] Videos = { ".mov", ".mp4", ".m4v", ".hevc" };
+
+        public static bool Wants(string path)
+        {
+            var ext = Path.GetExtension(path).ToLowerInvariant();
+            return Photos.Contains(ext) || Videos.Contains(ext);
+        }
+
+        /// Returns the new file's path, or null when nothing needed converting.
+        public static async Task<string> Convert(string path)
+        {
+            var ext = Path.GetExtension(path).ToLowerInvariant();
+            return Photos.Contains(ext) ? await Photo(path) : await Video(path);
+        }
+
+        static string FreeName(string dir, string baseName, string ext)
+        {
+            var p = Path.Combine(dir, baseName + ext);
+            for (int n = 2; File.Exists(p); n++) p = Path.Combine(dir, $"{baseName} ({n}){ext}");
+            return p;
+        }
+
+        static async Task<string> Photo(string path)
+        {
+            var src = await Windows.Storage.StorageFile.GetFileFromPathAsync(path);
+            Windows.Graphics.Imaging.SoftwareBitmap bmp;
+            Windows.Graphics.Imaging.BitmapPropertySet meta = null;
+            using (var input = await src.OpenAsync(Windows.Storage.FileAccessMode.Read))
+            {
+                Windows.Graphics.Imaging.BitmapDecoder dec;
+                try { dec = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(input); }
+                catch { throw new MissingCodec(); }
+                try
+                {
+                    bmp = await dec.GetSoftwareBitmapAsync(Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8, Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied,
+                        new Windows.Graphics.Imaging.BitmapTransform(), Windows.Graphics.Imaging.ExifOrientationMode.RespectExifOrientation,
+                        Windows.Graphics.Imaging.ColorManagementMode.ColorManageToSRgb);
+                }
+                catch { throw new MissingCodec(); }
+                try { meta = await dec.BitmapProperties.GetPropertiesAsync(new[] { "System.Photo.DateTaken", "System.Photo.CameraManufacturer", "System.Photo.CameraModel" }); } catch { }
+            }
+            var dir = Path.GetDirectoryName(path);
+            var outPath = FreeName(dir, Path.GetFileNameWithoutExtension(path), ".jpg");
+            var folder = await Windows.Storage.StorageFolder.GetFolderFromPathAsync(dir);
+            var dst = await folder.CreateFileAsync(Path.GetFileName(outPath), Windows.Storage.CreationCollisionOption.GenerateUniqueName);
+            try
+            {
+                using (var output = await dst.OpenAsync(Windows.Storage.FileAccessMode.ReadWrite))
+                {
+                    var opts = new Windows.Graphics.Imaging.BitmapPropertySet { { "ImageQuality", new Windows.Graphics.Imaging.BitmapTypedValue(0.92f, Windows.Foundation.PropertyType.Single) } };
+                    var enc = await Windows.Graphics.Imaging.BitmapEncoder.CreateAsync(Windows.Graphics.Imaging.BitmapEncoder.JpegEncoderId, output, opts);
+                    enc.SetSoftwareBitmap(bmp);
+                    if (meta != null && meta.Count > 0) try { await enc.BitmapProperties.SetPropertiesAsync(meta); } catch { }
+                    await enc.FlushAsync();
+                }
+            }
+            catch { try { await dst.DeleteAsync(); } catch { } throw; }
+            finally { bmp.Dispose(); }
+            Finish(path, dst.Path);
+            return dst.Path;
+        }
+
+        static async Task<string> Video(string path)
+        {
+            var src = await Windows.Storage.StorageFile.GetFileFromPathAsync(path);
+            Windows.Media.MediaProperties.MediaEncodingProfile inProfile;
+            try { inProfile = await Windows.Media.MediaProperties.MediaEncodingProfile.CreateFromFileAsync(src); }
+            catch { return null; } // not a video Windows can read; leave it
+            var sub = inProfile.Video?.Subtype ?? "";
+            if (!sub.Equals("HEVC", StringComparison.OrdinalIgnoreCase) && !sub.Equals("H265", StringComparison.OrdinalIgnoreCase)) return null; // already H.264 etc.
+
+            var dir = Path.GetDirectoryName(path);
+            var outPath = FreeName(dir, Path.GetFileNameWithoutExtension(path), ".mp4");
+            var folder = await Windows.Storage.StorageFolder.GetFolderFromPathAsync(dir);
+            var dst = await folder.CreateFileAsync(Path.GetFileName(outPath), Windows.Storage.CreationCollisionOption.GenerateUniqueName);
+            try
+            {
+                var outProfile = Windows.Media.MediaProperties.MediaEncodingProfile.CreateMp4(Windows.Media.MediaProperties.VideoEncodingQuality.Auto);
+                outProfile.Video.Width = inProfile.Video.Width;
+                outProfile.Video.Height = inProfile.Video.Height;
+                if (inProfile.Video.FrameRate.Denominator > 0)
+                {
+                    outProfile.Video.FrameRate.Numerator = inProfile.Video.FrameRate.Numerator;
+                    outProfile.Video.FrameRate.Denominator = inProfile.Video.FrameRate.Denominator;
+                }
+                // Keep the quality close to the original: about 0.12 bits per pixel per frame, at least 8 Mbps.
+                double fps = inProfile.Video.FrameRate.Denominator > 0 ? (double)inProfile.Video.FrameRate.Numerator / inProfile.Video.FrameRate.Denominator : 30;
+                outProfile.Video.Bitrate = (uint)Math.Max(8_000_000, Math.Min(60_000_000, inProfile.Video.Width * inProfile.Video.Height * fps * 0.12));
+                var tc = new Windows.Media.Transcoding.MediaTranscoder { HardwareAccelerationEnabled = true };
+                var prep = await tc.PrepareFileTranscodeAsync(src, dst, outProfile);
+                if (!prep.CanTranscode)
+                {
+                    if (prep.FailureReason == Windows.Media.Transcoding.TranscodeFailureReason.CodecNotFound) throw new MissingCodec();
+                    throw new Exception("can't transcode");
+                }
+                await prep.TranscodeAsync();
+            }
+            catch { try { await dst.DeleteAsync(); } catch { } throw; }
+            Finish(path, dst.Path);
+            return dst.Path;
+        }
+
+        /// Keeps the original's dates on the new file, then removes the original.
+        static void Finish(string original, string converted)
+        {
+            try
+            {
+                File.SetCreationTimeUtc(converted, File.GetCreationTimeUtc(original));
+                File.SetLastWriteTimeUtc(converted, File.GetLastWriteTimeUtc(original));
+            }
+            catch { }
+            try { File.Delete(original); } catch { }
         }
     }
 }

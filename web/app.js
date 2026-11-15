@@ -112,6 +112,7 @@ const S = {
   name: store.get("name", defaultName(kind)),
   nearby: store.get("nearby", true),
   autoAccept: store.get("autoAccept", true),
+  convert: store.get("convert", true),
   paired: store.get("paired", {}), // id -> {pub, name, kind}
   peers: [],
   ice: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }],
@@ -138,6 +139,8 @@ function connect() {
 }
 const wsSend = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
 setInterval(() => { if (ws && ws.readyState === 1) ws.send("ping"); }, 30000);
+// Relay credentials last a day; refresh them on devices that stay connected for days.
+setInterval(() => { if (S.online && Date.now() - (S.iceAt || 0) > 4 * 3600 * 1000) wsSend({ t: "ice" }); }, 10 * 60 * 1000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden && (!ws || ws.readyState > 1)) { backoff = 1000; connect(); } });
 window.addEventListener("online", () => { backoff = 1000; connect(); });
 
@@ -171,7 +174,14 @@ async function onServer(m) {
       S.online = true;
       backoff = 1000;
       if (Array.isArray(m.ice) && m.ice.length) S.ice = m.ice;
+      S.iceAt = Date.now();
       render();
+      break;
+    case "ice":
+      if (Array.isArray(m.ice) && m.ice.length) { S.ice = m.ice; S.iceAt = Date.now(); }
+      break;
+    case "pong":
+      if (S.pingWait && S.pingWait.n === m.n) { S.pingWait.res(m); S.pingWait = null; }
       break;
     case "peers":
       S.peers = m.peers || [];
@@ -313,6 +323,7 @@ function closePc(t) {
 
 // ---------- sending ----------
 async function sendItems(peer, files, text) {
+  if (files.length > MAX_ITEMS - 1) { toast(`Sending the first ${MAX_ITEMS - 1} files. Send the rest separately`); files = files.slice(0, MAX_ITEMS - 1); }
   const items = files.map((f) => { const it = { name: cleanName(f.name), size: f.size, type: f.type || "application/octet-stream" }; const p = cleanPath(relPathOf(f)); if (p) it.path = p; return it; });
   const blobs = files.slice();
   if (text) {
@@ -321,7 +332,7 @@ async function sendItems(peer, files, text) {
     blobs.push(b);
   }
   if (!items.length) return;
-  const t = { tid: randId(), dir: "out", peer, items, blobs, total: items.reduce((a, b) => a + b.size, 0), done: 0, state: "preparing", gen: 0 };
+  const t = { tid: randId(), dir: "out", peer, items, blobs, total: items.reduce((a, b) => a + b.size, 0), done: 0, state: "preparing", gen: 0, sentText: text || "" };
   S.tx.set(t.tid, t);
   renderTx(t);
   await connectOut(t, "offer");
@@ -357,7 +368,7 @@ async function connectOut(t, mode) {
   if (!live()) return;
   const sdp = pc.localDescription.sdp;
   const data = { k: mode, tid: t.tid, gen, sdp, sig: await Id.sign(`beam-${mode}|${t.tid}|${t.peer.id}|${sdp}`), pub: Id.pub };
-  if (mode === "offer") Object.assign(data, { name: S.name, kind, files: t.items });
+  if (mode === "offer") Object.assign(data, { name: S.name, kind }, await packFiles(t.items));
   if (t.state === "preparing") t.state = "waiting";
   renderTx(t);
   wsSend({ t: "signal", to: t.peer.id, data });
@@ -420,12 +431,33 @@ function retry(t) {
   connectOut(t, "resume").catch(() => dropped(t, t.gen));
 }
 
+// Big batches: the file list goes gzipped so the offer stays small (thousands of names fit).
+const MAX_ITEMS = 5000;
+async function packFiles(items) {
+  const files = items.map((it) => { const o = { name: it.name, size: it.size, type: it.type }; if (it.text) o.text = true; if (it.path) o.path = it.path; return o; });
+  const json = JSON.stringify(files);
+  if (json.length < 40000 || typeof CompressionStream === "undefined") return { files };
+  const z = await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer();
+  return { filesZ: b64(z), count: files.length };
+}
+async function unpackFiles(d) {
+  if (Array.isArray(d.files)) return d.files;
+  if (typeof d.filesZ !== "string" || typeof DecompressionStream === "undefined") return [];
+  try {
+    const bytes = Uint8Array.from(atob(d.filesZ), (c) => c.charCodeAt(0));
+    const text = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+    if (text.length > 4 * 1048576) return [];
+    const list = JSON.parse(text);
+    return Array.isArray(list) ? list : [];
+  } catch { return []; }
+}
+
 // ---------- receiving ----------
 async function onOffer(from, d) {
   if (S.tx.has(d.tid)) return;
   if (!(await trustedKey(from, d.pub))) return;
   if (!(await verifySig(d.pub, d.sig, `beam-offer|${d.tid}|${Id.id}|${d.sdp}`))) return;
-  const items = (Array.isArray(d.files) ? d.files : []).slice(0, 500).map((f) => ({
+  const items = (await unpackFiles(d)).slice(0, MAX_ITEMS).map((f) => ({
     name: cleanName(f.name), size: Math.max(0, Number(f.size) || 0), type: String(f.type || "application/octet-stream").slice(0, 100), text: !!f.text,
     path: cleanPath(f.path) || undefined,
   }));
@@ -669,9 +701,64 @@ function setupReceive(t, dc, gen) {
   };
 }
 
+// ----- history -----
+// The last 200 transfers on this device, kept locally (never sent anywhere).
+const HISTORY_MAX = 200;
+function historyList() { const h = store.get("history", []); return Array.isArray(h) ? h : []; }
+function recordHistory(t) {
+  if (t.historyDone) return;
+  t.historyDone = true;
+  const files = t.items.filter((i) => !i.text);
+  const text = t.dir === "in" ? (t.received || []).filter((r) => r.text).map((r) => r.text).join("\n").slice(0, 4000) : "";
+  const entry = {
+    id: t.tid, at: Date.now(), dir: t.dir, peer: t.peer.name, ok: t.state === "done", reason: t.state === "done" ? "" : t.reason || "",
+    count: files.length, names: files.slice(0, 3).map((i) => i.name), folder: topFolder(t.items) || "", size: files.reduce((a, b) => a + b.size, 0),
+    text: text || (t.dir === "out" && t.sentText ? t.sentText.slice(0, 4000) : ""), paths: [],
+  };
+  const h = historyList().filter((e) => e.id !== entry.id);
+  h.unshift(entry);
+  store.set("history", h.slice(0, HISTORY_MAX));
+}
+function historyPath(tid, path) {
+  const h = historyList(), e = h.find((x) => x.id === tid);
+  if (!e || e.paths.length >= 20) return;
+  e.paths.push(path);
+  store.set("history", h);
+}
+function whenText(ms) {
+  const d = new Date(ms), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (d.toDateString() === now.toDateString()) return "Today " + time;
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return "Yesterday " + time;
+  return d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", " + time;
+}
+function showHistory() {
+  const h = historyList();
+  const rows = h.map((e, i) => {
+    const what = e.folder ? `Folder "${esc(e.folder)}"${e.count > 1 ? ` (${e.count} files)` : ""}`
+      : e.count ? esc(e.names[0] || "File") + (e.count > 1 ? ` and ${e.count - 1} more` : "") : e.text ? "Text" : "Nothing";
+    const who = (e.dir === "in" ? "From " : "To ") + esc(e.peer);
+    const meta = [who, e.size ? fmtSize(e.size) : "", whenText(e.at)].filter(Boolean).join(", ");
+    const status = e.ok ? "" : `<small class="bad">${esc(e.reason || "Didn't finish")}</small>`;
+    const btns = (native && e.paths.length ? `<button class="btn ghost small" data-hreveal="${i}">Show</button>` : "") +
+      (e.text ? `<button class="btn ghost small" data-hcopy="${i}">Copy text</button>` : "");
+    return `<div class="item hist ${e.dir}"><span><i>${e.dir === "in" ? "↓" : "↑"}</i><span>${what}<small>${meta}</small>${status}</span></span><span class="row-btns">${btns}</span></div>`;
+  }).join("");
+  openSheet(`<h2>Transfer history</h2>
+    <div class="list">${rows || '<div class="item"><span class="sub">Nothing sent or received on this device yet</span></div>'}</div>
+    <p><small>Kept on this device only. The last ${HISTORY_MAX} transfers.</small></p>
+    <div class="actions">${h.length ? '<button class="btn ghost" id="hclear">Clear history</button>' : ""}<button class="btn primary" id="done">Done</button></div>`);
+  $("#done").onclick = closeSheet;
+  if ($("#hclear")) $("#hclear").onclick = () => { if (confirm("Clear the transfer history on this device? Files you received stay where they are.")) { store.set("history", []); showHistory(); } };
+  document.querySelectorAll("[data-hreveal]").forEach((b) => (b.onclick = () => native.postMessage({ op: "reveal", path: h[+b.dataset.hreveal].paths[0] })));
+  document.querySelectorAll("[data-hcopy]").forEach((b) => (b.onclick = () => navigator.clipboard.writeText(h[+b.dataset.hcopy].text).then(() => toast("Copied"), () => toast("Couldn't copy"))));
+}
+
 function finish(t) {
   if (t.state === "done" || t.state === "failed") return;
   t.state = "done";
+  recordHistory(t);
   renderTx(t);
   progressFinal(t);
   setTimeout(() => { if (t.state === "done") closePc(t); }, 1500);
@@ -685,6 +772,7 @@ function fail(t, why) {
   if (t.dc && t.dc.readyState === "open") try { t.dc.send(JSON.stringify({ t: "cancel" })); } catch {}
   t.state = "failed";
   t.reason = why;
+  if (t.dir === "out" || t.everOpen || t.got) recordHistory(t);
   closePc(t);
   if (t.w) { const w = t.w; t.w = null; t.q = t.q.then(() => w.abort()).catch(() => {}); }
   renderTx(t);
@@ -719,20 +807,34 @@ window.beamNative = {
     else if (act === "decline") decline(t);
   },
   saved(id, path) {
-    for (const t of S.tx.values()) for (const r of t.received) if (r.nid === id) { r.path = path; renderTx(t); }
+    for (const t of S.tx.values()) for (const r of t.received) if (r.nid === id) { r.path = path; renderTx(t); historyPath(t.tid, path); }
+  },
+  // Windows: an iPhone photo/video is being converted to JPG/MP4 after it arrived.
+  converting(id, on) {
+    for (const t of S.tx.values()) for (const r of t.received) if (r.nid === id) { r.converting = !!on; renderTx(t); }
+  },
+  converted(id, path) {
+    for (const t of S.tx.values()) for (const r of t.received) if (r.nid === id) {
+      const old = r.path;
+      r.path = path; r.name = path.split(/[\\/]/).pop(); r.converting = false;
+      renderTx(t);
+      const h = historyList(), e = h.find((x) => x.id === t.tid);
+      if (e) { const i = e.paths.indexOf(old); if (i >= 0) e.paths[i] = path; else e.paths.push(path); store.set("history", h); }
+    }
   },
   saveFailed(id) {
     for (const t of S.tx.values()) if (t.dir === "in" && id.startsWith(t.tid + ":")) fail(t, "Couldn't save to " + (S.saveDir ? S.saveDir.name : "Downloads") + ". Check the folder in Settings");
   },
 };
 if (native) native.postMessage({ op: "getSaveDir" });
+if (nativeKind === "windows") native.postMessage({ op: "setConvert", on: S.convert !== false });
 // Windows app: files from Explorer arrive as real file handles, so the browser reads them directly.
 if (nativeKind === "windows") {
   window.chrome.webview.addEventListener("message", async (e) => {
     if (!e.data || e.data.op !== "share") return;
     const files = [];
     const walk = async (dir, prefix) => {
-      if (files.length >= 5000) return;
+      if (files.length >= MAX_ITEMS) return;
       for await (const [name, h] of dir) {
         if (h.kind === "file") { try { const f = await h.getFile(); f.beamPath = prefix + "/" + f.name; files.push(f); } catch {} }
         else await walk(h, prefix + "/" + name);
@@ -951,7 +1053,7 @@ function macFile(f) {
 async function filesFromEntries(entries) {
   const out = [];
   const walk = async (entry, prefix) => {
-    if (out.length >= 5000) return;
+    if (out.length >= MAX_ITEMS) return;
     if (entry.isFile) {
       const f = await new Promise((res, rej) => entry.file(res, rej)).catch(() => null);
       if (f) { f.beamPath = prefix ? prefix + "/" + f.name : ""; out.push(f); }
@@ -1014,6 +1116,7 @@ function renderTxList() {
   for (const t of [...S.tx.values()].reverse()) renderTx(t);
 }
 
+const SHOW_FILES = 25;
 function renderTx(t) {
   nativeStatusSoon();
   nativeProgressSoon();
@@ -1031,17 +1134,20 @@ function renderTx(t) {
   let body = "";
   if (moving) body += `<div class="bar"><i style="width:${t.total ? (100 * t.done) / t.total : 0}%"></i></div>`;
   const one = t.state === "done" && t.items.length === 1 && t.received && t.received.length === 1 && !t.received[0].text ? t.received[0] : null;
-  const folderZip = t.state === "done" && t.sink === "memory" && topFolder(t.items) && t.received && t.received.length > 1 && t.received.every((r) => r.url);
+  const folderZip = t.state === "done" && t.sink === "memory" && t.received && t.received.length > 1 && (topFolder(t.items) || t.received.length > SHOW_FILES) && t.received.every((r) => r.url);
   let oneBtn = "";
   if (one) {
     oneBtn = one.url ? `<a class="btn ghost small" href="${one.url}" download="${esc(one.name)}">Save</a>`
       : "folder" in one ? `<span class="size">Saved${one.folder ? " in " + esc(one.folder) : ""}</span>`
-      : one.path ? `<button class="btn ghost small" data-reveal="${esc(one.path)}">${revealLabel}</button>` : `<span class="size">Saving…</span>`;
+      : one.converting ? `<span class="size">Converting…</span>` : one.path ? `<button class="btn ghost small" data-reveal="${esc(one.path)}">${revealLabel}</button>` : `<span class="size">Saving…</span>`;
   } else if (folderZip) {
     body += `<div class="files"><div class="file"><span class="sub">${t.received.length} files</span><button class="btn ghost small" data-zip="${t.tid}">Save as .zip</button></div></div>`;
   } else if (t.received && t.received.length) {
     body += '<div class="files">';
-    for (const r of t.received) {
+    // Long batches list the first few; drawing thousands of rows on every file would slow receiving down.
+    const texts = t.received.filter((r) => r.text), files = t.received.filter((r) => !r.text);
+    const more = Math.max(0, files.length - SHOW_FILES);
+    for (const r of texts.concat(files.slice(0, SHOW_FILES))) {
       if (r.text) {
         const isUrl = /^https?:\/\/\S+$/.test(r.text.trim());
         body += `<div class="text">${esc(r.text)}</div><div class="row">` +
@@ -1052,9 +1158,10 @@ function renderTx(t) {
       } else if ("folder" in r) {
         body += `<div class="file"><span>${esc(r.name)}</span><span class="sub">Saved${r.folder ? " in " + esc(r.folder) : ""}</span></div>`;
       } else if (r.nid) {
-        body += `<div class="file"><span>${esc(r.name)}</span>${r.path ? `<button class="btn ghost small" data-reveal="${esc(r.path)}">${revealLabel}</button>` : '<span class="sub">Saving…</span>'}</div>`;
+        body += `<div class="file"><span>${esc(r.name)}</span>${r.converting ? '<span class="sub">Converting…</span>' : r.path ? `<button class="btn ghost small" data-reveal="${esc(r.path)}">${revealLabel}</button>` : '<span class="sub">Saving…</span>'}</div>`;
       }
     }
+    if (more) body += `<div class="file"><span class="sub">and ${more} more file${more === 1 ? "" : "s"}</span></div>`;
     body += "</div>";
   }
   let btns = "";
@@ -1269,8 +1376,10 @@ function showSettings() {
     <label class="opt"><span>Everyone nearby can see me<small>When off, only your own and paired devices can</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
     <label class="opt"><span>Auto-accept from my devices<small>What they send arrives without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>
     ${!native && "Notification" in window && Notification.permission !== "granted" ? '<label class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></label>' : ""}
+    ${nativeKind === "windows" ? `<label class="opt"><span>Convert iPhone photos and videos<small>HEIC photos become JPG and HEVC videos become MP4, so every app opens them</small></span><input type="checkbox" class="toggle" id="cv" ${S.convert !== false ? "checked" : ""}></label>` : ""}
     ${native ? `<div class="opt"><span>Save received files to<small id="sdName">${esc(S.saveDir ? S.saveDir.name : "Downloads")}</small></span><span class="row-btns">${S.saveDir && !S.saveDir.isDefault ? '<button class="btn ghost small" id="sdReset">Use Downloads</button>' : ""}<button class="btn ghost small" id="sdPick">Choose…</button></span></div>` : ""}
     ${canSaveToDisk ? `<label class="opt"><span>Save received files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Your Downloads folder. Big transfers ask where to save"}</small></span><button class="btn ghost small" id="sf">Choose…</button></label>` : ""}
+    <div class="actions"><button class="btn ghost" id="hist">Transfer history</button><button class="btn ghost" id="ctest">Test connection</button></div>
     <p><small>Device code ${shortId(Id.id)}</small></p>
     <h3>Account</h3>
     <div class="list"><div class="item"><span>${S.user ? esc(S.user.name) + ' <span class="sub">' + esc(S.user.username) + (S.user.admin ? " · admin" : "") + "</span>" : "Not signed in"}</span></div></div>
@@ -1282,6 +1391,8 @@ function showSettings() {
     <div class="actions"><button class="btn ghost" id="pShow">Show a code</button><button class="btn ghost" id="pJoin">Enter a code</button></div>
     <div class="actions"><button class="btn primary" id="done">Done</button></div>`, saveSettings);
   $("#done").onclick = closeSheet;
+  $("#ctest").onclick = () => { saveSettings(); sheetOnClose = null; connectionTest(); };
+  $("#hist").onclick = () => { saveSettings(); sheetOnClose = null; showHistory(); };
   if ($("#ppl")) $("#ppl").onclick = () => { saveSettings(); sheetOnClose = null; S.adminOpen = true; showPeople(); wsSend({ t: "admin-list" }); };
   $("#cpin").onclick = () => { saveSettings(); sheetOnClose = null; showChangePin(); };
   $("#sout").onclick = () => { if (confirm("Sign out of Beam on this device?")) { sheetOnClose = null; closeSheet(); wsSend({ t: "logout" }); } };
@@ -1302,12 +1413,75 @@ function showSettings() {
     showSettings();
   }));
 }
+// ----- connection test -----
+// Checks each way a transfer can travel: the server, a direct internet path, and the relay.
+async function candidatesWith(iceServers, relayOnly) {
+  const pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: relayOnly ? "relay" : "all" });
+  const types = new Set();
+  pc.onicecandidate = (e) => { const m = e.candidate && / typ (\w+)/.exec(e.candidate.candidate); if (m) types.add(m[1]); };
+  try {
+    pc.createDataChannel("test");
+    await pc.setLocalDescription(await pc.createOffer());
+    await gathered(pc, 5000);
+  } catch {}
+  try { pc.close(); } catch {}
+  return types;
+}
+async function connectionTest() {
+  const row = (ok, title, detail) => `<div class="item test ${ok === null ? "wait" : ok ? "good" : "bad"}"><span>${title}<small>${detail}</small></span><b>${ok === null ? "…" : ok ? "OK" : "Problem"}</b></div>`;
+  const rows = { server: row(null, "Beam server", "Checking…"), direct: row(null, "Direct connection", "Checking…"), relay: row(null, "Relay", "Checking…"), devices: row(null, "Your devices", "Checking…") };
+  let summary = "Testing…";
+  const draw = () => { if ($("#testRows")) { $("#testRows").innerHTML = Object.values(rows).join(""); $("#testSum").textContent = summary; } };
+  openSheet(`<h2>Connection test</h2><p id="testSum">Testing…</p><div class="list" id="testRows"></div>
+    <div class="actions"><button class="btn ghost" id="again">Test again</button><button class="btn primary" id="done">Done</button></div>`);
+  $("#done").onclick = closeSheet;
+  $("#again").onclick = connectionTest;
+  draw();
+
+  // 1. Server
+  let pong = null, ms = 0;
+  if (S.online) {
+    const n = randId(), t0 = performance.now();
+    pong = await new Promise((res) => { S.pingWait = { n, res }; wsSend({ t: "ping", n }); setTimeout(() => res(null), 6000); });
+    ms = Math.round(performance.now() - t0);
+  }
+  rows.server = pong ? row(true, "Beam server", `Connected, ${ms} ms round trip`) : row(false, "Beam server", S.online ? "Not answering" : S.user === null ? "Not signed in" : "Can't reach it. Check the internet connection");
+  draw();
+
+  // 2. Direct path (STUN only)
+  const stun = S.ice.filter((x) => [].concat(x.urls).some((u) => /^stuns?:/.test(u))).map((x) => ({ urls: [].concat(x.urls).filter((u) => /^stuns?:/.test(u)) }));
+  const direct = await candidatesWith(stun, false);
+  const publicOk = direct.has("srflx");
+  rows.direct = row(publicOk, "Direct connection", publicOk ? "This network allows direct transfers" : direct.has("host") ? "Only to devices on this same network" : "Blocked on this network");
+  draw();
+
+  // 3. Relay (TURN only)
+  const turn = S.ice.filter((x) => [].concat(x.urls).some((u) => /^turns?:/.test(u)));
+  let relayOk = false;
+  if (!turn.length) rows.relay = row(false, "Relay", pong && pong.relay ? "Set up on the server, reconnect to load it" : "Not set up yet");
+  else {
+    relayOk = (await candidatesWith(turn, true)).has("relay");
+    rows.relay = row(relayOk, "Relay", relayOk ? "Ready for networks that block direct transfers" : "Can't reach the relay from this network");
+  }
+  draw();
+
+  // 4. Devices
+  const all = S.peers.length;
+  rows.devices = row(all > 0, "Your devices", all ? `${all} reachable now` : "None online right now");
+  summary = !pong ? "Beam can't send anything until it reaches the server."
+    : publicOk || relayOk ? "Transfers should work from this network."
+    : "Transfers will only work with devices on this same network.";
+  draw();
+}
+
 function saveSettings() {
   const nm = $("#nm"), nb = $("#nb"), aa = $("#aa");
   if (!nm) return;
   const name = nm.value.trim().slice(0, 40) || S.name;
   const changed = name !== S.name || nb.checked !== S.nearby;
   S.name = name; S.nearby = nb.checked; S.autoAccept = aa.checked;
+  const cv = $("#cv");
+  if (cv && cv.checked !== (S.convert !== false)) { S.convert = cv.checked; store.set("convert", S.convert); native.postMessage({ op: "setConvert", on: S.convert }); }
   store.set("name", S.name); store.set("nearby", S.nearby); store.set("autoAccept", S.autoAccept);
   if (changed) updateServer();
   render();

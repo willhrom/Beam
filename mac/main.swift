@@ -521,7 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
       // Only files Beam saved itself, in Downloads or the chosen folder (past or present).
       if let p = d["path"] as? String {
         let u = URL(fileURLWithPath: p).standardizedFileURL
-        if savedPaths.contains(u.path) || u.path.hasPrefix(downloadsDir().path + "/") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
+        if savedPaths.contains(u.path) || u.path.hasPrefix(downloadsDir().path + "/") || u.path.hasPrefix(saveRoot().path + "/") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
       }
     case "getSaveDir":
       sendSaveDir()

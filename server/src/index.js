@@ -12,7 +12,7 @@ import { DurableObject } from "cloudflare:workers";
 
 const MAX_NAME = 40;
 const MAX_WATCH = 40;
-const MAX_SIGNAL = 64 * 1024;
+const MAX_SIGNAL = 512 * 1024; // big batches send a compressed file list with the offer
 const PAIR_TTL = 10 * 60 * 1000;
 const MAX_WAITING_PER_NET = 12, MAX_WAITING = 400; // connections not yet signed in
 const TALK_TTL = 30 * 60 * 1000;                   // how long a started transfer may resume across networks
@@ -235,13 +235,14 @@ export class Hub extends DurableObject {
 
   async handle(ws, raw) {
     if (typeof raw !== "string" || raw.length > MAX_SIGNAL) return;
+    const a = ws.deserializeAttachment() || {};
+    if (!a.user && raw.length > 16 * 1024) return; // only signed-in devices send big messages
     let m;
     try {
       m = JSON.parse(raw);
     } catch {
       return;
     }
-    const a = ws.deserializeAttachment() || {};
 
     if (m.t === "hello") {
       if (a.id) return;
@@ -417,6 +418,14 @@ export class Hub extends DurableObject {
       }
       return send(ws, await this.adminList());
     }
+
+    // Connection test: round-trip time and whether the relay is set up.
+    if (m.t === "ping") {
+      const { TURN_KEY_ID, TURN_KEY_API_TOKEN } = this.env;
+      return send(ws, { t: "pong", n: clean(m.n, 40), relay: !!(TURN_KEY_ID && TURN_KEY_API_TOKEN) });
+    }
+    // Fresh relay credentials (they expire, and some devices stay connected for days).
+    if (m.t === "ice") return send(ws, { t: "ice", ice: await this.turn() });
 
     if (m.t === "update") {
       const before = { ...a };
