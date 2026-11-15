@@ -1215,7 +1215,7 @@ namespace Beam
         // Animation: one ~60 fps timer drives entering, leaving, the bar, the badge pop and the shake.
         readonly System.Windows.Forms.Timer anim = new System.Windows.Forms.Timer { Interval = 15 };
         readonly Stopwatch clock = Stopwatch.StartNew();
-        double enterAt = -1, leaveAt = -1, popAt = -1, shakeAt = -1;
+        double enterAt = -1, leaveAt = -1, popAt = -1, shakeAt = -1, lastStep;
         int baseX, baseY;
         public event Action Clicked;
 
@@ -1309,6 +1309,7 @@ namespace Beam
             }
             if (Calm) { shownPct = pct; Location = new Point(baseX, baseY); Opacity = 1; }
             if (!anim.Enabled && !Calm) anim.Start();
+            if (Now - lastStep > 500) shownPct = pct; // animation timer not ticking: don't let the bar lag
             Invalidate();
             if (ended) { hideTimer.Interval = Math.Max(500, holdMs); hideTimer.Start(); }
         }
@@ -1356,6 +1357,7 @@ namespace Beam
             Invalidate();
             bool running = state == "active";
             if (enterAt < 0 && leaveAt < 0 && shakeAt < 0 && shownPct == pct && !running && (popAt < 0 || now - popAt > 700)) anim.Stop();
+            lastStep = now;
         }
 
         protected override void OnMouseClick(MouseEventArgs e)
@@ -1367,7 +1369,28 @@ namespace Beam
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            var g = e.Graphics;
+            try { PaintCard(e.Graphics); }
+            catch
+            {
+                // Never let a drawing problem freeze the card: fall back to a plain version.
+                try { PaintPlain(e.Graphics); } catch { }
+            }
+        }
+
+        void PaintPlain(Graphics g)
+        {
+            float k = K;
+            g.Clear(BackColor);
+            using var font = new Font("Segoe UI", 13f * k, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var paper = new SolidBrush(Color.FromArgb(237, 242, 250));
+            g.DrawString(title + "  " + (int)Math.Floor(pct * 100) + "%", font, paper, 14 * k, 14 * k);
+            g.DrawString(detail, font, Brushes.Gray, 14 * k, 34 * k);
+            g.FillRectangle(Brushes.DimGray, 14 * k, ClientSize.Height - 18 * k, ClientSize.Width - 28 * k, 4 * k);
+            g.FillRectangle(new SolidBrush(Color.FromArgb(92, 200, 255)), 14 * k, ClientSize.Height - 18 * k, (float)((ClientSize.Width - 28 * k) * pct), 4 * k);
+        }
+
+        void PaintCard(Graphics g)
+        {
             float k = K;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
