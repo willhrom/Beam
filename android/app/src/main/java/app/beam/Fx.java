@@ -99,14 +99,14 @@ final class Fx {
   /** The "looking for devices" ping: a ring that keeps spreading out of `ring`. */
   static ValueAnimator radar(View ring) {
     ValueAnimator a = ValueAnimator.ofFloat(0, 1);
-    a.setDuration(2200);
+    a.setDuration(2700);
     a.setRepeatCount(ValueAnimator.INFINITE);
     a.setInterpolator(new AccelerateInterpolator(0.6f));
     a.addUpdateListener(x -> {
       float f = (float) x.getAnimatedValue();
-      ring.setScaleX(0.4f + f * 1.6f);
-      ring.setScaleY(0.4f + f * 1.6f);
-      ring.setAlpha(0.8f * (1 - f));
+      ring.setScaleX(0.08f + f * 0.92f);
+      ring.setScaleY(0.08f + f * 0.92f);
+      ring.setAlpha(0.85f * (1 - f));
     });
     return a;
   }

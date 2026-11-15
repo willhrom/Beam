@@ -47,7 +47,9 @@ public class MainActivity extends Activity implements Beam.Listener {
   private final java.util.Set<String> peersSeen = new java.util.HashSet<>();
   private android.widget.FrameLayout overlay;
   private View radarBox;
-  private android.animation.ValueAnimator radarAnim, pulseAnim;
+  private LinearLayout emptyBox;
+  private android.animation.ValueAnimator pulseAnim;
+  private final List<android.animation.ValueAnimator> radarAnims = new ArrayList<>();
   private boolean updateOffered;
   private String pickFor;
   private AlertDialog incomingDialog, pairDialog;
@@ -116,7 +118,7 @@ public class MainActivity extends Activity implements Beam.Listener {
 
   @Override protected void onDestroy() {
     if (signInDialog != null) { signInDialog.dismiss(); signInDialog = null; }
-    if (radarAnim != null) radarAnim.cancel();
+    for (android.animation.ValueAnimator ra : radarAnims) ra.cancel();
     if (pulseAnim != null) pulseAnim.cancel();
     super.onDestroy();
   }
@@ -171,15 +173,32 @@ public class MainActivity extends Activity implements Beam.Listener {
     gp.gravity = Gravity.CENTER_HORIZONTAL;
     root.addView(peersGrid, gp);
 
-    // "Looking for devices": a ring keeps spreading out of a dot, like the web app's sonar.
+    // "Looking for devices": rings keep spreading out of a dot, like the web app's sonar.
+    // The sonar and its text sit in the middle of the empty space.
+    emptyBox = Ui.col(this);
+    emptyBox.setGravity(Gravity.CENTER);
     android.widget.FrameLayout rb = new android.widget.FrameLayout(this);
-    View ring = new View(this);
-    android.graphics.drawable.GradientDrawable rg = new android.graphics.drawable.GradientDrawable();
-    rg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
-    rg.setStroke(Ui.dp(this, 2), Ui.ACCENT2);
-    ring.setBackground(rg);
-    android.widget.FrameLayout.LayoutParams rlp = new android.widget.FrameLayout.LayoutParams(Ui.dp(this, 90), Ui.dp(this, 90), Gravity.CENTER);
-    rb.addView(ring, rlp);
+    for (int i = 0; i < 3; i++) {
+      View ring = new View(this);
+      android.graphics.drawable.GradientDrawable rg = new android.graphics.drawable.GradientDrawable();
+      rg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+      rg.setStroke(Ui.dp(this, 1.5f), Ui.ACCENT2);
+      ring.setBackground(rg);
+      ring.setAlpha(0f);
+      rb.addView(ring, new android.widget.FrameLayout.LayoutParams(Ui.dp(this, 220), Ui.dp(this, 220), Gravity.CENTER));
+      android.animation.ValueAnimator ra = Fx.radar(ring);
+      ra.setStartDelay(i * 900L);
+      radarAnims.add(ra);
+    }
+    // Two faint fixed rings, so the sonar reads even when it's still.
+    for (int d : new int[] { 120, 200 }) {
+      View fixed = new View(this);
+      android.graphics.drawable.GradientDrawable fg = new android.graphics.drawable.GradientDrawable();
+      fg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+      fg.setStroke(Ui.dp(this, 1), Ui.LINE);
+      fixed.setBackground(fg);
+      rb.addView(fixed, new android.widget.FrameLayout.LayoutParams(Ui.dp(this, d), Ui.dp(this, d), Gravity.CENTER));
+    }
     View dot = new View(this);
     android.graphics.drawable.GradientDrawable dg = new android.graphics.drawable.GradientDrawable();
     dg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
@@ -187,12 +206,12 @@ public class MainActivity extends Activity implements Beam.Listener {
     dot.setBackground(dg);
     rb.addView(dot, new android.widget.FrameLayout.LayoutParams(Ui.dp(this, 14), Ui.dp(this, 14), Gravity.CENTER));
     radarBox = rb;
-    radarAnim = Fx.radar(ring);
-    root.addView(rb, Ui.margins(this, -1, Ui.dp(this, 150), 0, 10, 0, 0));
+    emptyBox.addView(rb, Ui.lp(Ui.dp(this, 240), Ui.dp(this, 240)));
 
     empty = Ui.text(this, "", 14, Ui.DIM, false);
     empty.setGravity(Gravity.CENTER);
-    root.addView(empty, Ui.margins(this, -1, -2, 0, 0, 0, 30));
+    emptyBox.addView(empty, Ui.margins(this, -1, -2, 0, 12, 0, 0));
+    root.addView(emptyBox, new LinearLayout.LayoutParams(-1, 0, 1));
 
     transfers = Ui.col(this);
     root.addView(transfers, Ui.margins(this, -1, -2, 0, 16, 0, 0));
@@ -273,10 +292,13 @@ public class MainActivity extends Activity implements Beam.Listener {
       for (View v : want) { Fx.detach(v); peersGrid.addView(v); }
     }
     empty.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
+    emptyBox.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
     boolean looking = all.isEmpty() && (beam.online || beam.nearby.usable());
     radarBox.setVisibility(looking ? View.VISIBLE : View.GONE);
-    if (looking && Fx.on() && !radarAnim.isStarted()) radarAnim.start();
-    else if (!looking && radarAnim.isStarted()) radarAnim.cancel();
+    for (android.animation.ValueAnimator ra : radarAnims) {
+      if (looking && Fx.on() && !ra.isStarted()) ra.start();
+      else if (!looking && ra.isStarted()) ra.cancel();
+    }
     manyBtn.setVisibility(all.size() > 1 ? View.VISIBLE : View.GONE);
     empty.setText(beam.online || beam.nearby.usable() ? "Looking for devices…\nOpen Beam on another device on this WiFi,\nor pair one in Settings." : "");
 
