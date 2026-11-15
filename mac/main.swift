@@ -1,5 +1,5 @@
 // Beam for Mac: a menu-bar app that keeps the Beam web app running in the background,
-// so other devices can send to this Mac at any time. Files are saved straight to Downloads.
+// so other devices can send to this Mac at any time. Files are saved to Downloads, or a folder picked in Settings.
 import Cocoa
 import WebKit
 import UserNotifications
@@ -234,6 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
   var window: NSWindow!
   var web: WKWebView!
   var saves: [String: (handle: FileHandle, url: URL)] = [:]
+  var savedPaths = Set<String>()
   var activity: NSObjectProtocol?
   var online = false
   var loginItem: NSMenuItem!
@@ -512,15 +513,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     case "saveEnd":
       guard let s = saves.removeValue(forKey: id) else { return }
       try? s.handle.close()
+      savedPaths.insert(s.url.standardizedFileURL.path)
       js("beamNative.saved(\(q(id)), \(q(s.url.path)))")
     case "saveAbort":
       abortSave(id: id)
     case "reveal":
+      // Only files Beam saved itself, in Downloads or the chosen folder (past or present).
       if let p = d["path"] as? String {
-        let u = URL(fileURLWithPath: p)
-        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-        if u.standardizedFileURL.path.hasPrefix(downloads.standardizedFileURL.path) { NSWorkspace.shared.activateFileViewerSelecting([u]) }
+        let u = URL(fileURLWithPath: p).standardizedFileURL
+        if savedPaths.contains(u.path) || u.path.hasPrefix(downloadsDir().path + "/") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
       }
+    case "getSaveDir":
+      sendSaveDir()
+    case "pickSaveDir":
+      let panel = NSOpenPanel()
+      panel.canChooseDirectories = true
+      panel.canChooseFiles = false
+      panel.canCreateDirectories = true
+      panel.allowsMultipleSelection = false
+      panel.prompt = "Save Here"
+      panel.message = "Choose where Beam saves the files you receive"
+      panel.directoryURL = saveRoot()
+      NSApp.activate(ignoringOtherApps: true)
+      panel.begin { r in
+        if r == .OK, let u = panel.url {
+          let p = u.standardizedFileURL.path
+          if p == self.downloadsDir().path { UserDefaults.standard.removeObject(forKey: "saveDir") }
+          else { UserDefaults.standard.set(p, forKey: "saveDir") }
+        }
+        self.sendSaveDir()
+      }
+    case "resetSaveDir":
+      UserDefaults.standard.removeObject(forKey: "saveDir")
+      sendSaveDir()
     default:
       break
     }
@@ -533,9 +558,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     return n.isEmpty ? "file" : n
   }
 
-  /// `path` is the folder inside the transfer this file belongs to ("Trip/Day 1"), recreated under Downloads.
+  func downloadsDir() -> URL { FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0].standardizedFileURL }
+
+  /// The folder picked in Settings, or Downloads. If the picked folder is gone
+  /// (a drive that's unplugged, a folder that was deleted) files land in Downloads instead.
+  func saveRoot() -> URL {
+    if let p = UserDefaults.standard.string(forKey: "saveDir") {
+      var isDir: ObjCBool = false
+      if FileManager.default.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue, FileManager.default.isWritableFile(atPath: p) {
+        return URL(fileURLWithPath: p, isDirectory: true)
+      }
+    }
+    return downloadsDir()
+  }
+
+  func sendSaveDir() {
+    let root = saveRoot()
+    let isDefault = root.path == downloadsDir().path
+    let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+    var shown = root.path
+    if shown.hasPrefix(home + "/") { shown = "~" + shown.dropFirst(home.count) }
+    let missing = isDefault && UserDefaults.standard.string(forKey: "saveDir") != nil
+    let label = missing ? "Downloads, because the chosen folder isn't available" : isDefault ? "Downloads" : shown
+    js("beamNative.saveDir(\(q(root.path)), \(q(label)), \(isDefault && !missing))")
+  }
+
+  /// `path` is the folder inside the transfer this file belongs to ("Trip/Day 1"), recreated under the save folder.
   func startSave(id: String, name: String, path: String) {
-    let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+    let downloads = saveRoot()
     var folder = downloads
     for part in path.split(separator: "/").map(String.init).filter({ !$0.isEmpty && $0 != "." && $0 != ".." }).prefix(20) {
       folder = folder.appendingPathComponent(safeName(part))

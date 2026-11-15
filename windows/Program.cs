@@ -1,5 +1,5 @@
 // Beam for Windows: a tray app that keeps the Beam web app running in the background,
-// so other devices can send to this PC at any time. Files are saved straight to Downloads.
+// so other devices can send to this PC at any time. Files are saved to Downloads, or a folder picked in Settings.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -108,6 +108,7 @@ namespace Beam
         readonly NotifyIcon tray = new NotifyIcon();
         readonly ToolStripMenuItem startupItem = new ToolStripMenuItem("Start with Windows");
         readonly Dictionary<string, (FileStream stream, string path)> saves = new();
+        readonly HashSet<string> savedPaths = new(StringComparer.OrdinalIgnoreCase);
         readonly Uri server = new Uri(Program.Server);
         bool online, quitting, pageReady;
         public bool Busy;
@@ -555,6 +556,7 @@ namespace Beam
                     if (saves.Remove(id, out var done))
                     {
                         done.stream.Dispose();
+                        savedPaths.Add(Path.GetFullPath(done.path));
                         Js($"beamNative.saved({Q(id)}, {Q(done.path)})");
                     }
                     break;
@@ -562,9 +564,36 @@ namespace Beam
                     AbortSave(id);
                     break;
                 case "reveal":
+                    // Only files Beam saved itself, in Downloads or the chosen folder.
                     var path = Str("path");
-                    if (path != null && File.Exists(path) && Path.GetFullPath(path).StartsWith(Downloads(), StringComparison.OrdinalIgnoreCase))
-                        Process.Start("explorer.exe", $"/select,\"{path}\"");
+                    if (path != null && File.Exists(path) && (savedPaths.Contains(Path.GetFullPath(path)) || Path.GetFullPath(path).StartsWith(Downloads() + "\\", StringComparison.OrdinalIgnoreCase)))
+                        Process.Start("explorer.exe", $"/select,\"{Path.GetFullPath(path)}\"");
+                    break;
+                case "getSaveDir":
+                    SendSaveDir();
+                    break;
+                case "pickSaveDir":
+                    using (var dlg = new FolderBrowserDialog
+                    {
+                        Description = "Choose where Beam saves the files you receive",
+                        UseDescriptionForTitle = true,
+                        ShowNewFolderButton = true,
+                        InitialDirectory = SaveRoot(),
+                    })
+                    {
+                        if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
+                        {
+                            var picked = NormDir(dlg.SelectedPath);
+                            using var k = Registry.CurrentUser.CreateSubKey(@"Software\Beam");
+                            if (string.Equals(picked, Downloads(), StringComparison.OrdinalIgnoreCase)) k.DeleteValue("saveDir", false);
+                            else k.SetValue("saveDir", picked);
+                        }
+                    }
+                    SendSaveDir();
+                    break;
+                case "resetSaveDir":
+                    using (var k = Registry.CurrentUser.CreateSubKey(@"Software\Beam")) k.DeleteValue("saveDir", false);
+                    SendSaveDir();
                     break;
             }
         }
@@ -580,6 +609,43 @@ namespace Beam
             return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
         }
 
+        /// Full path without a trailing slash, except for a drive root ("D:\\") which needs it.
+        static string NormDir(string p)
+        {
+            var full = Path.GetFullPath(p);
+            var root = Path.GetPathRoot(full);
+            return string.Equals(full, root, StringComparison.OrdinalIgnoreCase) ? full : full.TrimEnd('\\');
+        }
+
+        static string ChosenSaveDir()
+        {
+            try { using var k = Registry.CurrentUser.OpenSubKey(@"Software\Beam"); return k?.GetValue("saveDir") as string; }
+            catch { return null; }
+        }
+
+        /// The folder picked in Settings, or Downloads. If the picked folder is gone
+        /// (an unplugged drive, a deleted folder) files land in Downloads instead.
+        static string SaveRoot()
+        {
+            var p = ChosenSaveDir();
+            if (!string.IsNullOrEmpty(p))
+            {
+                try { if (Directory.Exists(p)) return NormDir(p); } catch { }
+            }
+            return Downloads();
+        }
+
+        void SendSaveDir()
+        {
+            var root = SaveRoot();
+            var isDefault = string.Equals(root, Downloads(), StringComparison.OrdinalIgnoreCase);
+            var missing = isDefault && !string.IsNullOrEmpty(ChosenSaveDir());
+            var home = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)).TrimEnd('\\');
+            var shown = root.StartsWith(home + "\\", StringComparison.OrdinalIgnoreCase) ? root.Substring(home.Length + 1) : root;
+            var label = missing ? "Downloads, because the chosen folder isn't available" : isDefault ? "Downloads" : shown;
+            Js($"beamNative.saveDir({Q(root)}, {Q(label)}, {(isDefault && !missing ? "true" : "false")})");
+        }
+
         static string SafeName(string s)
         {
             var safe = Path.GetFileName(s ?? "");
@@ -588,17 +654,18 @@ namespace Beam
             return safe.Length == 0 ? "file" : safe;
         }
 
-        /// <param name="relPath">The folder inside the transfer this file belongs to ("Trip\Day 1"), recreated under Downloads.</param>
+        /// <param name="relPath">The folder inside the transfer this file belongs to ("Trip\Day 1"), recreated under the save folder.</param>
         void StartSave(string id, string name, string relPath)
         {
             var safe = SafeName(name);
-            var dir = Downloads();
+            var root = SaveRoot();
+            var dir = root;
             foreach (var part in (relPath ?? "").Split('/', '\\'))
             {
                 if (part.Length == 0 || part == "." || part == "..") continue;
                 dir = Path.Combine(dir, SafeName(part));
             }
-            if (!Path.GetFullPath(dir).StartsWith(Downloads(), StringComparison.OrdinalIgnoreCase)) dir = Downloads();
+            if (!Path.GetFullPath(dir).StartsWith(root, StringComparison.OrdinalIgnoreCase)) dir = root;
             Directory.CreateDirectory(dir);
             var baseName = Path.GetFileNameWithoutExtension(safe);
             var ext = Path.GetExtension(safe);

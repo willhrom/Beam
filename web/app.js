@@ -704,6 +704,12 @@ function notify(tag, title, body, actions) {
   }
 }
 window.beamNative = {
+  // Mac and Windows apps: where received files go (the folder picker lives in the app).
+  saveDir(path, name, isDefault) {
+    const before = S.saveDir;
+    S.saveDir = { path, name, isDefault: !!isDefault };
+    if (!$("#sheet").hidden && $("#sdPick") && (!before || before.path !== path || before.isDefault !== !!isDefault)) { saveSettings(); sheetOnClose = null; showSettings(); }
+  },
   // Mac app: files from Finder (Services menu, Open With, or dropped on the menu bar icon)
   share(list) { shareFromDesktop((list || []).map(macFile)); },
   action(tag, act) {
@@ -716,9 +722,10 @@ window.beamNative = {
     for (const t of S.tx.values()) for (const r of t.received) if (r.nid === id) { r.path = path; renderTx(t); }
   },
   saveFailed(id) {
-    for (const t of S.tx.values()) if (t.dir === "in" && id.startsWith(t.tid + ":")) fail(t, "Couldn't save to Downloads");
+    for (const t of S.tx.values()) if (t.dir === "in" && id.startsWith(t.tid + ":")) fail(t, "Couldn't save to " + (S.saveDir ? S.saveDir.name : "Downloads") + ". Check the folder in Settings");
   },
 };
+if (native) native.postMessage({ op: "getSaveDir" });
 // Windows app: files from Explorer arrive as real file handles, so the browser reads them directly.
 if (nativeKind === "windows") {
   window.chrome.webview.addEventListener("message", async (e) => {
@@ -1262,6 +1269,7 @@ function showSettings() {
     <label class="opt"><span>Everyone nearby can see me<small>When off, only your own and paired devices can</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
     <label class="opt"><span>Auto-accept from my devices<small>What they send arrives without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>
     ${!native && "Notification" in window && Notification.permission !== "granted" ? '<label class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></label>' : ""}
+    ${native ? `<div class="opt"><span>Save received files to<small id="sdName">${esc(S.saveDir ? S.saveDir.name : "Downloads")}</small></span><span class="row-btns">${S.saveDir && !S.saveDir.isDefault ? '<button class="btn ghost small" id="sdReset">Use Downloads</button>' : ""}<button class="btn ghost small" id="sdPick">Choose…</button></span></div>` : ""}
     ${canSaveToDisk ? `<label class="opt"><span>Save received files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Your Downloads folder. Big transfers ask where to save"}</small></span><button class="btn ghost small" id="sf">Choose…</button></label>` : ""}
     <p><small>Device code ${shortId(Id.id)}</small></p>
     <h3>Account</h3>
@@ -1279,6 +1287,9 @@ function showSettings() {
   $("#sout").onclick = () => { if (confirm("Sign out of Beam on this device?")) { sheetOnClose = null; closeSheet(); wsSend({ t: "logout" }); } };
   $("#pShow").onclick = () => { saveSettings(); S.pairing = { mode: "show" }; wsSend({ t: "pair-code" }); showPairShow(); };
   $("#pJoin").onclick = () => { saveSettings(); S.pairing = { mode: "join" }; showPairJoin(); };
+  if ($("#sdPick")) $("#sdPick").onclick = () => native.postMessage({ op: "pickSaveDir" });
+  if ($("#sdReset")) $("#sdReset").onclick = () => native.postMessage({ op: "resetSaveDir" });
+  if (native) native.postMessage({ op: "getSaveDir" });
   const sf = $("#sf");
   if (sf) sf.onclick = () => pickFolder().then(() => { saveSettings(); sheetOnClose = null; showSettings(); }).catch(() => {});
   const nt = $("#nt");
