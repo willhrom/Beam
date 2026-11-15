@@ -1259,12 +1259,102 @@ const FX = {
     el.classList.add(cls);
     setTimeout(() => el.classList.remove(cls), ms);
   },
+  // Sending starts: a little file card arcs from you to the device, which catches it.
+  launch(t) {
+    if (this.calm() || document.hidden) return;
+    const from = this.you(), to = this.peerAvatar(t.peer.id);
+    const a = this.center(from), b = this.center(to);
+    if (!a || !b) return;
+    const card = document.createElement("div");
+    card.className = "flycard";
+    const files = t.items.filter((i) => !i.text);
+    card.innerHTML = files.length > 1 ? `<span>${files.length}</span>` : t.items.some((i) => i.text) && !files.length ? "<span>Aa</span>" : "";
+    this.layer().appendChild(card);
+    const bend = -Math.min(160, Math.hypot(b.x - a.x, b.y - a.y) * 0.5);
+    const frames = [];
+    for (let i = 0; i <= 20; i++) {
+      const k = i / 20, u = 1 - k;
+      const mx = (a.x + b.x) / 2 + bend * 0.6, my = (a.y + b.y) / 2;
+      const x = u * u * a.x + 2 * u * k * mx + k * k * b.x, y = u * u * a.y + 2 * u * k * my + k * k * b.y;
+      frames.push({ transform: `translate(${x}px, ${y}px) rotate(${-25 + k * 385}deg) scale(${0.5 + Math.sin(k * Math.PI) * 0.8 - k * 0.3})`, opacity: k > 0.92 ? (1 - k) / 0.08 : 1 });
+      if (i % 3 === 0 && i > 0 && i < 20) setTimeout(() => this.trail(x, y), 650 * k);
+    }
+    card.animate(frames, { duration: 650, easing: "cubic-bezier(.5,0,.4,1)" }).onfinish = () => {
+      card.remove();
+      this.pulse(to, "caught", 600);
+      this.burst(to, { n: 8, size: 34, colors: ["#5cc8ff", "#ffffff"] });
+    };
+  },
+  trail(x, y) {
+    const d = document.createElement("i");
+    d.className = "spark";
+    this.layer().appendChild(d);
+    d.animate([{ transform: `translate(${x}px, ${y}px) scale(.9)`, opacity: .8 }, { transform: `translate(${x}px, ${y + 14}px) scale(.1)`, opacity: 0 }], { duration: 500, easing: "ease-out" }).onfinish = () => d.remove();
+  },
+  // A glowing beam between you and the other device, flowing the way the data goes.
+  beam(t) {
+    if (this.calm()) return;
+    let svg = document.getElementById("fxBeam");
+    if (!svg) {
+      svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.id = "fxBeam";
+      svg.setAttribute("aria-hidden", "true");
+      document.body.appendChild(svg);
+    }
+    let path = svg.querySelector(`[data-tid="${t.tid}"]`);
+    const a = this.center(this.you()), b = this.center(this.peerAvatar(t.peer.id));
+    if (!a || !b) { if (path) path.remove(); return; }
+    if (!path) {
+      path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.dataset.tid = t.tid;
+      path.setAttribute("class", "beamline " + t.dir);
+      svg.appendChild(path);
+    }
+    const [p, q] = t.dir === "out" ? [a, b] : [b, a];
+    const mx = (p.x + q.x) / 2 + (q.y - p.y) * 0.12, my = (p.y + q.y) / 2 - (q.x - p.x) * 0.12;
+    path.setAttribute("d", `M${p.x},${p.y} Q${mx},${my} ${q.x},${q.y}`);
+  },
+  unbeam(t) { const el = document.querySelector(`#fxBeam [data-tid="${t.tid}"]`); if (el) el.remove(); },
+  // A big finish for things you receive: confetti falls from the top of the window.
+  confetti(n = 46) {
+    if (this.calm() || document.hidden) return;
+    const colors = ["#5cc8ff", "#4ade9a", "#ffffff", "#2f6bff", "#ffd166", "#ff8fab"];
+    const w = window.innerWidth, h = window.innerHeight;
+    for (let i = 0; i < n; i++) {
+      const p = document.createElement("i");
+      p.className = "bit confetti" + (i % 4 === 0 ? " long" : "");
+      p.style.background = colors[i % colors.length];
+      this.layer().appendChild(p);
+      const x = Math.random() * w, drift = (Math.random() - 0.5) * 160, spin = (Math.random() - 0.5) * 900;
+      p.animate([
+        { transform: `translate(${x}px, -20px) rotate(0deg)`, opacity: 1 },
+        { transform: `translate(${x + drift * 0.5}px, ${h * 0.5}px) rotate(${spin * 0.5}deg)`, opacity: 1, offset: 0.55 },
+        { transform: `translate(${x + drift}px, ${h + 20}px) rotate(${spin}deg)`, opacity: 0.2 },
+      ], { duration: 1600 + Math.random() * 1200, delay: Math.random() * 300, easing: "cubic-bezier(.25,.6,.5,1)" }).onfinish = () => p.remove();
+    }
+  },
+  // A check mark floats up out of the device you sent to.
+  rise(el, text) {
+    if (this.calm() || document.hidden) return;
+    const c = this.center(el);
+    if (!c) return;
+    const d = document.createElement("div");
+    d.className = "rise";
+    d.textContent = text;
+    this.layer().appendChild(d);
+    d.animate([
+      { transform: `translate(${c.x}px, ${c.y - 10}px) translate(-50%, -50%) scale(.4)`, opacity: 0 },
+      { transform: `translate(${c.x}px, ${c.y - 44}px) translate(-50%, -50%) scale(1.1)`, opacity: 1, offset: 0.35 },
+      { transform: `translate(${c.x}px, ${c.y - 70}px) translate(-50%, -50%) scale(1)`, opacity: 0 },
+    ], { duration: 1300, easing: "cubic-bezier(.2,.8,.3,1)" }).onfinish = () => d.remove();
+  },
   // While a transfer moves, sparks stream along the beam between you and the other device.
   stream(t) {
     if (t.fxTimer || this.calm()) return;
     const tick = () => {
       if (!S.tx.has(t.tid) || !["sending", "receiving"].includes(t.state)) return this.stop(t);
       const peer = this.peerAvatar(t.peer.id), you = this.you();
+      this.beam(t);
       if (!peer || !you) return;
       if (t.dir === "out") this.spark(you, peer, { ms: 760 });
       else this.spark(peer, you, { ms: 760 });
@@ -1272,7 +1362,7 @@ const FX = {
     tick();
     t.fxTimer = setInterval(tick, 420);
   },
-  stop(t) { if (t.fxTimer) { clearInterval(t.fxTimer); t.fxTimer = 0; } },
+  stop(t) { if (t.fxTimer) { clearInterval(t.fxTimer); t.fxTimer = 0; } this.unbeam(t); },
   // Called on every transfer redraw: reacts only when the state changes.
   onTx(t, el) {
     const prev = t.fxState;
@@ -1281,12 +1371,19 @@ const FX = {
     const moving = t.state === "sending" || t.state === "receiving";
     if (moving) this.stream(t); else this.stop(t);
     if (!prev) this.pulse(el, "enter", 600);
+    // You hit send: the file flies to the device.
+    if (!prev && t.dir === "out") setTimeout(() => this.launch(t), 30);
+    // Someone wants to send you something: their device knocks.
+    const peerEl = this.peerAvatar(t.peer.id);
+    if (peerEl) peerEl.classList.toggle("knock", t.state === "asking");
     if (t.state === "done" && prev !== "done") {
       const peer = this.peerAvatar(t.peer.id);
       const target = t.dir === "out" ? peer : el.querySelector(".tx-ico");
       if (peer) this.pulse(peer, "landed", 1100);
       this.pulse(el.querySelector(".tx-ico"), "pop", 700);
       setTimeout(() => this.burst(target || el.querySelector(".tx-ico"), { n: t.dir === "in" ? 18 : 12, size: t.dir === "in" ? 64 : 50 }), 60);
+      if (t.dir === "in") this.confetti();
+      else if (peer) this.rise(peer, "Sent");
     }
     if (t.state === "failed" && prev && prev !== "asking") this.pulse(el, "shake", 600);
   },

@@ -296,8 +296,26 @@ textarea { height: auto; min-height: 110px; padding: 10px 12px; resize: vertical
 .toggle:checked:active::after { transform: translateX(14px); }
 .sheet .card { animation: up .32s cubic-bezier(.22, 1.2, .36, 1); }
 
+#fx .flycard { position: absolute; left: -15px; top: -19px; width: 30px; height: 38px; border-radius: 6px; background: linear-gradient(160deg, #fff, #cfe9ff);
+  box-shadow: 0 0 0 1px rgba(92, 200, 255, .6), 0 0 18px 4px rgba(92, 200, 255, .55); display: grid; place-items: center; will-change: transform; }
+#fx .flycard::before { content: ""; position: absolute; right: 0; top: 0; width: 10px; height: 10px; background: linear-gradient(225deg, var(--night) 50%, #9fd3f5 50%); border-radius: 0 6px 0 2px; }
+#fx .flycard span { font-size: 12px; font-weight: 700; color: var(--beam); }
+#fx .rise { position: absolute; left: 0; top: 0; padding: 4px 10px; border-radius: 999px; background: var(--good); color: #062417; font-weight: 700; font-size: 13px; box-shadow: 0 6px 18px rgba(74, 222, 154, .35); }
+#fx .confetti { width: 7px; height: 11px; left: 0; top: 0; border-radius: 1.5px; }
+#fx .confetti.long { width: 4px; height: 15px; }
+#fxBeam { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; overflow: visible; }
+#fxBeam .beamline { fill: none; stroke: var(--signal); stroke-width: 2.5; stroke-linecap: round; stroke-dasharray: 2 12; opacity: .75;
+  filter: drop-shadow(0 0 4px rgba(92, 200, 255, .8)); animation: flow .6s linear infinite; }
+@keyframes flow { to { stroke-dashoffset: -14; } }
+.avatar.caught { animation: caught .55s cubic-bezier(.34, 1.56, .64, 1); }
+@keyframes caught { 0% { transform: scale(1); } 30% { transform: scale(.86, .94) translateY(3px); } 70% { transform: scale(1.12); } 100% { transform: scale(1); } }
+.avatar.knock { animation: knock 1.6s ease-in-out infinite; border-color: var(--signal); box-shadow: 0 0 0 6px rgba(92, 200, 255, .16); }
+@keyframes knock { 0%, 55%, 100% { transform: rotate(0); } 62% { transform: rotate(-9deg); } 70% { transform: rotate(8deg); } 78% { transform: rotate(-6deg); } 86% { transform: rotate(4deg); } }
+
 @media (prefers-reduced-motion: reduce) {
   .peer { animation: none; }
+  #fxBeam, .avatar.caught, .avatar.knock { animation: none !important; }
+  #fxBeam { display: none; }
   .you-dot, .avatar.ping::after, .avatar.tapped, .avatar.landed, .avatar.landed::after, .tx.enter, .tx-ico.pop, .tx.shake, .stage.drop .you-dot i,
   .tx.sending .bar i, .tx.receiving .bar i, .sheet .card { animation: none !important; }
   #fx { display: none; }

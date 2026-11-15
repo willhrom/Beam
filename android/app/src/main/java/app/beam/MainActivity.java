@@ -50,6 +50,8 @@ public class MainActivity extends Activity implements Beam.Listener {
   private LinearLayout emptyBox;
   private android.animation.ValueAnimator pulseAnim;
   private final List<android.animation.ValueAnimator> radarAnims = new ArrayList<>();
+  private final java.util.Map<String, View[]> orbits = new java.util.HashMap<>();
+  private final java.util.Map<String, android.animation.ValueAnimator> knocks = new java.util.HashMap<>();
   private boolean updateOffered;
   private String pickFor;
   private AlertDialog incomingDialog, pairDialog;
@@ -232,13 +234,19 @@ public class MainActivity extends Activity implements Beam.Listener {
     pulseAnim.setRepeatMode(android.animation.ValueAnimator.REVERSE);
     pulseAnim.addUpdateListener(a -> {
       float f = (float) a.getAnimatedValue();
+      float phase = (android.os.SystemClock.uptimeMillis() % 1400) / 1400f;
       for (Transfer t : beam.tx.values()) {
         if (!(Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state))) continue;
         LinearLayout b = bubbles.get(t.peerId);
-        if (b == null || b.getChildCount() == 0) continue;
-        View circle = b.getChildAt(0);
-        circle.setScaleX(1f + 0.07f * f);
-        circle.setScaleY(1f + 0.07f * f);
+        View circle = b != null && b.getChildCount() > 0 ? b.getChildAt(0) : null;
+        if (circle != null) {
+          circle.setScaleX(1f + 0.07f * f);
+          circle.setScaleY(1f + 0.07f * f);
+        }
+        // Two dots circle the device while data flows (clockwise out, the other way in).
+        View[] dots = orbits.get(t.tid);
+        if (dots == null) { dots = new View[] { Fx.dot(overlay), Fx.dot(overlay) }; orbits.put(t.tid, dots); }
+        Fx.orbit(overlay, circle, dots, phase, t.incoming);
       }
     });
   }
@@ -327,17 +335,37 @@ public class MainActivity extends Activity implements Beam.Listener {
 
       // React to state changes.
       String prev = txSeen.put(t.tid, t.state);
-      if (prev == null) Fx.slideIn(c);
-      else if (!prev.equals(t.state)) {
+      LinearLayout pb = bubbles.get(t.peerId);
+      final View circle = pb != null && pb.getChildCount() > 0 ? pb.getChildAt(0) : null;
+      if (prev == null) {
+        Fx.slideIn(c);
+        // You hit send: the file flies up to the device.
+        if (!t.incoming) {
+          int files = 0;
+          for (Transfer.Item it : t.items) if (!it.text) files++;
+          final int nFiles = files;
+          beam.main.postDelayed(() -> Fx.launch(overlay, circle, nFiles, null), 40);
+        }
+      }
+      // Someone wants to send you something: their device wiggles until you answer.
+      boolean asking = Transfer.ASKING.equals(t.state) && circle != null && Fx.on();
+      android.animation.ValueAnimator kn = knocks.get(t.tid);
+      if (asking && kn == null) { kn = Fx.knock(circle); knocks.put(t.tid, kn); kn.start(); }
+      else if (!asking && kn != null) { kn.cancel(); knocks.remove(t.tid); }
+      if (prev != null && !prev.equals(t.state)) {
+        if (!(Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state))) {
+          View[] dots = orbits.remove(t.tid);
+          if (dots != null) for (View d : dots) overlay.removeView(d);
+        }
         if (Transfer.DONE.equals(t.state)) {
-          LinearLayout b = bubbles.get(t.peerId);
-          View circle = b != null && b.getChildCount() > 0 ? b.getChildAt(0) : null;
           Fx.bounce(circle);
           View badge = c.findViewWithTag("badge");
           Fx.bounce(badge);
           final View target = t.incoming || circle == null ? badge : circle;
           final int n = t.incoming ? 18 : 12;
           beam.main.postDelayed(() -> Fx.burst(overlay, target, n), 60);
+          if (t.incoming) beam.main.postDelayed(() -> Fx.confetti(overlay, 46), 120);
+          else beam.main.postDelayed(() -> Fx.rise(overlay, circle, "Sent"), 120);
         } else if (Transfer.FAILED.equals(t.state) && !Transfer.ASKING.equals(prev)) {
           Fx.shake(c);
         }
@@ -347,6 +375,14 @@ public class MainActivity extends Activity implements Beam.Listener {
     cardKeys.keySet().retainAll(tids);
     bars.keySet().retainAll(tids);
     txSeen.keySet().retainAll(tids);
+    for (java.util.Iterator<java.util.Map.Entry<String, View[]>> it = orbits.entrySet().iterator(); it.hasNext(); ) {
+      java.util.Map.Entry<String, View[]> e = it.next();
+      if (!tids.contains(e.getKey())) { for (View d : e.getValue()) overlay.removeView(d); it.remove(); }
+    }
+    for (java.util.Iterator<java.util.Map.Entry<String, android.animation.ValueAnimator>> it = knocks.entrySet().iterator(); it.hasNext(); ) {
+      java.util.Map.Entry<String, android.animation.ValueAnimator> e = it.next();
+      if (!tids.contains(e.getKey())) { e.getValue().cancel(); it.remove(); }
+    }
     if (!sameChildren(transfers, wantCards)) {
       transfers.removeAllViews();
       for (View v : wantCards) { Fx.detach(v); transfers.addView(v, Ui.margins(this, -1, -2, 0, 0, 0, 10)); }
@@ -354,6 +390,8 @@ public class MainActivity extends Activity implements Beam.Listener {
     if (anyMoving && Fx.on() && !pulseAnim.isStarted()) pulseAnim.start();
     else if (!anyMoving && pulseAnim.isStarted()) {
       pulseAnim.cancel();
+      for (View[] dots : orbits.values()) for (View d : dots) overlay.removeView(d);
+      orbits.clear();
       for (LinearLayout b : bubbles.values()) if (b.getChildCount() > 0) { b.getChildAt(0).setScaleX(1f); b.getChildAt(0).setScaleY(1f); }
     }
   }
