@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Download Beam</title>
+<meta name="description" content="Beam sends files, photos, text and links between your devices, like AirDrop. Download it for Android, Windows and Mac.">
+<meta name="theme-color" content="#0f1626">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+@font-face { font-family: "Instrument Sans"; src: url("fonts/instrument-sans.woff2") format("woff2"); font-weight: 400 700; font-display: swap; }
+:root {
+  --night: #0f1626; --raised: #172136; --raised-2: #1f2c47; --line: #2a3752;
+  --paper: #edf2fa; --dim: #93a1b8; --beam: #2f6bff; --beam-hover: #4a80ff; --signal: #5cc8ff;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--night); color: var(--paper);
+  font: 16px/1.55 "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--signal); }
+.wrap { width: min(1040px, 100% - 40px); margin: 0 auto; }
+
+/* ----- top ----- */
+header { padding: 22px 0; }
+.brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 650; font-size: 18px; color: var(--paper); text-decoration: none; }
+.brand img { width: 30px; height: 30px; border-radius: 8px; }
+
+/* ----- hero ----- */
+.hero { display: grid; grid-template-columns: 1.1fr .9fr; gap: 40px; align-items: center; padding: 40px 0 64px; }
+h1 { font-size: clamp(38px, 6vw, 60px); line-height: 1.02; letter-spacing: -0.035em; font-weight: 650; margin: 0 0 18px; max-width: 12ch; }
+.lede { color: var(--dim); font-size: 18px; max-width: 46ch; margin: 0 0 30px; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px; height: 50px; padding: 0 22px;
+  border-radius: 12px; font: inherit; font-weight: 600; font-size: 16px; text-decoration: none; cursor: pointer;
+  border: 1px solid transparent; transition: background .15s, border-color .15s;
+}
+.btn svg { width: 20px; height: 20px; flex: none; }
+.btn.primary { background: var(--beam); color: #fff; }
+.btn.primary:hover { background: var(--beam-hover); }
+.btn.quiet { background: transparent; color: var(--paper); border-color: var(--line); }
+.btn.quiet:hover { background: var(--raised-2); }
+.btn:focus-visible, summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 3px; }
+.meta { color: var(--dim); font-size: 13.5px; margin-top: 14px; min-height: 1.5em; }
+
+/* The beam: rings spreading from the icon, like the app's own sonar screen. */
+.sonar { position: relative; aspect-ratio: 1; width: min(100%, 420px); justify-self: center; display: grid; place-items: center; }
+.sonar i { position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--signal); opacity: 0; animation: ring 4.8s cubic-bezier(.2,.6,.3,1) infinite; }
+.sonar i:nth-child(2) { animation-delay: 1.6s; }
+.sonar i:nth-child(3) { animation-delay: 3.2s; }
+.sonar .fixed { position: absolute; border-radius: 50%; border: 1px solid var(--line); }
+.sonar .f1 { inset: 18%; } .sonar .f2 { inset: 34%; }
+.sonar img { width: 26%; border-radius: 24%; position: relative; box-shadow: 0 0 0 10px rgba(92, 200, 255, .07), 0 20px 50px rgba(47, 107, 255, .35); }
+@keyframes ring { 0% { transform: scale(.28); opacity: .75; } 100% { transform: scale(1); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .sonar i { animation: none; opacity: .25; } .sonar i:nth-child(2) { transform: scale(.66); } .sonar i:nth-child(3) { transform: scale(.45); } }
+
+/* ----- downloads ----- */
+h2 { font-size: 26px; letter-spacing: -0.02em; font-weight: 650; margin: 0 0 6px; }
+.section-note { color: var(--dim); margin: 0 0 22px; }
+.platforms { border-top: 1px solid var(--line); }
+.platform { display: grid; grid-template-columns: 52px 1fr auto; gap: 18px; align-items: start; padding: 24px 0; border-bottom: 1px solid var(--line); }
+.platform.here { position: relative; }
+.platform.here::before { content: ""; position: absolute; left: -20px; top: 24px; bottom: 24px; width: 3px; border-radius: 2px; background: var(--signal); }
+.pico { width: 52px; height: 52px; border-radius: 14px; background: var(--raised); border: 1px solid var(--line); display: grid; place-items: center; color: var(--signal); }
+.pico svg { width: 26px; height: 26px; }
+.platform h3 { margin: 2px 0 2px; font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
+.platform h3 small { font-size: 13px; font-weight: 500; color: var(--signal); margin-left: 8px; letter-spacing: 0; }
+.platform p { margin: 0; color: var(--dim); max-width: 60ch; }
+.platform .facts { font-size: 13.5px; margin-top: 6px; }
+.platform .btn { height: 44px; font-size: 15px; }
+details { margin-top: 12px; max-width: 62ch; }
+summary { cursor: pointer; color: var(--paper); font-weight: 600; font-size: 14.5px; list-style: none; display: inline-flex; align-items: center; gap: 6px; border-radius: 6px; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: ""; width: 7px; height: 7px; border-right: 2px solid var(--dim); border-bottom: 2px solid var(--dim); transform: rotate(-45deg); transition: transform .15s; margin-right: 4px; }
+details[open] summary::before { transform: rotate(45deg); }
+ol { margin: 12px 0 0; padding-left: 22px; color: var(--dim); }
+ol li { margin: 6px 0; padding-left: 4px; }
+ol li b { color: var(--paper); font-weight: 600; }
+
+/* ----- why ----- */
+.points { display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px; padding: 64px 0 24px; }
+.points h3 { font-size: 17px; margin: 0 0 6px; font-weight: 650; }
+.points p { margin: 0; color: var(--dim); }
+
+footer { padding: 40px 0 56px; color: var(--dim); font-size: 13.5px; }
+
+@media (max-width: 760px) {
+  .hero { grid-template-columns: 1fr; padding: 16px 0 48px; gap: 8px; }
+  .sonar { order: -1; width: min(70%, 260px); }
+  .platform { grid-template-columns: 44px 1fr; }
+  .pico { width: 44px; height: 44px; border-radius: 12px; }
+  .platform .get { grid-column: 2; }
+  .platform.here::before { left: -12px; }
+  .points { grid-template-columns: 1fr; gap: 22px; padding-top: 48px; }
+}
+</style>
+</head>
+<body>
+<header class="wrap"><a class="brand" href="./"><img src="icon.svg" alt="">Beam</a></header>
+
+<main class="wrap">
+  <section class="hero">
+    <div>
+      <h1>Send anything between your devices.</h1>
+      <p class="lede">Photos, videos, files, folders, text and links go straight from one device to another, encrypted the whole way. Like AirDrop, but on Android, Windows and Mac too.</p>
+      <div class="cta">
+        <a class="btn primary" id="mainBtn" href="#downloads">Choose your device</a>
+        <a class="btn quiet" id="otherBtn" href="#downloads" hidden>Other devices</a>
+      </div>
+      <div class="meta" id="mainMeta"></div>
+    </div>
+    <div class="sonar" aria-hidden="true">
+      <span class="fixed f1"></span><span class="fixed f2"></span>
+      <i></i><i></i><i></i>
+      <img src="icon.svg" alt="">
+    </div>
+  </section>
+
+  <section id="downloads">
+    <h2>Downloads</h2>
+    <p class="section-note">Each app keeps itself up to date after you install it. You'll need a Beam account; ask your Beam admin for an invite code.</p>
+
+    <div class="platforms">
+      <article class="platform" data-os="android">
+        <span class="pico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M10.5 18.5h3"/></svg></span>
+        <div>
+          <h3>Android</h3>
+          <p>Runs in the background, shows up in the share sheet, and sends phone to phone over Bluetooth and Wi-Fi when there's no internet.</p>
+          <p class="facts" data-facts="android">Android 10 or newer</p>
+          <details>
+            <summary>How to install</summary>
+            <ol>
+              <li>Tap <b>Download for Android</b> on your phone.</li>
+              <li>Open the downloaded file. If Android asks, allow your browser to <b>install unknown apps</b>, then go back.</li>
+              <li>Tap <b>Install</b>, open Beam and sign in.</li>
+              <li>Allow notifications so Beam can ask before accepting files.</li>
+            </ol>
+          </details>
+        </div>
+        <a class="btn primary get" href="https://github.com/willhrom/Beam/releases/download/android/beam.apk">Download for Android</a>
+      </article>
+
+      <article class="platform" data-os="windows">
+        <span class="pico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M3 5.5l7.5-1v7H3zM12.5 4.2L21 3v8.5h-8.5zM3 12.5h7.5v7L3 18.5zM12.5 12.5H21V21l-8.5-1.2z"/></svg></span>
+        <div>
+          <h3>Windows</h3>
+          <p>Lives in the system tray, starts with Windows, and adds Beam to the Share window and the right-click menu. Converts iPhone photos and videos so they open on your PC.</p>
+          <p class="facts" data-facts="windows">Windows 10 or 11</p>
+          <details>
+            <summary>How to install</summary>
+            <ol>
+              <li>Download <b>Beam.exe</b> and open it.</li>
+              <li>If Windows shows <b>"Windows protected your PC"</b>, click <b>More info</b>, then <b>Run anyway</b>.</li>
+              <li>Beam installs itself and opens. Sign in.</li>
+              <li>To add Beam to the Share window, click <b>Yes</b> when Windows asks for permission once.</li>
+            </ol>
+          </details>
+        </div>
+        <a class="btn primary get" href="https://github.com/willhrom/Beam/releases/download/windows/Beam.exe">Download for Windows</a>
+      </article>
+
+      <article class="platform" data-os="mac">
+        <span class="pico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12.5" rx="2"/><path d="M8 20.5h8M12 16.5v4"/></svg></span>
+        <div>
+          <h3>Mac</h3>
+          <p>Lives in the menu bar and stays reachable in the background. Adds "Send with Beam" to Finder's right-click menu.</p>
+          <p class="facts" data-facts="mac">macOS 13 or newer</p>
+          <details>
+            <summary>How to install</summary>
+            <ol>
+              <li>Download <b>Beam-mac.zip</b> and open it to unzip.</li>
+              <li>Drag <b>Beam</b> into your <b>Applications</b> folder.</li>
+              <li>Right-click Beam and choose <b>Open</b>. If macOS still blocks it, go to <b>System Settings → Privacy &amp; Security</b> and click <b>Open Anyway</b>.</li>
+              <li>Sign in. Beam appears in the menu bar at the top of the screen.</li>
+            </ol>
+          </details>
+        </div>
+        <a class="btn primary get" href="https://github.com/willhrom/Beam/releases/download/mac/Beam-mac.zip">Download for Mac</a>
+      </article>
+
+      <article class="platform" data-os="ios">
+        <span class="pico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-5.7-3.8-9S9.5 5.7 12 3z"/></svg></span>
+        <div>
+          <h3>iPhone, iPad and everything else</h3>
+          <p>Use Beam in the browser: no install needed. Ask your Beam admin for the web address, open it in Safari, then tap <b>Share → Add to Home Screen</b> to keep it like an app.</p>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <section class="points">
+    <div>
+      <h3>Private by design</h3>
+      <p>Files go directly between devices over an encrypted connection. Beam's server only introduces devices and never sees what you send.</p>
+    </div>
+    <div>
+      <h3>Any size, any amount</h3>
+      <p>Send huge videos, whole folders or thousands of photos at once. If the connection drops, Beam picks up where it left off.</p>
+    </div>
+    <div>
+      <h3>Only your people</h3>
+      <p>Beam is invite-only. Your own devices find each other anywhere, and nothing arrives without your OK unless it's from your own devices.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap">Beam is a private project. Downloads come straight from this repository's releases.</footer>
+
+<script>
+(function () {
+  var ua = navigator.userAgent, plat = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+  var os = /Android/i.test(ua) ? "android"
+    : /iPhone|iPad|iPod/.test(ua) || (/Mac/.test(plat) && navigator.maxTouchPoints > 1) ? "ios"
+    : /Win/i.test(plat) || /Windows/.test(ua) ? "windows"
+    : /Mac/i.test(plat) ? "mac" : null;
+  var names = { android: "Android", windows: "Windows", mac: "Mac" };
+  var links = {};
+  document.querySelectorAll(".platform").forEach(function (el) {
+    var a = el.querySelector(".get");
+    if (a) links[el.dataset.os] = a.href;
+    if (el.dataset.os === os) {
+      el.classList.add("here");
+      var h = el.querySelector("h3");
+      var tag = document.createElement("small");
+      tag.textContent = "This device";
+      h.appendChild(tag);
+      el.parentNode.insertBefore(el, el.parentNode.firstChild);
+    }
+  });
+  var main = document.getElementById("mainBtn"), other = document.getElementById("otherBtn");
+  if (os && links[os]) {
+    main.textContent = "Download for " + names[os];
+    main.href = links[os];
+    other.hidden = false;
+  } else if (os === "ios") {
+    main.textContent = "How to use Beam on iPhone";
+    main.href = "#downloads";
+  }
+
+  // Size and last update for each download, from GitHub's public release list.
+  var fmt = function (n) { return n >= 1048576 ? (n / 1048576).toFixed(0) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB"; };
+  var when = function (iso) { return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }); };
+  var files = { android: "beam.apk", windows: "Beam.exe", mac: "Beam-mac.zip" };
+  fetch("https://api.github.com/repos/willhrom/Beam/releases", { headers: { Accept: "application/vnd.github+json" } })
+    .then(function (r) { return r.ok ? r.json() : []; })
+    .then(function (rels) {
+      Object.keys(files).forEach(function (k) {
+        var asset = null;
+        rels.forEach(function (rel) { (rel.assets || []).forEach(function (a) { if (a.name === files[k]) asset = a; }); });
+        if (!asset) return;
+        var line = fmt(asset.size) + ", updated " + when(asset.updated_at);
+        var facts = document.querySelector('[data-facts="' + k + '"]');
+        if (facts) facts.textContent += ". " + line;
+        if (k === os) document.getElementById("mainMeta").textContent = line;
+      });
+    })
+    .catch(function () {});
+})();
+</script>
+</body>
+</html>

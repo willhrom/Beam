@@ -505,90 +505,120 @@ public class MainActivity extends Activity implements Beam.Listener {
 
   private void showSettings() {
     LinearLayout l = Ui.col(this);
-    int p = Ui.dp(this, 20);
-    l.setPadding(p, Ui.dp(this, 8), p, 0);
+    int p = Ui.dp(this, 18);
+    l.setPadding(p, Ui.dp(this, 4), p, Ui.dp(this, 8));
+    final AlertDialog[] self = self0;
+
+    // Who's signed in
+    LinearLayout who = Ui.row(this);
+    who.setGravity(Gravity.CENTER_VERTICAL);
+    who.setBackground(Ui.round(Ui.BG, Ui.dp(this, 14)));
+    who.setPadding(Ui.dp(this, 14), Ui.dp(this, 12), Ui.dp(this, 14), Ui.dp(this, 12));
+    String nm = beam.account == null ? "?" : beam.account.optString("name", beam.account.optString("username", "?")).trim();
+    TextView av = Ui.text(this, nm.isEmpty() ? "?" : nm.substring(0, 1).toUpperCase(), 16, Color.WHITE, true);
+    av.setGravity(Gravity.CENTER);
+    android.graphics.drawable.GradientDrawable avBg = new android.graphics.drawable.GradientDrawable(android.graphics.drawable.GradientDrawable.Orientation.TL_BR, new int[] { Ui.ACCENT, Ui.ACCENT2 });
+    avBg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+    av.setBackground(avBg);
+    who.addView(av, Ui.margins(this, Ui.dp(this, 38), Ui.dp(this, 38), 0, 0, 12, 0));
+    LinearLayout whoTxt = Ui.col(this);
+    whoTxt.addView(Ui.text(this, beam.account == null ? "Not signed in" : beam.account.optString("name"), 15, Ui.TEXT, true));
+    if (beam.account != null) whoTxt.addView(Ui.text(this, "Username " + beam.account.optString("username") + (beam.account.optBoolean("admin") ? ". You manage this Beam" : ""), 12, Ui.DIM, false));
+    who.addView(whoTxt, new LinearLayout.LayoutParams(0, -2, 1));
+    l.addView(who, Ui.margins(this, -1, -2, 0, 4, 0, 0));
+
+    // This device
+    l.addView(label("This device"));
+    LinearLayout dev = group();
     EditText name = new EditText(this);
     name.setText(beam.prefs.name);
     name.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
-    l.addView(label("Device name"));
-    l.addView(name);
-    Switch on = sw("Stay reachable when Beam is closed", beam.prefs.enabled);
-    Switch nb = sw("Everyone nearby can see me", beam.prefs.nearby);
-    Switch aa = sw("Auto-accept from my devices", beam.prefs.autoAccept);
-    l.addView(on);
-    l.addView(nb);
-    l.addView(aa);
-    l.addView(Ui.text(this, "Device code " + Crypto.shortId(beam.me.id), 12, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 8, 0, 0));
+    name.setTextColor(Ui.TEXT);
+    name.setBackground(null);
+    name.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+    LinearLayout nameRow = Ui.row(this);
+    nameRow.setGravity(Gravity.CENTER_VERTICAL);
+    nameRow.addView(Ui.text(this, "Name", 15, Ui.TEXT, false));
+    nameRow.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+    addRow(dev, nameRow);
+    Switch nb = switchRow(dev, "Everyone nearby can see me", "When off, only your own and paired devices can", beam.prefs.nearby);
+    Switch on = switchRow(dev, "Stay reachable when Beam is closed", "Beam always works while it's open", beam.prefs.enabled);
+    l.addView(dev);
 
-    l.addView(label("Saving"));
-    Switch gm = sw("Photos and videos go to the gallery", beam.prefs.galleryMedia);
-    l.addView(gm);
-    l.addView(Ui.text(this, beam.prefs.galleryMedia ? "Other files save to:" : "Files save to:", 13, Ui.DIM, false), Ui.margins(this, -1, -2, 0, 6, 0, 0));
+    // Receiving
+    l.addView(label("Receiving"));
+    LinearLayout rx = group();
+    Switch gm = switchRow(rx, "Photos and videos go to the gallery", "Pictures/Beam and Movies/Beam", beam.prefs.galleryMedia);
     LinearLayout fr = Ui.row(this);
-    fr.addView(Ui.text(this, beam.prefs.saveTree != null ? beam.prefs.saveTreeName : "Downloads/Beam", 14, Ui.TEXT, false), new LinearLayout.LayoutParams(0, -2, 1));
-    if (beam.prefs.saveTree != null) fr.addView(Ui.button(this, "Use Downloads", 0x18FFFFFF, Ui.TEXT, v -> {
+    fr.setGravity(Gravity.CENTER_VERTICAL);
+    LinearLayout frTxt = Ui.col(this);
+    frTxt.addView(Ui.text(this, beam.prefs.galleryMedia ? "Other files save to" : "Files save to", 15, Ui.TEXT, false));
+    frTxt.addView(Ui.text(this, beam.prefs.saveTree != null ? beam.prefs.saveTreeName : "Downloads/Beam", 12, Ui.DIM, false));
+    fr.addView(frTxt, new LinearLayout.LayoutParams(0, -2, 1));
+    if (beam.prefs.saveTree != null) fr.addView(Ui.button(this, "Downloads", 0x18FFFFFF, Ui.TEXT, v -> {
       releaseSaveDir();
       beam.prefs.saveTree = null;
       beam.prefs.saveTreeName = null;
       beam.prefs.save();
-      self0[0].dismiss();
+      self[0].dismiss();
       showSettings();
     }), Ui.margins(this, -2, -2, 0, 0, 8, 0));
     fr.addView(Ui.button(this, "Choose…", 0x18FFFFFF, Ui.TEXT, v -> {
-      self0[0].dismiss();
+      self[0].dismiss();
       try { startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION), PICK_SAVE_DIR); }
       catch (Exception e) { Toast.makeText(this, "No app on this phone can pick folders", Toast.LENGTH_LONG).show(); }
     }));
-    l.addView(fr, Ui.margins(this, -1, -2, 0, 4, 0, 0));
+    addRow(rx, fr);
+    Switch aa = switchRow(rx, "Auto-accept from my devices", "What they send arrives without asking", beam.prefs.autoAccept);
+    l.addView(rx);
 
-    LinearLayout tr = Ui.row(this);
-    tr.addView(Ui.button(this, "Transfer history", 0x18FFFFFF, Ui.TEXT, v -> { self0[0].dismiss(); showHistory(); }), new LinearLayout.LayoutParams(0, -2, 1));
-    tr.addView(new View(this), Ui.lp(Ui.dp(this, 10), 1));
-    tr.addView(Ui.button(this, "Test connection", 0x18FFFFFF, Ui.TEXT, v -> { self0[0].dismiss(); new ConnTest(this, beam).show(); }), new LinearLayout.LayoutParams(0, -2, 1));
-    l.addView(tr, Ui.margins(this, -1, -2, 0, 14, 0, 0));
+    // Activity
+    l.addView(label("Activity"));
+    LinearLayout act = group();
+    navRow(act, "Transfer history", "What this phone sent and received", false, v -> { self[0].dismiss(); showHistory(); });
+    navRow(act, "Test connection", "Check the server, relay and your devices", false, v -> { self[0].dismiss(); new ConnTest(this, beam).show(); });
+    l.addView(act);
 
-    l.addView(label("Account"));
-    String who = beam.account == null ? "Not signed in" : beam.account.optString("name") + "  (" + beam.account.optString("username") + (beam.account.optBoolean("admin") ? " · admin" : "") + ")";
-    l.addView(Ui.text(this, who, 14, Ui.TEXT, false));
-    LinearLayout ar = Ui.row(this);
-    if (beam.account != null && beam.account.optBoolean("admin")) {
-      ar.addView(Ui.button(this, "Manage people", Ui.ACCENT, Color.WHITE, v -> open(Uri.parse(Beam.SERVER), null)), Ui.margins(this, -2, -2, 0, 0, 8, 0));
-    }
-    ar.addView(Ui.button(this, "Change PIN", 0x18FFFFFF, Ui.TEXT, v -> { self0[0].dismiss(); showChangePin(); }), Ui.margins(this, -2, -2, 0, 0, 8, 0));
-    ar.addView(Ui.button(this, "Sign out", 0x22F87171, Ui.BAD, v -> Ui.dialog(this).setMessage("Sign out of Beam on this phone?")
-        .setPositiveButton("Sign out", (d, w) -> { self0[0].dismiss(); beam.logout(); }).setNegativeButton("Cancel", null).show()));
-    l.addView(ar, Ui.margins(this, -1, -2, 0, 8, 0, 0));
-    l.addView(label("My devices"));
-    l.addView(Ui.text(this, "Devices signed in to your account find each other automatically. You can also pair with someone else's device.", 13, Ui.DIM, false));
-    final AlertDialog[] self = self0;
+    // Paired devices
+    l.addView(label("Paired devices"));
+    LinearLayout pg = group();
     for (Prefs.Paired pd : new ArrayList<>(beam.prefs.paired.values())) {
       LinearLayout r = Ui.row(this);
-      r.addView(Ui.oneLine(Ui.text(this, pd.name + "  " + Crypto.shortId(pd.id), 14, Ui.TEXT, false)), new LinearLayout.LayoutParams(0, -2, 1));
-      r.addView(Ui.button(this, "Remove", 0x22F87171, Ui.BAD, v -> {
-        beam.unpair(pd.id);
-        self[0].dismiss();
-        showSettings();
-      }));
-      l.addView(r, Ui.margins(this, -1, -2, 0, 4, 0, 4));
+      r.setGravity(Gravity.CENTER_VERTICAL);
+      LinearLayout t = Ui.col(this);
+      t.addView(Ui.oneLine(Ui.text(this, pd.name, 15, Ui.TEXT, false)));
+      t.addView(Ui.text(this, Crypto.shortId(pd.id), 12, Ui.DIM, false));
+      r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+      r.addView(Ui.button(this, "Remove", 0x22F87171, Ui.BAD, v -> { beam.unpair(pd.id); self[0].dismiss(); showSettings(); }));
+      addRow(pg, r);
     }
-    LinearLayout pr = Ui.row(this);
-    pr.addView(Ui.button(this, "Show a code", 0x18FFFFFF, Ui.TEXT, v -> { self[0].dismiss(); beam.pairShow(); }), new LinearLayout.LayoutParams(0, -2, 1));
-    pr.addView(new View(this), Ui.lp(Ui.dp(this, 10), 1));
-    pr.addView(Ui.button(this, "Enter a code", 0x18FFFFFF, Ui.TEXT, v -> { self[0].dismiss(); beam.pairJoin(); }), new LinearLayout.LayoutParams(0, -2, 1));
-    l.addView(pr, Ui.margins(this, -1, -2, 0, 10, 0, 0));
-    l.addView(label("Updates"));
-    LinearLayout ur = Ui.row(this);
-    ur.addView(Ui.text(this, "Version 1.0." + Updater.current(), 14, Ui.TEXT, false), new LinearLayout.LayoutParams(0, -2, 1));
+    navRow(pg, "Show a pairing code", "On this phone, for someone else to enter", false, v -> { self[0].dismiss(); beam.pairShow(); });
+    navRow(pg, "Enter a pairing code", "From someone else's device", false, v -> { self[0].dismiss(); beam.pairJoin(); });
+    l.addView(pg);
+    l.addView(Ui.text(this, "Your own devices find each other automatically. Pair to send with someone else's device.", 12, Ui.DIM, false), Ui.margins(this, -1, -2, 2, 6, 0, 0));
+
+    // Account
+    l.addView(label("Account"));
+    LinearLayout acc = group();
+    if (beam.account != null && beam.account.optBoolean("admin")) navRow(acc, "Manage people", "Opens in your browser", false, v -> open(Uri.parse(Beam.SERVER), null));
+    navRow(acc, "Change PIN", null, false, v -> { self[0].dismiss(); showChangePin(); });
+    navRow(acc, "Sign out of this phone", null, true, v -> Ui.dialog(this).setMessage("Sign out of Beam on this phone?")
+        .setPositiveButton("Sign out", (d, w) -> { self[0].dismiss(); beam.logout(); }).setNegativeButton("Cancel", null).show());
+    l.addView(acc);
+
+    // About
+    l.addView(label("About"));
+    LinearLayout ab = group();
     boolean newer = Updater.available != null && Updater.available.version > Updater.current();
-    ur.addView(Ui.button(this, newer ? "Install 1.0." + Updater.available.version : "Check for updates", newer ? Ui.ACCENT : 0x18FFFFFF, newer ? Color.WHITE : Ui.TEXT, v -> {
-      if (Updater.available != null && Updater.available.version > Updater.current()) { self0[0].dismiss(); startActivity(new Intent(this, UpdateActivity.class)); }
+    navRow(ab, newer ? "Install version 1.0." + Updater.available.version : "Check for updates", "Version 1.0." + Updater.current(), false, v -> {
+      if (Updater.available != null && Updater.available.version > Updater.current()) { self[0].dismiss(); startActivity(new Intent(this, UpdateActivity.class)); }
       else Updater.check(beam, true);
-    }));
-    l.addView(ur);
+    });
     PowerManager pm = getSystemService(PowerManager.class);
-    if (!pm.isIgnoringBatteryOptimizations(getPackageName())) {
-      l.addView(Ui.button(this, "Allow background use (battery)", 0x18FFFFFF, Ui.TEXT, v -> openBatterySetting()), Ui.margins(this, -1, -2, 0, 10, 0, 0));
-    }
+    if (!pm.isIgnoringBatteryOptimizations(getPackageName())) navRow(ab, "Allow background use", "So Android doesn't put Beam to sleep", false, v -> openBatterySetting());
+    l.addView(ab);
+    l.addView(Ui.text(this, "Device code " + Crypto.shortId(beam.me.id), 12, Ui.DIM, false), Ui.margins(this, -1, -2, 2, 8, 0, 0));
+
     ScrollView sv = new ScrollView(this);
     sv.addView(l);
     self[0] = Ui.dialog(this).setTitle("Settings").setView(sv)
@@ -875,9 +905,59 @@ public class MainActivity extends Activity implements Beam.Listener {
   }
 
   private TextView label(String s) {
-    TextView t = Ui.text(this, s.toUpperCase(), 12, Ui.DIM, true);
-    t.setPadding(0, Ui.dp(this, 14), 0, Ui.dp(this, 4));
+    TextView t = Ui.text(this, s, 13, Ui.DIM, true);
+    t.setPadding(Ui.dp(this, 2), Ui.dp(this, 18), 0, Ui.dp(this, 6));
     return t;
+  }
+
+  /** A rounded box that holds a group of settings rows. */
+  private LinearLayout group() {
+    LinearLayout g = Ui.col(this);
+    g.setBackground(Ui.round(0x0AFFFFFF, Ui.dp(this, 14)));
+    g.setPadding(Ui.dp(this, 14), 0, Ui.dp(this, 14), 0);
+    return g;
+  }
+
+  /** Adds a row to a group, with a divider above it if it isn't the first. */
+  private void addRow(LinearLayout g, View row) {
+    if (g.getChildCount() > 0) {
+      View line = new View(this);
+      line.setBackgroundColor(Ui.LINE);
+      g.addView(line, Ui.lp(-1, 1));
+    }
+    row.setPadding(row.getPaddingLeft(), Ui.dp(this, 10), row.getPaddingRight(), Ui.dp(this, 10));
+    g.addView(row, Ui.lp(-1, -2));
+  }
+
+  private Switch switchRow(LinearLayout g, String title, String sub, boolean on) {
+    LinearLayout r = Ui.row(this);
+    r.setGravity(Gravity.CENTER_VERTICAL);
+    LinearLayout t = Ui.col(this);
+    t.addView(Ui.text(this, title, 15, Ui.TEXT, false));
+    if (sub != null) t.addView(Ui.text(this, sub, 12, Ui.DIM, false));
+    r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+    Switch s = new Switch(this);
+    s.setChecked(on);
+    r.addView(s);
+    r.setOnClickListener(v -> s.toggle());
+    addRow(g, r);
+    return s;
+  }
+
+  private void navRow(LinearLayout g, String title, String sub, boolean danger, View.OnClickListener click) {
+    LinearLayout r = Ui.row(this);
+    r.setGravity(Gravity.CENTER_VERTICAL);
+    LinearLayout t = Ui.col(this);
+    t.addView(Ui.text(this, title, 15, danger ? Ui.BAD : Ui.TEXT, false));
+    if (sub != null) t.addView(Ui.text(this, sub, 12, Ui.DIM, false));
+    r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+    if (!danger) r.addView(Ui.text(this, "›", 22, Ui.DIM, false));
+    android.util.TypedValue tv = new android.util.TypedValue();
+    getTheme().resolveAttribute(android.R.attr.selectableItemBackground, tv, true);
+    r.setForeground(getDrawable(tv.resourceId));
+    r.setClickable(true);
+    r.setOnClickListener(click);
+    addRow(g, r);
   }
 
   private Switch sw(String label, boolean on) {

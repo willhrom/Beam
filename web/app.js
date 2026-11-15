@@ -1370,26 +1370,50 @@ function closePrompt(tid) {
 // ----- settings & pairing -----
 function showSettings() {
   const paired = Object.entries(S.paired);
-  openSheet(`<h2>Settings</h2>
-    <h3>This device</h3>
-    <input type="text" id="nm" maxlength="40" value="${esc(S.name)}">
-    <label class="opt"><span>Everyone nearby can see me<small>When off, only your own and paired devices can</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
-    <label class="opt"><span>Auto-accept from my devices<small>What they send arrives without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>
-    ${!native && "Notification" in window && Notification.permission !== "granted" ? '<label class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></label>' : ""}
-    ${nativeKind === "windows" ? `<label class="opt"><span>Convert iPhone photos and videos<small>HEIC photos become JPG and HEVC videos become MP4, so every app opens them</small></span><input type="checkbox" class="toggle" id="cv" ${S.convert !== false ? "checked" : ""}></label>` : ""}
-    ${native ? `<div class="opt"><span>Save received files to<small id="sdName">${esc(S.saveDir ? S.saveDir.name : "Downloads")}</small></span><span class="row-btns">${S.saveDir && !S.saveDir.isDefault ? '<button class="btn ghost small" id="sdReset">Use Downloads</button>' : ""}<button class="btn ghost small" id="sdPick">Choose…</button></span></div>` : ""}
-    ${canSaveToDisk ? `<label class="opt"><span>Save received files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Your Downloads folder. Big transfers ask where to save"}</small></span><button class="btn ghost small" id="sf">Choose…</button></label>` : ""}
-    <div class="actions"><button class="btn ghost" id="hist">Transfer history</button><button class="btn ghost" id="ctest">Test connection</button></div>
-    <p><small>Device code ${shortId(Id.id)}</small></p>
-    <h3>Account</h3>
-    <div class="list"><div class="item"><span>${S.user ? esc(S.user.name) + ' <span class="sub">' + esc(S.user.username) + (S.user.admin ? " · admin" : "") + "</span>" : "Not signed in"}</span></div></div>
-    <div class="actions">${S.user && S.user.admin ? '<button class="btn primary" id="ppl">Manage people</button>' : ""}<button class="btn ghost" id="cpin">Change PIN</button><button class="btn danger" id="sout">Sign out</button></div>
-    <h3>My devices</h3>
-    <p>Devices signed in to your account find each other automatically. You can also pair with someone else's device:</p>
+  const chev = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const nav = (id, label, sub, cls = "") => `<button class="nav ${cls}" id="${id}"><span>${label}${sub ? `<small>${sub}</small>` : ""}</span>${cls.includes("danger") ? "" : chev}</button>`;
+  const initial = S.user ? esc((S.user.name || S.user.username || "?").trim().charAt(0).toUpperCase()) : "?";
+  const receiving = [
+    native ? `<div class="opt"><span>Save files to<small id="sdName">${esc(S.saveDir ? S.saveDir.name : "Downloads")}</small></span><span class="row-btns">${S.saveDir && !S.saveDir.isDefault ? '<button class="btn ghost small" id="sdReset">Use Downloads</button>' : ""}<button class="btn ghost small" id="sdPick">Choose…</button></span></div>` : "",
+    canSaveToDisk ? `<div class="opt"><span>Save files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Downloads. Big transfers ask where to save"}</small></span><button class="btn ghost small" id="sf">Choose…</button></div>` : "",
+    nativeKind === "windows" ? `<label class="opt"><span>Convert iPhone photos and videos<small>HEIC to JPG and HEVC to MP4, so every app opens them</small></span><input type="checkbox" class="toggle" id="cv" ${S.convert !== false ? "checked" : ""}></label>` : "",
+    `<label class="opt"><span>Auto-accept from my devices<small>What they send arrives without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>`,
+    !native && "Notification" in window && Notification.permission !== "granted" ? '<div class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></div>' : "",
+  ].join("");
+  openSheet(`<div class="set-head"><h2>Settings</h2></div>
+    <div class="who"><span class="avatar">${initial}</span><span>${S.user ? esc(S.user.name) : "Not signed in"}<small>${S.user ? "Username " + esc(S.user.username) + (S.user.admin ? ". You manage this Beam" : "") : ""}</small></span></div>
 
-    <div class="list">${paired.map(([id, p]) => `<div class="item"><span>${esc(p.name)} <span class="sub">${shortId(id)}</span></span><button class="btn danger small" data-unpair="${id}">Remove</button></div>`).join("") || '<div class="item"><span class="sub">None yet</span></div>'}</div>
-    <div class="actions"><button class="btn ghost" id="pShow">Show a code</button><button class="btn ghost" id="pJoin">Enter a code</button></div>
-    <div class="actions"><button class="btn primary" id="done">Done</button></div>`, saveSettings);
+    <h3>This device</h3>
+    <div class="group">
+      <label class="opt field"><span>Name</span><input type="text" id="nm" maxlength="40" value="${esc(S.name)}" aria-label="Device name"></label>
+      <label class="opt"><span>Everyone nearby can see me<small>When off, only your own and paired devices can</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
+    </div>
+
+    <h3>Receiving</h3>
+    <div class="group">${receiving}</div>
+
+    <h3>Activity</h3>
+    <div class="group">
+      ${nav("hist", "Transfer history", "What this device sent and received")}
+      ${nav("ctest", "Test connection", "Check the server, relay and your devices")}
+    </div>
+
+    <h3>Paired devices</h3>
+    <div class="group">
+      ${paired.map(([id, p]) => `<div class="opt"><span>${esc(p.name)}<small>${shortId(id)}</small></span><button class="btn danger small" data-unpair="${id}">Remove</button></div>`).join("")}
+      ${nav("pShow", "Show a pairing code", "On this device, for someone else to enter")}
+      ${nav("pJoin", "Enter a pairing code", "From someone else's device")}
+    </div>
+    <p class="hint">Your own devices find each other automatically. Pair to send with someone else's device.</p>
+
+    <h3>Account</h3>
+    <div class="group">
+      ${S.user && S.user.admin ? nav("ppl", "Manage people", "Add people, reset PINs, sign out devices") : ""}
+      ${nav("cpin", "Change PIN", "")}
+      ${nav("sout", "Sign out of this device", "", "danger")}
+    </div>
+    <p class="hint">Device code ${shortId(Id.id)}</p>
+    <div class="actions sticky"><button class="btn primary" id="done">Done</button></div>`, saveSettings);
   $("#done").onclick = closeSheet;
   $("#ctest").onclick = () => { saveSettings(); sheetOnClose = null; connectionTest(); };
   $("#hist").onclick = () => { saveSettings(); sheetOnClose = null; showHistory(); };
