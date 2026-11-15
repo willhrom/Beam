@@ -1,6 +1,6 @@
 name: Deploy server and web app (Cloudflare)
 
-# The handshake server and the web app
+# The handshake server and the web app. Secrets are loaded on each deploy.
 on:
   push:
     branches: [main]
