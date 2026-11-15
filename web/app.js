@@ -1393,6 +1393,9 @@ let statusTimer = 0;
 function nativeStatusSoon() { if (native && !statusTimer) statusTimer = setTimeout(() => { statusTimer = 0; nativeStatus(); }, 500); }
 let progressRaf = 0, lastProgress = 0;
 function renderProgress(t) {
+  // First, and not tied to drawing: the corner card has to keep moving while Beam's window is
+  // hidden, and a hidden window never runs the drawing callback below.
+  nativeProgressSoon();
   if (progressRaf) return;
   const now = performance.now();
   if (now - lastProgress < 120) return;
@@ -1405,8 +1408,6 @@ function renderProgress(t) {
     if (pct) pct.textContent = (t.total ? Math.floor((100 * t.done) / t.total) : 0) + "%";
     if (t.dir === "out") renderRing(t);
   });
-  // Not tied to drawing: the corner card has to keep moving while Beam's window is hidden.
-  nativeProgressSoon();
 }
 
 // A whole received folder as one download (browsers can't save a folder directly). Stored, not compressed.
