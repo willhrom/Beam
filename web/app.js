@@ -931,7 +931,7 @@ function render() {
   for (const p of S.peers) {
     let el = box.querySelector(`[data-id="${p.id}"]`);
     const paired = (!!S.paired[p.id] && S.paired[p.id].pub === p.pub) || p.mine;
-    const html = `<div class="avatar">${iconFor(p.kind)}<svg class="ring" viewBox="0 0 82 82"><circle cx="41" cy="41" r="38" stroke-dasharray="238.8" stroke-dashoffset="238.8"/></svg></div>
+    const html = `<div class="avatar">${iconFor(p.kind)}<svg class="ring" viewBox="0 0 82 82"><circle class="track" cx="41" cy="41" r="38"/><circle class="arc" cx="41" cy="41" r="38" transform="rotate(-90 41 41)" stroke-dasharray="238.8" stroke-dashoffset="238.8"/></svg></div>
       <div class="name">${esc(p.name)}</div><div class="tag ${paired ? "paired" : ""}">${paired ? "My device" : "Nearby"}</div>`;
     if (!el) {
       el = document.createElement("button");
@@ -1084,10 +1084,11 @@ async function filesFromEntries(entries) {
 }
 
 function renderRing(t) {
-  const el = document.querySelector(`.peer[data-id="${t.peer.id}"] .ring circle`);
+  const el = document.querySelector(`.peer[data-id="${t.peer.id}"] .ring .arc`);
   if (!el) return;
   const active = ["waiting", "connecting", "sending", "finishing", "paused", "reconnecting"].includes(t.state);
   const frac = active ? (t.total ? t.done / t.total : 0) : 0;
+  el.parentNode.classList.toggle("on", active);
   el.style.strokeDashoffset = String(238.8 * (1 - (t.state === "waiting" ? 0.04 : frac)));
 }
 

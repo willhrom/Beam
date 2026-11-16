@@ -96,7 +96,13 @@ main { flex: 1; display: flex; flex-direction: column; align-items: center; over
 .peer:active .avatar { transform: scale(.96); }
 .peer.drop .avatar { box-shadow: 0 0 0 5px rgba(92, 200, 255, .18); }
 .avatar .ring { position: absolute; inset: -6px; }
-.avatar .ring circle { fill: none; stroke: var(--signal); stroke-width: 3; stroke-linecap: round; transform: rotate(-90deg); transform-origin: center; transition: stroke-dashoffset .2s; }
+/* Progress ring around a device you're sending to. Rotated with an SVG attribute (not CSS), because
+   Safari/WebKit (the Mac app) turns CSS-rotated SVG around the corner and the ring ends up off the icon. */
+.avatar .ring { pointer-events: none; }
+.avatar .ring circle { fill: none; stroke-width: 3; }
+.avatar .ring .arc { stroke: var(--signal); stroke-linecap: round; transition: stroke-dashoffset .2s; filter: drop-shadow(0 0 3px rgba(92, 200, 255, .6)); }
+.avatar .ring .track { stroke: rgba(92, 200, 255, .16); opacity: 0; transition: opacity .2s; }
+.avatar .ring.on .track { opacity: 1; }
 /* Long names wrap onto a second line; the full name shows on hover and in every "Send to" heading. */
 .peer .name { font-size: 13.5px; font-weight: 600; line-height: 1.25; max-width: 100%; text-align: center; overflow: hidden; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; }
