@@ -957,7 +957,7 @@ function render() {
       el.addEventListener("pointerdown", () => FX.pulse(el.querySelector(".avatar"), "tapped", 500));
       fresh.push(el);
     }
-    if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; el.title = p.name; el.setAttribute("aria-label", "Send to " + p.name); }
     el.classList.toggle("mine", paired);
   }
   // A new device pops in with a little ping from the beam.
@@ -998,6 +998,7 @@ function showRecipients(files, text, title) {
   openSheet(`<h2>${esc(title || "Send " + pendingLabel())}</h2>
     <p>${files.length ? fmtSize(files.reduce((a, f) => a + f.size, 0)) + ". " : ""}Pick one device or several.</p>
     <div class="list" id="pickList">${list()}</div>
+    <p class="pick-who" id="pickWho"></p>
     <div class="actions"><button class="btn ghost" id="cx">Cancel</button><button class="btn primary" id="go" disabled>Send</button></div>`, () => { S.pickOpen = false; S.pickSel = null; });
   S.pickOpen = true;
   S.pickSel = S.pickSel || new Set();
@@ -1009,6 +1010,12 @@ function showRecipients(files, text, title) {
     for (const id of [...S.pickSel]) if (!S.peers.some((p) => p.id === id)) S.pickSel.delete(id);
     const n = S.pickSel.size, go = $("#go");
     if (go) { go.disabled = !n; go.textContent = n > 1 ? `Send to ${n} devices` : "Send"; }
+    // Spell out who's ticked, full names, so there's no guessing.
+    const who = $("#pickWho");
+    if (who) {
+      const names = [...S.pickSel].map((id) => (S.peers.find((p) => p.id === id) || {}).name).filter(Boolean);
+      who.textContent = names.length ? "Sending to " + names.join(", ") : "";
+    }
   };
   S.pickRefresh = () => { const box = $("#pickList"); if (box && S.pickOpen) { box.innerHTML = list(); wire(); } };
   wire();

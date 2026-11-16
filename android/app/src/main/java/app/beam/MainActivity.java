@@ -432,7 +432,10 @@ public class MainActivity extends Activity implements Beam.Listener {
     badge.setBackground(bg);
     top.addView(badge, Ui.margins(this, Ui.dp(this, 34), Ui.dp(this, 34), 0, 0, 12, 0));
     LinearLayout words = Ui.col(this);
-    words.addView(Ui.oneLine(Ui.text(this, (t.incoming ? "From " : "To ") + t.peerName, 14, Ui.TEXT, true)));
+    TextView who = Ui.text(this, (t.incoming ? "From " : "To ") + t.peerName, 14, Ui.TEXT, true);
+    who.setMaxLines(3);
+    who.setEllipsize(android.text.TextUtils.TruncateAt.END);
+    words.addView(who);
     String sub;
     if (Transfer.FAILED.equals(t.state)) sub = t.reason;
     else if (Transfer.DONE.equals(t.state)) sub = (t.incoming ? "Received " : "Sent ") + t.describe() + (t.incoming && t.savedWhere() != null ? " · " + t.savedWhere() : "");
@@ -528,7 +531,7 @@ public class MainActivity extends Activity implements Beam.Listener {
   private void chooseWhat(String peerId) {
     Beam.Peer p = beam.peer(peerId);
     if (p == null) return;
-    Ui.dialog(this).setTitle("Send to " + p.name)
+    Ui.dialog(this).setCustomTitle(Ui.title(this, "Send to " + p.name))
         .setItems(new String[] { "Files or photos", "A folder", "Text or link" }, (d, which) -> {
           if (which == 0) {
             pickFor = peerId;
@@ -606,7 +609,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     e.setHint("Paste a link or type something");
     e.setMinLines(3);
     ClipboardManager cm = getSystemService(ClipboardManager.class);
-    AlertDialog dlg = Ui.dialog(this).setTitle("Send text to " + p.name).setView(pad(e))
+    AlertDialog dlg = Ui.dialog(this).setCustomTitle(Ui.title(this, "Send text to " + p.name)).setView(pad(e))
         .setPositiveButton("Send", (d, w) -> {
           Beam.Peer peer = beam.peer(peerId);
           String s = e.getText().toString();
@@ -793,7 +796,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       LinearLayout r = Ui.row(this);
       r.setGravity(Gravity.CENTER_VERTICAL);
       LinearLayout t = Ui.col(this);
-      t.addView(Ui.oneLine(Ui.text(this, pd.name, 15, Ui.TEXT, false)));
+      t.addView(Ui.text(this, pd.name, 15, Ui.TEXT, false));
       t.addView(Ui.text(this, Crypto.shortId(pd.id), 12, Ui.DIM, false));
       r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
       r.addView(Ui.button(this, "Remove", 0x22F87171, Ui.BAD, v -> { beam.unpair(pd.id); self[0].dismiss(); showSettings(); }));

@@ -85,6 +85,14 @@ final class Ui {
     return p;
   }
 
+  /** A pop-up title that wraps instead of cutting off (for long device names). */
+  static TextView title(Context c, String s) {
+    TextView t = text(c, s, 19, TEXT, true);
+    t.setPadding(dp(c, 24), dp(c, 20), dp(c, 24), dp(c, 6));
+    t.setBreakStrategy(android.text.Layout.BREAK_STRATEGY_HIGH_QUALITY);
+    return t;
+  }
+
   static AlertDialog.Builder dialog(Context c) {
     return new AlertDialog.Builder(c, R.style.BeamDialog);
   }
@@ -113,9 +121,16 @@ final class Ui {
     if (note != null) g.setStroke(dp(c, 3), ACCENT2);
     circle.setBackground(g);
     box.addView(circle, lp(dp(c, 72), dp(c, 72)));
-    TextView name = oneLine(text(c, p.name, 13, TEXT, false));
+    // Long names wrap onto a second line; press and hold to see the whole thing.
+    TextView name = text(c, p.name, 13, TEXT, false);
+    name.setMaxLines(3);
+    name.setEllipsize(android.text.TextUtils.TruncateAt.END);
     name.setGravity(Gravity.CENTER);
-    box.addView(name, margins(c, dp(c, 96), -2, 0, 6, 0, 0));
+    box.addView(name, margins(c, dp(c, 108), -2, 0, 6, 0, 0));
+    box.setOnLongClickListener(v -> {
+      android.widget.Toast.makeText(c, p.name, android.widget.Toast.LENGTH_LONG).show();
+      return true;
+    });
     String label = note != null ? note : (paired ? "My device" : "Nearby") + (offline ? " · offline" : "");
     TextView tag = text(c, label, 11, note != null || paired ? ACCENT2 : DIM, false);
     tag.setGravity(Gravity.CENTER);

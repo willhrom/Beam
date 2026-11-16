@@ -132,7 +132,7 @@ public class ShareActivity extends Activity implements Beam.Listener {
       boolean gaveUp = System.currentTimeMillis() - opened > WAIT_FOR_DEVICE;
       hint.setText(gaveUp ? targetName() + " isn't reachable right now. Pick another device, or open Beam on it." : "Looking for " + targetName() + "…");
     } else {
-      hint.setText(all.isEmpty() ? (beam.online || beam.nearby.usable() ? "Looking for devices… Open Beam on the other device." : "Connecting…") : chosen.isEmpty() ? "Tap a device, or several" : "Tap more to add, then Send");
+      hint.setText(all.isEmpty() ? (beam.online || beam.nearby.usable() ? "Looking for devices… Open Beam on the other device." : "Connecting…") : chosen.isEmpty() ? "Tap a device, or several. Press and hold one to see its full name" : chosenText());
     }
     StringBuilder k = new StringBuilder();
     for (Beam.Peer p : all) k.append(p.id).append(p.name).append(beam.isOfflineOnly(p.id)).append('|');
@@ -160,6 +160,14 @@ public class ShareActivity extends Activity implements Beam.Listener {
       sendBtn.setVisibility(chosen.isEmpty() ? android.view.View.GONE : android.view.View.VISIBLE);
       sendBtn.setText(chosen.size() > 1 ? "Send to " + chosen.size() + " devices" : "Send");
     }
+    if (!chosen.isEmpty()) hint.setText(chosenText());
+  }
+
+  /** Spells out exactly who's selected, full names, so there's no guessing. */
+  private String chosenText() {
+    List<String> names = new ArrayList<>();
+    for (String id : chosen) { Beam.Peer p = beam.peer(id); if (p != null) names.add(p.name); }
+    return "Sending to " + String.join(", ", names) + ". Tap more to add, then Send";
   }
 
   private void send() {

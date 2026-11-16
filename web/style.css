@@ -84,7 +84,7 @@ main { flex: 1; display: flex; flex-direction: column; align-items: center; over
 .empty { position: absolute; z-index: 1; top: 24%; left: 50%; transform: translateX(-50%); width: min(300px, 82%); margin: 0; text-align: center; font-weight: 600; font-size: 16px; }
 .empty small { display: block; margin-top: 6px; font-weight: 400; font-size: 13.5px; color: var(--dim); }
 
-.peer { width: 104px; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 2px; background: none; border: 0; border-radius: 14px; cursor: pointer;
+.peer { width: 118px; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 2px; background: none; border: 0; border-radius: 14px; cursor: pointer;
   animation: arrive .55s cubic-bezier(.34, 1.56, .64, 1) calc(var(--i, 0) * 70ms) both, bob 7s ease-in-out calc(1s + var(--i, 0) * -1.7s) infinite; }
 @keyframes arrive { 0% { transform: scale(.3) translateY(24px); opacity: 0; } 60% { opacity: 1; } 100% { transform: none; } }
 /* Devices drift very gently, like they're floating on the sonar. */
@@ -97,7 +97,9 @@ main { flex: 1; display: flex; flex-direction: column; align-items: center; over
 .peer.drop .avatar { box-shadow: 0 0 0 5px rgba(92, 200, 255, .18); }
 .avatar .ring { position: absolute; inset: -6px; }
 .avatar .ring circle { fill: none; stroke: var(--signal); stroke-width: 3; stroke-linecap: round; transform: rotate(-90deg); transform-origin: center; transition: stroke-dashoffset .2s; }
-.peer .name { font-size: 13.5px; font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Long names wrap onto a second line; the full name shows on hover and in every "Send to" heading. */
+.peer .name { font-size: 13.5px; font-weight: 600; line-height: 1.25; max-width: 100%; text-align: center; overflow: hidden; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; }
 .peer .tag { font-size: 12px; color: var(--dim); }
 .peer .tag.paired { color: var(--signal); }
 
@@ -113,7 +115,7 @@ main { flex: 1; display: flex; flex-direction: column; align-items: center; over
 .tx.failed .tx-ico { background: rgba(255, 123, 123, .12); color: var(--bad); }
 .tx.paused .tx-ico, .tx.reconnecting .tx-ico { background: rgba(147, 161, 184, .14); color: var(--dim); }
 .tx-text { flex: 1; min-width: 0; }
-.tx .title { font-weight: 600; font-size: 14.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tx .title { font-weight: 600; font-size: 14.5px; overflow-wrap: anywhere; }
 .tx .sub, .sub { color: var(--dim); font-size: 13px; }
 .tx .sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tx-side { display: flex; align-items: center; gap: 8px; flex: none; }
@@ -320,3 +322,8 @@ textarea { height: auto; min-height: 110px; padding: 10px 12px; resize: vertical
   .tx.sending .bar i, .tx.receiving .bar i, .sheet .card { animation: none !important; }
   #fx { display: none; }
 }
+
+.list .item.pick > span { min-width: 0; overflow-wrap: anywhere; }
+.card .pick-who { margin: 10px 2px 0; font-size: 13px; color: var(--signal); overflow-wrap: anywhere; }
+.card .pick-who:empty { display: none; }
+.card h2 { overflow-wrap: anywhere; }
