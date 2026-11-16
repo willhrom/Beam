@@ -348,6 +348,154 @@ final class ProgressPopup {
   }
 }
 
+/// "Someone wants to send you something" cards. While Beam's window isn't in front, each request
+/// drops down from the top-right corner with Accept and Decline, and stays until it's answered
+/// (or the sender gives up). Several requests stack downwards.
+final class RequestCards: NSObject {
+  final class Card {
+    let tag: String
+    let panel: NSPanel
+    var answered = false
+    init(tag: String, panel: NSPanel) { self.tag = tag; self.panel = panel }
+  }
+  var cards: [Card] = []
+  let onAnswer: (String, String) -> Void
+  let onOpen: () -> Void
+  var calm: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+  let blue = NSColor(red: 0.36, green: 0.78, blue: 1, alpha: 1)
+  let w: CGFloat = 340, h: CGFloat = 112, gap: CGFloat = 10
+
+  init(onAnswer: @escaping (String, String) -> Void, onOpen: @escaping () -> Void) {
+    self.onAnswer = onAnswer
+    self.onOpen = onOpen
+    super.init()
+  }
+
+  func has(_ tag: String) -> Bool { cards.contains { $0.tag == tag } }
+
+  func slot(_ i: Int) -> NSRect {
+    let area = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? .zero
+    return NSRect(x: area.maxX - w - 16, y: area.maxY - 12 - h - CGFloat(i) * (h + gap), width: w, height: h)
+  }
+
+  func show(tag: String, title: String, body: String) {
+    if has(tag) { return }
+    let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+    panel.level = .statusBar
+    panel.isOpaque = false
+    panel.backgroundColor = .clear
+    panel.hasShadow = true
+    panel.hidesOnDeactivate = false
+    panel.isReleasedWhenClosed = false
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+    panel.appearance = NSAppearance(named: .darkAqua)
+    panel.becomesKeyOnlyIfNeeded = true
+
+    let v = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+    v.material = .hudWindow
+    v.blendingMode = .behindWindow
+    v.state = .active
+    v.wantsLayer = true
+    v.layer?.cornerRadius = 16
+    v.layer?.masksToBounds = true
+    v.layer?.borderWidth = 1
+    v.layer?.borderColor = blue.withAlphaComponent(0.35).cgColor
+
+    let icon = NSImageView(frame: NSRect(x: 14, y: h - 48, width: 34, height: 34))
+    icon.image = NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: nil)
+    icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 27, weight: .medium)
+    icon.contentTintColor = blue
+    let t = NSTextField(wrappingLabelWithString: title)
+    t.frame = NSRect(x: 58, y: h - 50, width: w - 72, height: 38)
+    t.font = .systemFont(ofSize: 13, weight: .semibold)
+    t.maximumNumberOfLines = 2
+    t.lineBreakMode = .byTruncatingTail
+    let b = NSTextField(labelWithString: body)
+    b.frame = NSRect(x: 58, y: h - 68, width: w - 72, height: 16)
+    b.font = .systemFont(ofSize: 11.5)
+    b.textColor = .secondaryLabelColor
+    b.lineBreakMode = .byTruncatingTail
+
+    let decline = NSButton(title: "Decline", target: nil, action: nil)
+    decline.bezelStyle = .rounded
+    decline.frame = NSRect(x: w - 14 - 96 - 8 - 96, y: 12, width: 96, height: 30)
+    let accept = NSButton(title: "Accept", target: nil, action: nil)
+    accept.bezelStyle = .rounded
+    accept.bezelColor = NSColor(red: 0.18, green: 0.42, blue: 1, alpha: 1)
+    accept.keyEquivalent = "\r"
+    accept.frame = NSRect(x: w - 14 - 96, y: 12, width: 96, height: 30)
+    let open = NSButton(title: "Open Beam", target: nil, action: nil)
+    open.isBordered = false
+    open.font = .systemFont(ofSize: 11.5, weight: .medium)
+    open.contentTintColor = blue
+    open.frame = NSRect(x: 54, y: 16, width: 80, height: 22)
+
+    for part in [icon, t, b, decline, accept, open] as [NSView] { v.addSubview(part) }
+    panel.contentView = v
+    let card = Card(tag: tag, panel: panel)
+    accept.target = self; accept.action = #selector(tapped(_:)); accept.identifier = NSUserInterfaceItemIdentifier("accept|" + tag)
+    decline.target = self; decline.action = #selector(tapped(_:)); decline.identifier = NSUserInterfaceItemIdentifier("decline|" + tag)
+    open.target = self; open.action = #selector(tapped(_:)); open.identifier = NSUserInterfaceItemIdentifier("open|" + tag)
+    cards.append(card)
+
+    // Drop down from just above its spot, with a little bounce.
+    let to = slot(cards.count - 1)
+    if calm {
+      panel.setFrame(to, display: true)
+      panel.orderFrontRegardless()
+    } else {
+      panel.alphaValue = 0
+      panel.setFrame(to.offsetBy(dx: 0, dy: 34), display: true)
+      panel.orderFrontRegardless()
+      NSAnimationContext.runAnimationGroup { ctx in
+        ctx.duration = 0.45
+        ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.5, 0.64, 1)
+        panel.animator().setFrame(to, display: true)
+        panel.animator().alphaValue = 1
+      }
+    }
+    NSSound(named: "Glass")?.play()
+  }
+
+  @objc func tapped(_ sender: NSButton) {
+    let parts = (sender.identifier?.rawValue ?? "").split(separator: "|", maxSplits: 1).map(String.init)
+    guard parts.count == 2 else { return }
+    let (what, tag) = (parts[0], parts[1])
+    if what == "open" { onOpen(); close(tag); return }
+    if let c = cards.first(where: { $0.tag == tag }) { c.answered = true }
+    onAnswer(tag, what)
+    close(tag)
+  }
+
+  /// Slides a card away (answered, cancelled, timed out or handled in Beam's window) and moves the rest up.
+  func close(_ tag: String) {
+    guard let i = cards.firstIndex(where: { $0.tag == tag }) else { return }
+    let card = cards.remove(at: i)
+    let p = card.panel
+    if calm { p.orderOut(nil) } else {
+      let from = p.frame
+      NSAnimationContext.runAnimationGroup({ ctx in
+        ctx.duration = 0.22
+        ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        p.animator().setFrame(from.offsetBy(dx: 40, dy: 0), display: true)
+        p.animator().alphaValue = 0
+      }, completionHandler: { p.orderOut(nil) })
+    }
+    for (j, c) in cards.enumerated() {
+      let to = slot(j)
+      if calm { c.panel.setFrame(to, display: true) } else {
+        NSAnimationContext.runAnimationGroup { ctx in
+          ctx.duration = 0.3
+          ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+          c.panel.animator().setFrame(to, display: true)
+        }
+      }
+    }
+  }
+
+  func closeAll() { for c in cards.map({ $0.tag }) { close(c) } }
+}
+
 // Lets the page read a shared Finder file piece by piece (so big videos never load all at once).
 final class FileReader: NSObject, WKScriptMessageHandlerWithReply {
   weak var app: AppDelegate?
@@ -378,6 +526,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
   var busy = false                   // a transfer is running (don't restart for an update)
   lazy var updater = Updater(self)
   lazy var popup = ProgressPopup(onClick: { [weak self] in self?.showWindow() })
+  lazy var requests = RequestCards(
+    onAnswer: { [weak self] tag, what in
+      guard let self = self else { return }
+      self.js("beamNative.action(\(self.q(tag)), \(self.q(what)))")
+    },
+    onOpen: { [weak self] in self?.showWindow() })
   var pendingShare: [URL] = []
   var pageReady = false
   var statusItem: NSStatusItem!
@@ -650,9 +804,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
                 state: d["state"] as? String ?? "active", dir: d["dir"] as? String ?? "in",
                 hold: (d["hold"] as? NSNumber)?.intValue ?? 0)
     case "notify":
-      notify(tag: d["tag"] as? String ?? "", title: d["title"] as? String ?? "Beam", body: d["body"] as? String ?? "", request: d["actions"] as? Bool ?? false)
+      let tag = d["tag"] as? String ?? "", title = d["title"] as? String ?? "Beam", body = d["body"] as? String ?? ""
+      let request = d["actions"] as? Bool ?? false
+      let inFront = window.isVisible && NSApp.isActive && window.isKeyWindow
+      if request && !inFront {
+        // Beam's own drop-down card, with buttons that are always visible.
+        requests.show(tag: tag, title: title, body: body)
+      } else if !(request && inFront) {
+        notify(tag: tag, title: title, body: body, request: request)
+      }
     case "unnotify":
-      if let tag = d["tag"] as? String { UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [tag]) }
+      if let tag = d["tag"] as? String {
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [tag])
+        requests.close(tag)
+      }
     case "show":
       showWindow()
     case "saveBegin":

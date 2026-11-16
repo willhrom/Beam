@@ -525,11 +525,20 @@ namespace Beam
                     break;
                 }
                 case "notify":
-                    Notify(Str("tag") ?? "", Str("title") ?? "Beam", Str("body") ?? "",
-                        d.TryGetProperty("actions", out var a) && a.ValueKind == JsonValueKind.True);
+                {
+                    bool request = d.TryGetProperty("actions", out var a) && a.ValueKind == JsonValueKind.True;
+                    bool front = Visible && WindowState != FormWindowState.Minimized && Form.ActiveForm == this;
+                    if (request && !front)
+                        // Beam's own drop-down card, with buttons that are always visible.
+                        RequestCard.ShowFor(Str("tag") ?? "", Str("title") ?? "Beam", Str("body") ?? "",
+                            (tag, what) => Js($"beamNative.action({Q(tag)}, {Q(what)})"), ShowMain);
+                    else if (!request)
+                        Notify(Str("tag") ?? "", Str("title") ?? "Beam", Str("body") ?? "", false);
                     break;
+                }
                 case "unnotify":
                     try { ToastNotificationManagerCompat.History.Remove(Short(Str("tag") ?? "")); } catch { }
+                    RequestCard.CloseFor(Str("tag") ?? "");
                     break;
                 case "show":
                     ShowMain();
@@ -1205,6 +1214,187 @@ namespace Beam
     /// A small card in the lower-right corner of the screen showing a transfer's progress
     /// while Beam's window isn't in front. It never takes focus; clicking it opens Beam.
     /// </summary>
+    /// "Someone wants to send you something" card. While Beam's window isn't in front, each request
+    /// drops down from the top-right corner with Accept and Decline, and stays until it's answered
+    /// (or the sender gives up). Several requests stack downwards.
+    sealed class RequestCard : Form
+    {
+        public readonly string Tag2;
+        readonly string title, body;
+        readonly Action<string, string> answer;
+        readonly Action open;
+        readonly System.Windows.Forms.Timer anim = new System.Windows.Forms.Timer { Interval = 15 };
+        readonly Stopwatch clock = Stopwatch.StartNew();
+        double startAt = -1, endAt = -1;
+        int fromY, toY, baseX;
+        public int Slot;
+        static readonly List<RequestCard> Open = new List<RequestCard>();
+        static bool Calm => !SystemInformation.UIEffectsEnabled;
+        float K => DeviceDpi / 96f;
+
+        public static void ShowFor(string tag, string title, string body, Action<string, string> answer, Action open)
+        {
+            if (Open.Any(c => c.Tag2 == tag)) return;
+            var card = new RequestCard(tag, title, body, answer, open);
+            Open.Add(card);
+            card.Slot = Open.Count - 1;
+            card.Appear();
+            try { System.Media.SystemSounds.Asterisk.Play(); } catch { }
+        }
+
+        public static void CloseFor(string tag)
+        {
+            var c = Open.FirstOrDefault(x => x.Tag2 == tag);
+            c?.Disappear();
+        }
+
+        RequestCard(string tag, string title, string body, Action<string, string> answer, Action open)
+        {
+            Tag2 = tag; this.title = title; this.body = body; this.answer = answer; this.open = open;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            BackColor = Color.FromArgb(23, 33, 54);
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            float k = DeviceDpi / 96f;
+            Size = new Size((int)(352 * k), (int)(118 * k));
+            var acc = MakeButton("Accept", Color.FromArgb(47, 107, 255), Color.White);
+            var dec = MakeButton("Decline", Color.FromArgb(31, 44, 71), Color.FromArgb(237, 242, 250));
+            var opn = new LinkLabel { Text = "Open Beam", AutoSize = true, LinkColor = Color.FromArgb(92, 200, 255), ActiveLinkColor = Color.White, LinkBehavior = LinkBehavior.HoverUnderline, BackColor = Color.Transparent, Font = new Font("Segoe UI", 9f) };
+            int bw = (int)(96 * k), bh = (int)(32 * k), m = (int)(14 * k);
+            acc.SetBounds(Width - m - bw, Height - m - bh, bw, bh);
+            dec.SetBounds(Width - m - bw - (int)(8 * k) - bw, Height - m - bh, bw, bh);
+            opn.Location = new Point((int)(60 * k), Height - m - bh + (int)(7 * k));
+            acc.Click += (s, e) => { answer(Tag2, "accept"); Disappear(); };
+            dec.Click += (s, e) => { answer(Tag2, "decline"); Disappear(); };
+            opn.LinkClicked += (s, e) => { open(); Disappear(); };
+            Controls.Add(acc); Controls.Add(dec); Controls.Add(opn);
+            anim.Tick += (s, e) => Step();
+        }
+
+        static Button MakeButton(string text, Color bg, Color fg)
+        {
+            var b = new Button { Text = text, FlatStyle = FlatStyle.Flat, BackColor = bg, ForeColor = fg, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand, TabStop = false };
+            b.FlatAppearance.BorderSize = 0;
+            b.FlatAppearance.MouseOverBackColor = ControlPaint.Light(bg, 0.15f);
+            b.FlatAppearance.MouseDownBackColor = ControlPaint.Dark(bg, 0.05f);
+            return b;
+        }
+
+        protected override bool ShowWithoutActivation => true;
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008; // never activate, no taskbar button, always on top
+                return cp;
+            }
+        }
+
+        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            int round = 2, border = 0x00FFC85C; // rounded corners, light blue border (BGR)
+            try { DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int)); DwmSetWindowAttribute(Handle, 34, ref border, sizeof(int)); } catch { }
+        }
+
+        Point SlotPoint(int slot)
+        {
+            var area = Screen.PrimaryScreen.WorkingArea;
+            int m = (int)(14 * K);
+            return new Point(area.Right - Width - m, area.Top + m + slot * (Height + (int)(10 * K)));
+        }
+
+        void Appear()
+        {
+            var p = SlotPoint(Slot);
+            baseX = p.X; toY = p.Y; fromY = p.Y - (int)(34 * K);
+            if (Calm) { Location = p; Show(); return; }
+            Opacity = 0;
+            Location = new Point(baseX, fromY);
+            Show();
+            startAt = clock.Elapsed.TotalMilliseconds;
+            anim.Start();
+        }
+
+        void Disappear()
+        {
+            if (!Open.Remove(this)) return;
+            for (int i = 0; i < Open.Count; i++) Open[i].MoveTo(i);
+            if (Calm) { Close(); return; }
+            endAt = clock.Elapsed.TotalMilliseconds;
+            startAt = -1;
+            anim.Start();
+        }
+
+        void MoveTo(int slot)
+        {
+            Slot = slot;
+            var p = SlotPoint(slot);
+            fromY = Location.Y; toY = p.Y; baseX = p.X;
+            if (Calm) { Location = p; return; }
+            startAt = clock.Elapsed.TotalMilliseconds;
+            anim.Start();
+        }
+
+        static double EaseOutBack(double t) { const double c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.Pow(t - 1, 3) + c1 * Math.Pow(t - 1, 2); }
+
+        void Step()
+        {
+            double now = clock.Elapsed.TotalMilliseconds;
+            if (endAt >= 0)
+            {
+                double t = Math.Min(1, (now - endAt) / 220);
+                Location = new Point(baseX + (int)(t * t * 40 * K), Location.Y);
+                Opacity = 1 - t;
+                if (t >= 1) { anim.Stop(); Close(); }
+                return;
+            }
+            if (startAt >= 0)
+            {
+                double t = Math.Min(1, (now - startAt) / 450);
+                Location = new Point(baseX, fromY + (int)Math.Round((toY - fromY) * EaseOutBack(t)));
+                if (Opacity < 1) Opacity = Math.Min(1, t * 2);
+                if (t >= 1) { startAt = -1; anim.Stop(); }
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            try
+            {
+                var g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                float k = K;
+                var accent = Color.FromArgb(92, 200, 255);
+                var badge = new RectangleF(14 * k, 14 * k, 34 * k, 34 * k);
+                using (var b = new SolidBrush(Color.FromArgb(38, accent))) g.FillEllipse(b, badge);
+                using (var pen = new Pen(accent, 2.2f * k) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                {
+                    float cx = badge.X + badge.Width / 2, cy = badge.Y + badge.Height / 2, a = 6.5f * k;
+                    g.DrawLine(pen, cx, cy - a, cx, cy + a);
+                    g.DrawLines(pen, new[] { new PointF(cx - a * 0.7f, cy + a * 0.3f), new PointF(cx, cy + a), new PointF(cx + a * 0.7f, cy + a * 0.3f) });
+                }
+                float left = 60 * k, width = ClientSize.Width - left - 14 * k;
+                using var titleFont = new Font("Segoe UI Semibold", 13.5f * k, GraphicsUnit.Pixel);
+                using var bodyFont = new Font("Segoe UI", 12f * k, GraphicsUnit.Pixel);
+                using var paper = new SolidBrush(Color.FromArgb(237, 242, 250));
+                using var dim = new SolidBrush(Color.FromArgb(147, 161, 184));
+                var fmt = new StringFormat { Trimming = StringTrimming.EllipsisCharacter };
+                g.DrawString(title, titleFont, paper, new RectangleF(left, 12 * k, width, 38 * k), fmt);
+                g.DrawString(body, bodyFont, dim, new RectangleF(left, 50 * k, width, 18 * k), fmt);
+            }
+            catch { }
+        }
+    }
+
     sealed class ProgressPopup : Form
     {
         string title = "", detail = "", state = "active", dir = "in";
