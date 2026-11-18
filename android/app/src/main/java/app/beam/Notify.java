@@ -119,6 +119,16 @@ final class Notify {
 
   void received(Transfer t) {
     int id = idFor(t) + 140000;
+    // A link from one of my own devices opens by itself. Android only lets an app open things while
+    // it's on screen; otherwise the notification below opens it in one tap.
+    String link = t.items.size() == 1 && t.items.get(0).text && t.items.get(0).textValue != null ? t.items.get(0).textValue.trim() : null;
+    Beam beam = Beam.get(c);
+    if (link != null && link.matches("^https?://\\S+$") && beam.prefs.openLinks && beam.isMine(t.peerId) && MainActivity.inFront) {
+      try {
+        c.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        return;
+      } catch (Exception ignored) {}
+    }
     Notification.Builder b = new Notification.Builder(c, CH_DONE).setSmallIcon(R.drawable.ic_stat).setAutoCancel(true);
     Transfer.Item first = t.items.get(0);
     if (t.items.size() == 1 && first.text && first.textValue != null) {

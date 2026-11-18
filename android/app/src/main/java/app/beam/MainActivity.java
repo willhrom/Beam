@@ -106,8 +106,12 @@ public class MainActivity extends Activity implements Beam.Listener {
     }
   }
 
+  /** Beam's screen is showing (so it may open a link right away). */
+  static volatile boolean inFront;
+
   @Override protected void onResume() {
     super.onResume();
+    inFront = true;
     beam.listeners.add(this);
     beam.start(); // always connected while Beam is open, whatever the background setting
     beam.kick();
@@ -141,6 +145,7 @@ public class MainActivity extends Activity implements Beam.Listener {
 
   @Override protected void onPause() {
     super.onPause();
+    inFront = false;
     beam.listeners.remove(this);
     beam.nearby.discover(false);
   }
@@ -280,10 +285,11 @@ public class MainActivity extends Activity implements Beam.Listener {
     for (Beam.Peer p : all) {
       ids.add(p.id);
       boolean mine = beam.prefs.paired.containsKey(p.id) || p.mine;
-      String k = p.name + "|" + noteFor(p) + "|" + mine + "|" + beam.isOfflineOnly(p.id) + "|" + p.kind;
+      String k = p.name + "|" + noteFor(p) + "|" + mine + "|" + beam.isOfflineOnly(p.id) + "|" + p.kind + "|" + beam.isFav(p.id);
       LinearLayout b = bubbles.get(p.id);
       if (b == null || !k.equals(bubbleKeys.get(p.id))) {
         b = Ui.peerBubble(this, p, mine, noteFor(p), beam.isOfflineOnly(p.id));
+        if (beam.isFav(p.id)) Ui.addStar(this, b);
         b.setOnClickListener(v -> chooseWhat(p.id));
         Fx.squishOnTouch(b);
         bubbles.put(p.id, b);
@@ -450,6 +456,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     } else if (t.active()) {
       btns.addView(Ui.button(this, "Cancel", 0x18FFFFFF, Ui.TEXT, v -> beam.cancel(t.tid)));
     } else {
+      if (t.canSendAgain()) btns.addView(Ui.button(this, "Send again", 0x18FFFFFF, Ui.TEXT, v -> beam.sendAgain(t.tid)), Ui.margins(this, -2, -2, 0, 0, 6, 0));
       btns.addView(Ui.button(this, "✕", 0x18FFFFFF, Ui.TEXT, v -> beam.clear(t.tid)));
     }
     top.addView(btns);
@@ -531,7 +538,12 @@ public class MainActivity extends Activity implements Beam.Listener {
   private void chooseWhat(String peerId) {
     Beam.Peer p = beam.peer(peerId);
     if (p == null) return;
+    boolean fav = beam.isFav(peerId);
     Ui.dialog(this).setCustomTitle(Ui.title(this, "Send to " + p.name))
+        .setNeutralButton(fav ? "★ Unpin" : "☆ Pin to top", (d, w) -> {
+          beam.toggleFav(peerId);
+          Toast.makeText(this, p.name + (fav ? " unpinned" : " pinned to the top"), Toast.LENGTH_SHORT).show();
+        })
         .setItems(new String[] { "Files or photos", "A folder", "Text or link" }, (d, which) -> {
           if (which == 0) {
             pickFor = peerId;
@@ -780,6 +792,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     }));
     addRow(rx, fr);
     Switch aa = switchRow(rx, "Auto-accept from my devices", "What they send arrives without asking", beam.prefs.autoAccept);
+    Switch ol = switchRow(rx, "Open links from my devices", "A link sent from one of your devices opens in your browser", beam.prefs.openLinks);
     l.addView(rx);
 
     // Activity
@@ -842,6 +855,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       beam.prefs.autoAccept = aa.isChecked();
       beam.prefs.enabled = on.isChecked();
       beam.prefs.galleryMedia = gm.isChecked();
+      beam.prefs.openLinks = ol.isChecked();
       beam.prefs.save();
       if (wasOn && !beam.prefs.enabled) BeamService.stop(this);
       else if (!wasOn && beam.prefs.enabled) BeamService.start(this);

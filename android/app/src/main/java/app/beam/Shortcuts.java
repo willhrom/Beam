@@ -26,10 +26,15 @@ final class Shortcuts {
   static final String PREFIX = "dev_";
   private static String lastKey = "";
 
-  /** Paired devices first, then the ones you've sent to most recently. */
+  /** Pinned favorites first, then paired devices, then the ones you've sent to most recently. */
   static void update(Beam beam) {
     Map<String, String[]> devs = new LinkedHashMap<>();
-    for (String[] r : beam.prefs.recent) if (beam.prefs.paired.containsKey(r[0])) devs.put(r[0], new String[] { beam.prefs.paired.get(r[0]).name, r[2] });
+    for (String id : beam.prefs.favs) {
+      Prefs.Paired pd = beam.prefs.paired.get(id);
+      if (pd != null) { devs.put(id, new String[] { pd.name, pd.kind }); continue; }
+      for (String[] r : beam.prefs.recent) if (r[0].equals(id)) { devs.put(id, new String[] { r[1], r[2] }); break; }
+    }
+    for (String[] r : beam.prefs.recent) if (beam.prefs.paired.containsKey(r[0]) && !devs.containsKey(r[0])) devs.put(r[0], new String[] { beam.prefs.paired.get(r[0]).name, r[2] });
     for (Prefs.Paired p : beam.prefs.paired.values()) if (!devs.containsKey(p.id)) devs.put(p.id, new String[] { p.name, p.kind });
     for (String[] r : beam.prefs.recent) if (!devs.containsKey(r[0])) devs.put(r[0], new String[] { r[1], r[2] });
     ShortcutManager sm = beam.app.getSystemService(ShortcutManager.class);

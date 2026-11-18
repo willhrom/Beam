@@ -472,8 +472,40 @@ final class Beam {
   }
 
   void clear(String tid) {
-    tx.remove(tid);
+    Transfer t = tx.remove(tid);
+    if (t != null && !t.incoming && !t.active()) t.cleanupTemp();
     changed();
+  }
+
+  /** Signed in to my own account. */
+  boolean isMine(String id) {
+    for (Peer p : allPeers()) if (p.id.equals(id)) return p.mine;
+    return false;
+  }
+
+  /** A send that failed for good: send the same things again, from the start. */
+  void sendAgain(String tid) {
+    Transfer old = tx.get(tid);
+    if (old == null || !old.canSendAgain()) return;
+    Peer p = null;
+    for (Peer q : allPeers()) if (q.id.equals(old.peerId)) p = q;
+    if (p == null) {
+      android.widget.Toast.makeText(app, old.peerName + " isn't reachable right now. Try again when it's back", android.widget.Toast.LENGTH_LONG).show();
+      return;
+    }
+    List<Transfer.Item> items = new ArrayList<>();
+    for (Transfer.Item i : old.items) {
+      Transfer.Item n = new Transfer.Item(i.name, i.size, i.type, i.text);
+      n.path = i.path;
+      n.uri = i.uri;
+      n.temp = i.temp;            // the copy moves to the new transfer
+      n.sharedTemp = i.sharedTemp;
+      n.textValue = i.textValue;
+      i.temp = null;
+      items.add(n);
+    }
+    tx.remove(tid);
+    send(p, items);
   }
 
   void updateServer() {
@@ -572,10 +604,25 @@ final class Beam {
   }
 
   /** Everyone reachable: through the server, plus phones found offline over Bluetooth. */
+  /** Every device I can reach, pinned favorites first (in the order they were pinned). */
   List<Peer> allPeers() {
     List<Peer> all = new ArrayList<>(peers);
     for (Peer p : nearby.found.values()) if (onlinePeer(p.id) == null && !contains(all, p.id)) all.add(p);
+    final List<String> fav = prefs.favs;
+    java.util.Collections.sort(all, (a, b) -> {
+      int fa = fav.indexOf(a.id), fb = fav.indexOf(b.id);
+      return Integer.compare(fa < 0 ? Integer.MAX_VALUE : fa, fb < 0 ? Integer.MAX_VALUE : fb);
+    });
     return all;
+  }
+
+  boolean isFav(String id) { return prefs.favs.contains(id); }
+
+  void toggleFav(String id) {
+    if (!prefs.favs.remove(id)) prefs.favs.add(id);
+    prefs.save();
+    Shortcuts.update(this);
+    changed();
   }
 
   private static boolean contains(List<Peer> list, String id) {

@@ -90,7 +90,7 @@ main { flex: 1; display: flex; flex-direction: column; align-items: center; over
 /* Devices drift very gently, like they're floating on the sonar. */
 @keyframes bob { 0%, 100% { translate: 0 0; } 50% { translate: 0 -4px; } }
 .avatar { position: relative; width: 68px; height: 68px; margin-bottom: 8px; border-radius: 50%; display: grid; place-items: center; background: var(--raised); border: 1px solid var(--line); transition: background .15s, border-color .15s, transform .12s; }
-.avatar > svg:first-child { width: 29px; height: 29px; color: var(--paper); }
+.avatar > svg:not(.ring) { width: 29px; height: 29px; color: var(--paper); }
 .peer.mine .avatar { background: var(--raised-2); border-color: rgba(92, 200, 255, .55); }
 .peer:hover .avatar, .peer.drop .avatar { background: var(--raised-2); border-color: var(--signal); }
 .peer:active .avatar { transform: scale(.96); }
@@ -333,3 +333,14 @@ textarea { height: auto; min-height: 110px; padding: 10px 12px; resize: vertical
 .card .pick-who { margin: 10px 2px 0; font-size: 13px; color: var(--signal); overflow-wrap: anywhere; }
 .card .pick-who:empty { display: none; }
 .card h2 { overflow-wrap: anywhere; }
+
+/* Pinned devices: a small star on the icon, and the Pin button in the Send sheet. */
+.avatar .star { position: absolute; top: -3px; right: -3px; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center;
+  background: #ffd166; color: #3a2a00; box-shadow: 0 0 0 3px var(--night); z-index: 2; }
+.avatar .star svg { width: 13px; height: 13px; }
+.send-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.send-head h2 { min-width: 0; }
+.btn.pin { flex: none; gap: 6px; }
+.btn.pin svg { width: 15px; height: 15px; color: var(--dim); }
+.btn.pin.on { border-color: rgba(255, 209, 102, .5); color: #ffd166; }
+.btn.pin.on svg { color: #ffd166; }

@@ -85,6 +85,27 @@ final class Ui {
     return p;
   }
 
+  /** A small gold star on a device's circle: it's pinned to the top. */
+  static void addStar(Context c, LinearLayout bubble) {
+    if (bubble.getChildCount() == 0) return;
+    View circle = bubble.getChildAt(0);
+    bubble.removeViewAt(0);
+    android.widget.FrameLayout f = new android.widget.FrameLayout(c);
+    f.setClipChildren(false);
+    f.addView(circle, circle.getLayoutParams() != null ? new android.widget.FrameLayout.LayoutParams(circle.getLayoutParams().width, circle.getLayoutParams().height) : new android.widget.FrameLayout.LayoutParams(-2, -2));
+    TextView star = text(c, "★", 11, 0xFF3A2A00, true);
+    star.setGravity(Gravity.CENTER);
+    android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+    g.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+    g.setColor(0xFFFFD166);
+    g.setStroke(dp(c, 2), BG);
+    star.setBackground(g);
+    android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(dp(c, 22), dp(c, 22), Gravity.TOP | Gravity.END);
+    lp.setMargins(0, -dp(c, 2), -dp(c, 2), 0);
+    f.addView(star, lp);
+    bubble.addView(f, 0, circle.getLayoutParams() instanceof LinearLayout.LayoutParams ? circle.getLayoutParams() : new LinearLayout.LayoutParams(-2, -2));
+  }
+
   /** A pop-up title that wraps instead of cutting off (for long device names). */
   static TextView title(Context c, String s) {
     TextView t = text(c, s, 19, TEXT, true);

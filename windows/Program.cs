@@ -540,6 +540,11 @@ namespace Beam
                     try { ToastNotificationManagerCompat.History.Remove(Short(Str("tag") ?? "")); } catch { }
                     RequestCard.CloseFor(Str("tag") ?? "");
                     break;
+                case "openUrl":
+                    // A link from one of my own devices: open it in the default browser (web links only).
+                    if (Uri.TryCreate(Str("url") ?? "", UriKind.Absolute, out var lu) && (lu.Scheme == Uri.UriSchemeHttp || lu.Scheme == Uri.UriSchemeHttps))
+                        OpenExternal(lu.AbsoluteUri);
+                    break;
                 case "show":
                     ShowMain();
                     break;

@@ -113,6 +113,7 @@ const S = {
   nearby: store.get("nearby", true),
   autoAccept: store.get("autoAccept", true),
   convert: store.get("convert", true),
+  openLinks: store.get("openLinks", true),
   paired: store.get("paired", {}), // id -> {pub, name, kind}
   peers: [],
   ice: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }],
@@ -190,6 +191,7 @@ async function onServer(m) {
       // keep paired names fresh
       for (const p of S.peers) if (S.paired[p.id] && S.paired[p.id].pub === p.pub && S.paired[p.id].name !== p.name) { S.paired[p.id].name = p.name; savePaired(); }
       render();
+      resumeWaiting();
       break;
     case "signal":
       await onSignal(m.from, m.data || {});
@@ -253,7 +255,7 @@ function reloadWhenIdle() {
 function updateServer() { wsSend({ t: "update", name: S.name, nearby: S.nearby, watch: Object.keys(S.paired) }); }
 
 // ---------- signaling between devices ----------
-const RESUME_WINDOW = 15 * 60 * 1000; // how long a dropped transfer waits to pick back up
+const RESUME_WINDOW = 2 * 3600 * 1000; // how long a dropped transfer waits to pick back up (laptop asleep, out of range…)
 const BIG = 100 * 1024 * 1024;        // above this, browsers that can save straight to disk do so
 
 async function onSignal(from, d) {
@@ -418,17 +420,41 @@ function dropped(t, gen) {
   t.state = "paused";
   t.pausedAt = t.pausedAt || Date.now();
   renderTx(t);
-  if (t.dir === "out") setTimeout(() => retry(t), 2000 + Math.random() * 1000);
+  if (t.dir === "out") { clearTimeout(t.retryTimer); t.retryTimer = setTimeout(() => retry(t), Math.min(30000, 2000 * 2 ** Math.min(t.tries || 0, 4)) + Math.random() * 1000); }
   else setTimeout(() => { if (t.state === "paused" && Date.now() - t.pausedAt >= RESUME_WINDOW) fail(t, "Connection lost"); }, RESUME_WINDOW + 1000);
 }
 
 function retry(t) {
+  clearTimeout(t.retryTimer);
   if (t.state !== "paused") return;
   if (Date.now() - t.pausedAt > RESUME_WINDOW) return fail(t, "Connection lost");
-  if (!S.online) return setTimeout(() => retry(t), 3000);
+  // Wait quietly until we're online and the other device is back, instead of knocking on a closed door.
+  const back = S.online && S.peers.some((p) => p.id === t.peer.id);
+  if (!back) { t.retryTimer = setTimeout(() => retry(t), 5000); return; }
+  t.tries = (t.tries || 0) + 1;
   t.state = "reconnecting";
   renderTx(t);
   connectOut(t, "resume").catch(() => dropped(t, t.gen));
+}
+// The other device just showed up again: pick paused transfers to it straight back up.
+function resumeWaiting() {
+  for (const t of S.tx.values()) if (t.dir === "out" && t.state === "paused" && S.peers.some((p) => p.id === t.peer.id)) retry(t);
+}
+// A transfer that failed for good: send the same things again, from the start.
+function sendAgain(t) {
+  if (!t.blobs) return;
+  const peer = S.peers.find((p) => p.id === t.peer.id) || t.peer;
+  const files = [], textIdx = t.items.findIndex((i) => i.text);
+  t.items.forEach((it, i) => {
+    if (it.text) return;
+    const b = t.blobs[i];
+    const f = b instanceof File && b.name === it.name ? b : new File([b], it.name, { type: it.type });
+    if (it.path && f.beamPath === undefined) try { Object.defineProperty(f, "beamPath", { value: it.path + "/" + it.name }); } catch {}
+    files.push(f);
+  });
+  S.tx.delete(t.tid);
+  renderTxList();
+  sendItems(peer, files, textIdx >= 0 ? t.sentText : "");
 }
 
 // Big batches: the file list goes gzipped so the offer stays small (thousands of names fit).
@@ -701,6 +727,23 @@ function setupReceive(t, dc, gen) {
   };
 }
 
+// ----- links that open themselves -----
+// A single link sent from one of my own devices (same account) opens straight in the browser.
+function openLinkIfMine(t) {
+  if (t.dir !== "in" || S.openLinks === false || !t.received || t.received.length !== 1 || !t.received[0].text) return;
+  const url = t.received[0].text.trim();
+  if (!/^https?:\/\/\S+$/.test(url)) return;
+  const peer = S.peers.find((p) => p.id === t.peer.id);
+  if (!peer || !peer.mine) return;
+  if (native) { native.postMessage({ op: "openUrl", url }); return; }
+  // A browser tab may block opening a window it wasn't asked to; then the notification opens it.
+  const w = window.open(url, "_blank", "noopener");
+  if (!w && "Notification" in window && Notification.permission === "granted") {
+    const n = new Notification("Link from " + t.peer.name, { body: url + "\nClick to open", tag: "link-" + t.tid, icon: "/icon-192.png" });
+    n.onclick = () => { window.open(url, "_blank", "noopener"); n.close(); };
+  }
+}
+
 // ----- history -----
 // The last 200 transfers on this device, kept locally (never sent anywhere).
 const HISTORY_MAX = 200;
@@ -759,6 +802,7 @@ function finish(t) {
   if (t.state === "done" || t.state === "failed") return;
   t.state = "done";
   recordHistory(t);
+  openLinkIfMine(t);
   renderTx(t);
   progressFinal(t);
   setTimeout(() => { if (t.state === "done") closePc(t); }, 1500);
@@ -898,6 +942,25 @@ function progressFinal(t) {
   });
 }
 
+// ---------- favorites ----------
+// Devices pinned to the top, kept on this device. Pin or unpin from a device's "Send to" sheet.
+function favList() { const f = store.get("favs", []); return Array.isArray(f) ? f : []; }
+function isFav(id) { return favList().includes(id); }
+function toggleFav(id) {
+  const f = favList(), i = f.indexOf(id);
+  if (i >= 0) f.splice(i, 1); else f.push(id);
+  store.set("favs", f);
+  render();
+}
+function byFavorite(peers) {
+  const f = favList();
+  return peers.slice().sort((a, b) => {
+    const fa = f.indexOf(a.id), fb = f.indexOf(b.id);
+    if (fa >= 0 || fb >= 0) return (fa < 0 ? 1e9 : fa) - (fb < 0 ? 1e9 : fb);
+    return 0;
+  });
+}
+
 // ---------- UI ----------
 const ICONS = {
   phone: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M16 1H8a3 3 0 0 0-3 3v16a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3V4a3 3 0 0 0-3-3zm1 19a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h1.5l.5 1h4l.5-1H16a1 1 0 0 1 1 1z"/></svg>',
@@ -909,6 +972,7 @@ const ICONS = {
   down: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 5v14m-6-6 6 6 6-6"/></svg>',
   up: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 19V5m-6 6 6-6 6 6"/></svg>',
   check: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
+  star: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="m12 2.8 2.8 5.9 6.4.8-4.7 4.4 1.2 6.4L12 17.2l-5.7 3.1 1.2-6.4-4.7-4.4 6.4-.8z"/></svg>',
   cross: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" d="M7 7l10 10M17 7 7 17"/></svg>',
   pause: '<svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" d="M9 7v10m6-10v10"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zm4 18H6V4h7v5h5z"/></svg>',
@@ -928,10 +992,12 @@ function render() {
   const ids = new Set(S.peers.map((p) => p.id));
   const fresh = [];
   for (const el of [...box.children]) if (!ids.has(el.dataset.id)) el.remove();
-  for (const p of S.peers) {
+  const ordered = byFavorite(S.peers);
+  for (const p of ordered) {
     let el = box.querySelector(`[data-id="${p.id}"]`);
     const paired = (!!S.paired[p.id] && S.paired[p.id].pub === p.pub) || p.mine;
-    const html = `<div class="avatar">${iconFor(p.kind)}<svg class="ring" viewBox="0 0 82 82"><circle class="track" cx="41" cy="41" r="38"/><circle class="arc" cx="41" cy="41" r="38" transform="rotate(-90 41 41)" stroke-dasharray="238.8" stroke-dashoffset="238.8"/></svg></div>
+    const fav = isFav(p.id);
+    const html = `<div class="avatar">${fav ? `<span class="star" title="Pinned to the top">${ICONS.star}</span>` : ""}${iconFor(p.kind)}<svg class="ring" viewBox="0 0 82 82"><circle class="track" cx="41" cy="41" r="38"/><circle class="arc" cx="41" cy="41" r="38" transform="rotate(-90 41 41)" stroke-dasharray="238.8" stroke-dashoffset="238.8"/></svg></div>
       <div class="name">${esc(p.name)}</div><div class="tag ${paired ? "paired" : ""}">${paired ? "My device" : "Nearby"}</div>`;
     if (!el) {
       el = document.createElement("button");
@@ -959,7 +1025,10 @@ function render() {
     }
     if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; el.title = p.name; el.setAttribute("aria-label", "Send to " + p.name); }
     el.classList.toggle("mine", paired);
+    el.classList.toggle("fav", fav);
   }
+  // Keep the on-screen order matching: pinned devices first.
+  ordered.forEach((p, i) => { const el = box.querySelector(`[data-id="${p.id}"]`); if (el && box.children[i] !== el) box.insertBefore(el, box.children[i] || null); });
   // A new device pops in with a little ping from the beam.
   fresh.forEach((el, i) => setTimeout(() => { if (el.isConnected) { FX.pulse(el.querySelector(".avatar"), "ping", 1000); FX.spark(FX.you(), el.querySelector(".avatar"), { ms: 600 }); } }, 120 + i * 90));
   $("#empty").style.display = S.peers.length ? "none" : "";
@@ -993,7 +1062,7 @@ function pendingLabel() {
 function showRecipients(files, text, title) {
   S.pending = { files, text: text || null };
   render();
-  const list = () => S.peers.map((p) => `<label class="item pick"><span>${iconFor(p.kind)}<span>${esc(p.name)}<small class="sub">${S.paired[p.id] || p.mine ? "My device" : "Nearby"}</small></span></span><input type="checkbox" class="check" value="${p.id}" ${S.pickSel && S.pickSel.has(p.id) ? "checked" : ""}></label>`).join("")
+  const list = () => byFavorite(S.peers).map((p) => `<label class="item pick"><span>${iconFor(p.kind)}<span>${esc(p.name)}<small class="sub">${isFav(p.id) ? "Pinned, " : ""}${S.paired[p.id] || p.mine ? "My device" : "Nearby"}</small></span></span><input type="checkbox" class="check" value="${p.id}" ${S.pickSel && S.pickSel.has(p.id) ? "checked" : ""}></label>`).join("")
     || '<div class="item"><span class="sub">Looking for devices… Open Beam on the other device.</span></div>';
   openSheet(`<h2>${esc(title || "Send " + pendingLabel())}</h2>
     <p>${files.length ? fmtSize(files.reduce((a, f) => a + f.size, 0)) + ". " : ""}Pick one device or several.</p>
@@ -1107,7 +1176,9 @@ function txLine(t) {
     case "sending": return "Sending to " + n;
     case "receiving": return "Receiving from " + n;
     case "finishing": return "Finishing up";
-    case "paused": return "Connection lost. It will pick up where it stopped";
+    case "paused": return t.dir === "out" && !S.peers.some((p) => p.id === t.peer.id)
+      ? `Waiting for ${n} to come back. It picks up where it stopped`
+      : "Connection lost. It will pick up where it stopped";
     case "reconnecting": return "Reconnecting to " + n;
     case "done": return (t.dir === "out" ? "Sent to " : "Received from ") + n;
     default: {
@@ -1181,7 +1252,8 @@ function renderTx(t) {
   let btns = "";
   if (t.state === "asking") btns = `<button class="btn primary small" data-act="accept">Accept</button><button class="btn ghost small" data-act="decline">Decline</button>`;
   else if (!["done", "failed"].includes(t.state)) btns = `<button class="btn ghost small" data-act="cancel">Cancel</button>`;
-  else btns = `<button class="btn ghost small icon" data-act="clear" aria-label="Remove from list">✕</button>`;
+  else btns = (t.state === "failed" && t.dir === "out" && t.blobs && t.reason !== "Declined" ? `<button class="btn ghost small" data-act="again">Send again</button>` : "") +
+    `<button class="btn ghost small icon" data-act="clear" aria-label="Remove from list">✕</button>`;
   const side = moving ? `<span class="pct">${pct}%</span>` : t.total && !t.items.every((i) => i.text) ? `<span class="size">${fmtSize(t.total)}</span>` : "";
   const html = `<div class="tx-head"><span class="tx-ico">${txIcon(t)}</span><div class="tx-text"><div class="title">${esc(txTitle(t))}</div><div class="sub">${esc(txLine(t))}</div></div><div class="tx-side">${one ? oneBtn : side}${btns}</div></div>${body}`;
   if (el.dataset.html !== html) {
@@ -1192,6 +1264,7 @@ function renderTx(t) {
       if (a === "accept") accept(t, true);
       else if (a === "decline") decline(t);
       else if (a === "cancel") cancelTx(t);
+      else if (a === "again") sendAgain(t);
       else if (a === "clear") { for (const r of t.received || []) if (r.url) URL.revokeObjectURL(r.url); S.tx.delete(t.tid); renderTxList(); }
     }));
     el.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => { navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")); }));
@@ -1524,12 +1597,13 @@ function chooseWhat(peerId) {
   const p = S.peers.find((x) => x.id === peerId);
   if (!p) return;
   if (S.pending) { const v = S.pending; S.pending = null; closeSheet(); render(); return sendItems(p, v.files || [], v.text || null); }
-  openSheet(`<h2>Send to ${esc(p.name)}</h2>
+  openSheet(`<div class="send-head"><h2>Send to ${esc(p.name)}</h2><button class="btn ghost small pin ${isFav(p.id) ? "on" : ""}" id="pin">${ICONS.star}${isFav(p.id) ? "Pinned" : "Pin to top"}</button></div>
     <div class="big-choice">
       <button class="btn ghost" id="pickFiles">${ICONS.file}Files or photos</button>
       <button class="btn ghost" id="pickFolder">${ICONS.folder}A folder</button>
       <button class="btn ghost" id="pickText">${ICONS.text}Text or link</button>
     </div>`);
+  $("#pin").onclick = () => { toggleFav(p.id); const on = isFav(p.id); $("#pin").classList.toggle("on", on); $("#pin").innerHTML = ICONS.star + (on ? "Pinned" : "Pin to top"); toast(on ? p.name + " pinned to the top" : p.name + " unpinned"); };
   const pick = (folder) => () => {
     closeSheet();
     const inp = $(folder ? "#folderPick" : "#filePick");
@@ -1589,6 +1663,7 @@ function showSettings() {
     canSaveToDisk ? `<div class="opt"><span>Save files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Downloads. Big transfers ask where to save"}</small></span><button class="btn ghost small" id="sf">Choose…</button></div>` : "",
     nativeKind === "windows" ? `<label class="opt"><span>Convert iPhone photos and videos<small>HEIC to JPG and HEVC to MP4, so every app opens them</small></span><input type="checkbox" class="toggle" id="cv" ${S.convert !== false ? "checked" : ""}></label>` : "",
     `<label class="opt"><span>Auto-accept from my devices<small>What they send arrives without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>`,
+    `<label class="opt"><span>Open links from my devices<small>A link sent from one of your devices opens in your browser</small></span><input type="checkbox" class="toggle" id="ol" ${S.openLinks !== false ? "checked" : ""}></label>`,
     !native && "Notification" in window && Notification.permission !== "granted" ? '<div class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></div>' : "",
   ].join("");
   openSheet(`<div class="set-head"><h2>Settings</h2></div>
@@ -1717,6 +1792,8 @@ function saveSettings() {
   const name = nm.value.trim().slice(0, 40) || S.name;
   const changed = name !== S.name || nb.checked !== S.nearby;
   S.name = name; S.nearby = nb.checked; S.autoAccept = aa.checked;
+  const ol = $("#ol");
+  if (ol) { S.openLinks = ol.checked; store.set("openLinks", S.openLinks); }
   const cv = $("#cv");
   if (cv && cv.checked !== (S.convert !== false)) { S.convert = cv.checked; store.set("convert", S.convert); native.postMessage({ op: "setConvert", on: S.convert }); }
   store.set("name", S.name); store.set("nearby", S.nearby); store.set("autoAccept", S.autoAccept);

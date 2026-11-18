@@ -43,7 +43,7 @@ final class Transfer {
       DONE = "done", FAILED = "failed";
   static final int CHUNK = 64 * 1024;
   static final long HIGH_WATER = 4L * 1024 * 1024;
-  static final long RESUME_WINDOW = 15 * 60 * 1000L;
+  static final long RESUME_WINDOW = 2 * 3600 * 1000L; // laptop asleep, out of range… it still picks back up
 
   static final class Item {
     final String name, type;
@@ -1002,13 +1002,20 @@ final class Transfer {
     if (worthKeeping) History.record(beam.app, this);
     synchronized (lock) { lock.notifyAll(); }
     if (incoming) new Thread(this::discardPartial).start();
-    cleanupTemp();
+    // Keep our copies for a while so "Send again" works; clearing the card or two hours tidies them up.
+    if (incoming || "Cancelled".equals(why) || "Declined".equals(why)) cleanupTemp();
+    else beam.main.postDelayed(this::cleanupTemp, RESUME_WINDOW);
     stopDiscovering();
     ui();
     beam.main.postDelayed(() -> { if (r != null) r.close(); }, 500);
   }
 
-  private void cleanupTemp() {
+  /** Whether this failed send can be tried again from the start. */
+  boolean canSendAgain() {
+    return !incoming && FAILED.equals(state) && !"Declined".equals(reason) && !"Cancelled".equals(reason);
+  }
+
+  void cleanupTemp() {
     for (Item i : items) if (i.temp != null && !i.sharedTemp) { i.temp.delete(); i.temp = null; }
   }
 }

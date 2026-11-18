@@ -17,6 +17,8 @@ jobs:
       - name: Build
         env:
           BEAM_URL: ${{ vars.BEAM_URL }}
+          MAC_SIGN_P12_B64: ${{ secrets.MAC_SIGN_P12_B64 }}
+          MAC_SIGN_PASSWORD: ${{ secrets.MAC_SIGN_PASSWORD }}
         run: |
           URL="${BEAM_URL:-https://beam.wahromyk.workers.dev}"
           sed -e "s#__BEAM_URL__#$URL#" -e "s#__REPO__#${{ github.repository }}#" mac/main.swift > "$RUNNER_TEMP/main.swift"
@@ -27,7 +29,29 @@ jobs:
           lipo -create "$RUNNER_TEMP/beam-arm64" "$RUNNER_TEMP/beam-x86" -output $APP/Contents/MacOS/Beam
           sed -e "s#__VERSION__#1.0.${{ github.run_number }}#" -e "s#__BUILD__#${{ github.run_number }}#" mac/Info.plist > $APP/Contents/Info.plist
           iconutil -c icns mac/AppIcon.iconset -o $APP/Contents/Resources/AppIcon.icns
-          codesign --force --deep --sign - $APP
+          # Sign with the same certificate every build, so macOS treats each update as the same app
+          # (no Keychain prompt after updates). Without the certificate, fall back to a throwaway signature.
+          if [ -n "$MAC_SIGN_P12_B64" ]; then
+            KC="$RUNNER_TEMP/beam-sign.keychain-db"
+            KCPW=$(openssl rand -hex 16)
+            echo "$MAC_SIGN_P12_B64" | base64 --decode > "$RUNNER_TEMP/sign.p12"
+            security create-keychain -p "$KCPW" "$KC"
+            security set-keychain-settings -lut 3600 "$KC"
+            security unlock-keychain -p "$KCPW" "$KC"
+            security import "$RUNNER_TEMP/sign.p12" -k "$KC" -P "$MAC_SIGN_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPW" "$KC" > /dev/null
+            security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+            # codesign only uses a certificate the build machine trusts; trust ours on this throwaway runner.
+            openssl pkcs12 -in "$RUNNER_TEMP/sign.p12" -clcerts -nokeys -passin pass:"$MAC_SIGN_PASSWORD" -out "$RUNNER_TEMP/sign.pem"
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/sign.pem"
+            rm -f "$RUNNER_TEMP/sign.p12" "$RUNNER_TEMP/sign.pem"
+            security find-identity -p codesigning "$KC"
+            codesign --force --deep --keychain "$KC" --sign "Beam Code Signing" --identifier app.beam.mac $APP
+            codesign -dr - $APP
+          else
+            echo "::warning::MAC_SIGN_P12_B64 not set: signing with a throwaway signature (Keychain will ask again after each update)"
+            codesign --force --deep --sign - $APP
+          fi
           ditto -c -k --keepParent $APP Beam-mac.zip
           SHA=$(shasum -a 256 Beam-mac.zip | cut -d' ' -f1)
           echo "{\"version\": ${{ github.run_number }}, \"url\": \"https://github.com/${{ github.repository }}/releases/download/mac/Beam-mac.zip\", \"sha256\": \"$SHA\"}" > mac.json

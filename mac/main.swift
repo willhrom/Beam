@@ -818,6 +818,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [tag])
         requests.close(tag)
       }
+    case "openUrl":
+      // A link from one of my own devices: open it in the default browser (web links only).
+      if let str = d["url"] as? String, let u = URL(string: str), ["http", "https"].contains(u.scheme?.lowercased() ?? "") { NSWorkspace.shared.open(u) }
     case "show":
       showWindow()
     case "saveBegin":

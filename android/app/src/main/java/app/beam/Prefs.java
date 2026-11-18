@@ -24,7 +24,9 @@ final class Prefs {
   private final SharedPreferences sp;
   String name;
   boolean nearby, autoAccept, enabled, offline;
-  boolean galleryMedia;  // photos and videos go to the gallery (otherwise with the other files)
+  boolean galleryMedia;
+  boolean openLinks;
+  final java.util.List<String> favs = new java.util.ArrayList<>(); // devices pinned to the top     // a link from one of my own devices opens by itself  // photos and videos go to the gallery (otherwise with the other files)
   String saveTree;       // folder picked for received files (a document tree Uri), or null = Downloads/Beam
   String saveTreeName;   // that folder, in words
   final Map<String, Paired> paired = new LinkedHashMap<>();
@@ -41,6 +43,11 @@ final class Prefs {
     enabled = sp.getBoolean("enabled", true);
     offline = sp.getBoolean("offline", true);
     galleryMedia = sp.getBoolean("galleryMedia", true);
+    openLinks = sp.getBoolean("openLinks", true);
+    try {
+      org.json.JSONArray fa = new org.json.JSONArray(sp.getString("favs", "[]"));
+      for (int i = 0; i < fa.length(); i++) favs.add(fa.getString(i));
+    } catch (Exception ignored) {}
     saveTree = sp.getString("saveTree", null);
     saveTreeName = sp.getString("saveTreeName", null);
     try {
@@ -76,7 +83,7 @@ final class Prefs {
     for (String[] r : recent) rec.put(new org.json.JSONArray().put(r[0]).put(r[1]).put(r[2]));
     sp.edit().putString("recent", rec.toString()).putString("name", name).putBoolean("nearby", nearby).putBoolean("autoAccept", autoAccept)
         .putBoolean("enabled", enabled).putBoolean("offline", offline).putString("paired", o.toString())
-        .putBoolean("galleryMedia", galleryMedia).putString("saveTree", saveTree).putString("saveTreeName", saveTreeName).apply();
+        .putBoolean("galleryMedia", galleryMedia).putBoolean("openLinks", openLinks).putString("favs", new org.json.JSONArray(favs).toString()).putString("saveTree", saveTree).putString("saveTreeName", saveTreeName).apply();
   }
 
   List<String> watch() { return new ArrayList<>(paired.keySet()); }
