@@ -1,5 +1,6 @@
 name: Build Mac app
 
+# Builds, signs with a fixed certificate (Keychain stays quiet across updates) and publishes the Mac menu-bar app.
 on:
   push:
     branches: [main]
