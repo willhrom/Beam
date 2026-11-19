@@ -639,7 +639,7 @@ namespace Beam
                     if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
                     {
                         var pickedSync = NormDir(dlg.SelectedPath);
-                        var name = Path.GetFileName(pickedSync.TrimEnd('\'));
+                        var name = Path.GetFileName(pickedSync.TrimEnd('\\'));
                         if (string.IsNullOrEmpty(name)) name = "Synced folder";
                         syncer.Add(new SyncFolders.Sync { id = sid, name = name, path = pickedSync, peer = peer, peerName = peerName, active = false });
                         Js($"beamNative.syncPicked({Q(sid)}, {Q(name)})");
@@ -655,7 +655,7 @@ namespace Beam
                     if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
                     {
                         var parent = NormDir(dlg.SelectedPath);
-                        var folder = string.Equals(Path.GetFileName(parent.TrimEnd('\')), name, StringComparison.OrdinalIgnoreCase) ? parent : Path.Combine(parent, name);
+                        var folder = string.Equals(Path.GetFileName(parent.TrimEnd('\\')), name, StringComparison.OrdinalIgnoreCase) ? parent : Path.Combine(parent, name);
                         try
                         {
                             Directory.CreateDirectory(folder);
