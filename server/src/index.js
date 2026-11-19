@@ -15,6 +15,8 @@ const MAX_WATCH = 40;
 const MAX_SIGNAL = 512 * 1024; // big batches send a compressed file list with the offer
 const PAIR_TTL = 10 * 60 * 1000;
 const MAX_WAITING_PER_NET = 12, MAX_WAITING = 400; // connections not yet signed in
+const GUEST_TTL = 24 * 3600 * 1000;               // how long a guest link (QR code) works
+const GUEST_OK = new Set(["signal", "ping", "ice", "update"]); // all a guest may do: send to the device that invited them
 const TALK_TTL = 30 * 60 * 1000;                   // how long a started transfer may resume across networks
 
 export default {
@@ -32,6 +34,7 @@ export default {
 
 // ---------- helpers ----------
 const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const b64u = (u) => btoa(String.fromCharCode(...u)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 async function idFromPub(spki) {
   return hex(await crypto.subtle.digest("SHA-256", spki)).slice(0, 32);
@@ -119,8 +122,9 @@ export class Hub extends DurableObject {
   }
 
   /** Signed-in devices. */
+  /** Signed-in devices, plus guests from a QR link (who only ever see the device that invited them). */
   sockets() {
-    return this.allSockets().filter((s) => s.a.user);
+    return this.allSockets().filter((s) => s.a.user || s.a.guest);
   }
 
   /** Every connected device that has proven its key, signed in or not. */
@@ -163,7 +167,7 @@ export class Hub extends DurableObject {
       s.ws.serializeAttachment({});
       send(s.ws, { t: "signed-out", reason: why });
       try { s.ws.close(4002, "signed out"); } catch {}
-      if (before.user) this.broadcast(before, before);
+      if (before.user || before.guest) this.broadcast(before, before);
     }
   }
 
@@ -190,7 +194,10 @@ export class Hub extends DurableObject {
 
   // Can `viewer` see `peer`? Same network (both visible to everyone) or paired both ways.
   visible(viewer, peer) {
-    if (viewer.id === peer.id || !viewer.user || !peer.user) return false;
+    if (viewer.id === peer.id) return false;
+    // A guest and the device that invited it see each other, and nothing else.
+    if (viewer.guest || peer.guest) return !!((viewer.guest && peer.user && viewer.guest.to === peer.id) || (peer.guest && viewer.user && peer.guest.to === viewer.id));
+    if (!viewer.user || !peer.user) return false;
     if (viewer.user === peer.user) return true; // my own devices, anywhere
     if (viewer.nearby && peer.nearby && viewer.net === peer.net) return true;
     return viewer.watch.includes(peer.id) && peer.watch.includes(viewer.id);
@@ -199,7 +206,7 @@ export class Hub extends DurableObject {
   peersFor(a, all) {
     const list = all
       .filter((p) => this.visible(a, p.a))
-      .map((p) => ({ id: p.a.id, name: p.a.name, kind: p.a.kind, pub: p.a.pub, paired: a.watch.includes(p.a.id), local: p.a.net === a.net, mine: p.a.user === a.user }));
+      .map((p) => ({ id: p.a.id, name: p.a.name, kind: p.a.kind, pub: p.a.pub, paired: a.watch.includes(p.a.id), local: p.a.net === a.net, mine: !!a.user && p.a.user === a.user, guest: !!p.a.guest }));
     // My own devices that aren't connected right now, so Beam remembers them.
     if (a.offlineList && a.user && this.devs) {
       const online = new Set(all.map((p) => p.a.id));
@@ -316,6 +323,23 @@ export class Hub extends DurableObject {
         // Newer apps also list this account's devices that are offline right now.
         offlineList: Array.isArray(m.caps) && m.caps.includes("offline"),
       };
+      // A guest from a QR code: no account, and it can only see the device that made the code.
+      if (typeof m.guest === "string" && m.guest) {
+        const g = /^[A-Za-z0-9_-]{16,40}$/.test(m.guest) ? await this.ctx.storage.get("guest:" + m.guest) : null;
+        if (!g || g.exp < Date.now()) {
+          send(ws, { t: "guest-expired" });
+          ws.close(4003, "guest link expired");
+          return;
+        }
+        me.guest = { token: m.guest, to: g.to };
+        me.kind = "guest";
+        me.nearby = false;
+        me.watch = [];
+        ws.serializeAttachment(me);
+        send(ws, { t: "welcome", id, ice: await this.turn(), guest: { toName: g.toName, to: g.to, exp: g.exp } });
+        this.broadcast(me, null);
+        return;
+      }
       // Is this device signed in to an account?
       const dev = await this.ctx.storage.get("dev:" + id);
       const rec = dev && (await this.ctx.storage.get("user:" + dev.user));
@@ -398,7 +422,27 @@ export class Hub extends DurableObject {
       return this.signedIn(ws, a, rec);
     }
 
-    if (!a.user) return; // everything below needs a signed-in device
+    if (!a.user && !(a.guest && GUEST_OK.has(m.t))) return; // everything below needs a signed-in device
+
+    // QR guest link: anyone who scans it can send files to this device (and only this one) for a day.
+    if (m.t === "guest-link" || m.t === "guest-link-get" || m.t === "guest-revoke") {
+      const old = await this.ctx.storage.get("guestlink:" + a.id);
+      if (m.t === "guest-link-get") {
+        const g = old && (await this.ctx.storage.get("guest:" + old));
+        return send(ws, { t: "guest-link", token: g && g.exp > Date.now() ? old : null, exp: g ? g.exp : 0 });
+      }
+      if (old) {
+        await this.ctx.storage.delete("guest:" + old);
+        await this.ctx.storage.delete("guestlink:" + a.id);
+        this.kick((x) => x.guest && x.guest.token === old, "This guest link was turned off.");
+      }
+      if (m.t === "guest-revoke") return send(ws, { t: "guest-link", token: null, exp: 0 });
+      const token = b64u(crypto.getRandomValues(new Uint8Array(18)));
+      const exp = Date.now() + GUEST_TTL;
+      await this.ctx.storage.put("guest:" + token, { to: a.id, toName: a.name, user: a.user, exp });
+      await this.ctx.storage.put("guestlink:" + a.id, token);
+      return send(ws, { t: "guest-link", token, exp });
+    }
 
     // Remove one of my own devices that's gone for good (old laptop, reinstalled app…).
     if (m.t === "forget-device") {

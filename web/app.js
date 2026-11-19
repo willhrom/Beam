@@ -108,6 +108,9 @@ const shortId = (id) => (id.slice(0, 4) + "-" + id.slice(4, 8)).toUpperCase();
 
 // ---------- state ----------
 const kind = guessKind();
+// Opened from a guest QR code / link: no account, just send to the device that made it.
+const GUEST = new URLSearchParams(location.search).get("g") || null;
+if (GUEST) document.documentElement.classList.add("guest-mode");
 const S = {
   name: store.get("name", defaultName(kind)),
   nearby: store.get("nearby", true),
@@ -135,6 +138,7 @@ function connect() {
     S.online = false;
     S.peers = [];
     render();
+    if (S.guestGone) return; // the guest link expired or was turned off: don't keep knocking
     wsTimer = setTimeout(connect, backoff);
     backoff = Math.min(backoff * 2, 30000);
   };
@@ -154,10 +158,22 @@ async function onServer(m) {
         if (S.serverVersion && m.v !== S.serverVersion) return reloadWhenIdle();
         S.serverVersion = m.v;
       }
+      if (GUEST) { wsSend({ t: "hello", pub: Id.pub, sig: await Id.sign("beam-hello:" + m.nonce), name: store.get("guestName", "") || "Guest", kind, guest: GUEST }); break; }
       wsSend({ t: "hello", pub: Id.pub, sig: await Id.sign("beam-hello:" + m.nonce), name: S.name, kind, nearby: S.nearby, watch: Object.keys(S.paired), caps: ["offline"] });
       break;
     case "welcome":
       if (m.id !== Id.id) console.warn("server id mismatch");
+      if (m.guest) {
+        S.guest = m.guest;
+        S.user = null;
+        S.online = true;
+        backoff = 1000;
+        if (Array.isArray(m.ice) && m.ice.length) S.ice = m.ice;
+        S.iceAt = Date.now();
+        if (store.get("guestName", "")) S.name = store.get("guestName", "") + " (guest)";
+        if (!store.get("guestName", "")) guestWelcome(); else render();
+        break;
+      }
       if (m.login) {
         // This device isn't signed in to a Beam account yet.
         S.user = null;
@@ -181,6 +197,9 @@ async function onServer(m) {
       break;
     case "ice":
       if (Array.isArray(m.ice) && m.ice.length) { S.ice = m.ice; S.iceAt = Date.now(); }
+      break;
+    case "guest-link":
+      renderGuestLink(m);
       break;
     case "pong":
       if (S.pingWait && S.pingWait.n === m.n) { S.pingWait.res(m); S.pingWait = null; }
@@ -220,7 +239,12 @@ async function onServer(m) {
     case "login-error":
       if (S.authOpen) authError(m.reason);
       break;
+    case "guest-expired":
+      S.guestGone = true;
+      guestGone("This link has expired");
+      break;
     case "signed-out":
+      if (GUEST) { S.guestGone = true; guestGone(m.reason || "This link was turned off"); break; }
       S.user = null;
       toast(m.reason || "Signed out");
       break;
@@ -731,6 +755,61 @@ function setupReceive(t, dc, gen) {
   };
 }
 
+// ----- guests (QR code) -----
+function guestWelcome() {
+  openSheet(`<h2>Send files to ${esc(S.guest.toName)}</h2>
+    <p>${esc(S.guest.toName)} invited you to send them files with Beam. Nothing to install, and nothing is stored on a server: files go straight to their device.</p>
+    <label class="field"><span>Your name, so they know who's sending</span><input type="text" id="gname" maxlength="40" placeholder="e.g. Sarah" autocomplete="name"></label>
+    <div class="actions"><button class="btn primary" id="go">Continue</button></div>`);
+  $("#gname").focus();
+  const go = () => {
+    const n = $("#gname").value.trim().slice(0, 40);
+    if (!n) return $("#gname").focus();
+    store.set("guestName", n);
+    S.name = n + " (guest)"; // what the host sees on the request
+    wsSend({ t: "update", name: S.name });
+    sheetOnClose = null;
+    closeSheet();
+    render();
+  };
+  $("#gname").onkeydown = (e) => { if (e.key === "Enter") go(); };
+  $("#go").onclick = go;
+}
+function guestGone(why) {
+  clearTimeout(wsTimer);
+  openSheet(`<h2>${esc(why)}</h2><p>Ask for a new QR code or link to send more.</p>`);
+}
+// The host side: a QR code anyone can scan to send files to this device for a day.
+function guestSheet() {
+  S.guestLinkOpen = true;
+  wsSend({ t: "guest-link-get" });
+  openSheet(`<h2>Let a guest send to this device</h2><div id="glink"><p>Getting a code…</p></div>`, () => { S.guestLinkOpen = false; });
+}
+async function renderGuestLink(m) {
+  if (!S.guestLinkOpen || !$("#glink")) return;
+  if (!m.token) {
+    $("#glink").innerHTML = `<p>Make a QR code that a guest speaker, volunteer or visitor can scan to send files to <b>${esc(S.name)}</b>, without an account or installing anything. It works for 24 hours, only sends to this device, and you still accept each transfer.</p>
+      <div class="actions"><button class="btn ghost" id="gback">Back</button><button class="btn primary" id="gmake">Make a QR code</button></div>`;
+    $("#gmake").onclick = () => wsSend({ t: "guest-link" });
+    $("#gback").onclick = () => { sheetOnClose = null; S.guestLinkOpen = false; showSettings(); };
+    return;
+  }
+  const url = location.origin + "/?g=" + m.token;
+  if (!window.qrcode) await new Promise((res, rej) => { const sc = document.createElement("script"); sc.src = "/qrcode.js"; sc.onload = res; sc.onerror = rej; document.head.appendChild(sc); }).catch(() => {});
+  let svg = "";
+  if (window.qrcode) { const q = qrcode(0, "M"); q.addData(url); q.make(); svg = q.createSvgTag({ cellSize: 6, margin: 3, scalable: true }); }
+  const until = new Date(m.exp);
+  const when = until.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + (until.toDateString() === new Date().toDateString() ? " today" : " tomorrow");
+  $("#glink").innerHTML = `<div class="qr">${svg}</div>
+    <p class="hint center">Scan with any phone camera. Works until ${esc(when)} and only sends to ${esc(S.name)}. You'll still be asked to accept.</p>
+    <div class="glink-url"><input type="text" readonly value="${esc(url)}" aria-label="Guest link"><button class="btn ghost small" id="gcopy">Copy</button></div>
+    <div class="actions"><button class="btn danger" id="goff">Turn off</button>${navigator.share ? '<button class="btn ghost" id="gshare">Share link</button>' : ""}<button class="btn primary" id="gdone">Done</button></div>`;
+  $("#gcopy").onclick = () => navigator.clipboard.writeText(url).then(() => toast("Link copied"));
+  if ($("#gshare")) $("#gshare").onclick = () => navigator.share({ title: "Send files to " + S.name, url }).catch(() => {});
+  $("#goff").onclick = () => { wsSend({ t: "guest-revoke" }); toast("Guest link turned off"); };
+  $("#gdone").onclick = closeSheet;
+}
+
 // ----- drop folders (Mac and Windows apps) -----
 // The app watches folders; when new files have settled it hands them here to send to the folder's
 // device, and we tell it how that went so it never sends the same file twice.
@@ -1088,10 +1167,12 @@ function render() {
   // A new device pops in with a little ping from the beam.
   fresh.forEach((el, i) => setTimeout(() => { if (el.isConnected) { FX.pulse(el.querySelector(".avatar"), "ping", 1000); FX.spark(FX.you(), el.querySelector(".avatar"), { ms: 600 }); } }, 120 + i * 90));
   $("#empty").style.display = S.peers.length || (S.offline || []).length ? "none" : "";
-  $("#empty").innerHTML = !S.user && !S.online && ws && ws.readyState === 1 ? "Sign in to use Beam" : S.online
+  $("#empty").innerHTML = S.guest ? `${esc(S.guest.toName)} isn't online right now<small>Ask them to open Beam. This page will connect by itself.</small>`
+    : !S.user && !S.online && ws && ws.readyState === 1 ? "Sign in to use Beam" : S.online
     ? "Looking for devices<small>Open Beam on another device that's signed in as you, or on this WiFi.</small>"
     : "Connecting to Beam…";
-  $("#me").innerHTML = S.pending ? `<b>Choose a device to send ${esc(pendingLabel())}</b><a href="#" id="pcx">Cancel</a>`
+  $("#me").innerHTML = S.guest ? `<b>${esc(store.get("guestName", "") || "Guest")}</b><span>Tap ${esc(S.guest.toName)} to send them files</span>`
+    : S.pending ? `<b>Choose a device to send ${esc(pendingLabel())}</b><a href="#" id="pcx">Cancel</a>`
     : `<b>${esc(S.name)}</b><span>${S.nearby ? "Visible to everyone nearby" : "Visible to your devices only"}</span>${S.peers.length > 1 ? `<a href="#" id="many">Send to several devices</a>` : ""}`;
   const many = $("#many");
   if (many) many.onclick = (e) => { e.preventDefault(); chooseWhatMany(); };
@@ -1779,6 +1860,7 @@ function showSettings() {
     <h3>Activity</h3>
     <div class="group">
       ${native ? nav("drops", "Drop folders", `<span id="dropsSub">${dropSummary()}</span>`) : ""}
+      ${nav("guestqr", "Guest QR code", "Let someone without Beam send files to this device")}
       ${nav("hist", "Transfer history", "What this device sent and received")}
       ${nav("ctest", "Test connection", "Check the server, relay and your devices")}
     </div>
@@ -1806,6 +1888,7 @@ function showSettings() {
   $("#done").onclick = closeSheet;
   $("#ctest").onclick = () => { saveSettings(); sheetOnClose = null; connectionTest(); };
   if ($("#drops")) $("#drops").onclick = () => { saveSettings(); sheetOnClose = null; dropFoldersSheet(); };
+  $("#guestqr").onclick = () => { saveSettings(); sheetOnClose = null; guestSheet(); };
   if (native) native.postMessage({ op: "getDropFolders" });
   if ($("#upd")) $("#upd").onclick = () => { native.postMessage({ op: "checkUpdates" }); toast("Checking for updates…"); };
   if (native) native.postMessage({ op: "getVersion" });

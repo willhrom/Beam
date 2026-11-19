@@ -349,3 +349,15 @@ textarea { height: auto; min-height: 110px; padding: 10px 12px; resize: vertical
 .peer.offline { opacity: .5; animation-name: arrive; }
 .peer.offline .avatar { border-style: dashed; background: transparent; }
 .peer.offline:hover { opacity: .75; }
+
+/* Guest page (opened from a QR code): no account chip or settings. */
+.guest-mode #acct, .guest-mode #settingsBtn { display: none !important; }
+/* The guest QR code sheet. */
+.card .qr { background: #fff; border-radius: 16px; padding: 10px; width: min(260px, 70vw); margin: 8px auto 4px; }
+.card .qr svg { display: block; width: 100%; height: auto; }
+.card p.center { text-align: center; }
+.glink-url { display: flex; gap: 8px; margin-top: 12px; }
+.glink-url input { flex: 1; min-width: 0; font-size: 13px; color: var(--dim); }
+.card label.field { display: block; margin: 14px 0 4px; }
+.card label.field span { display: block; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
+.card label.field input { width: 100%; }
