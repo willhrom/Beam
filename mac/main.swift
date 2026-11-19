@@ -604,6 +604,144 @@ final class DropFolders {
   }
 }
 
+/// Synced folders: one folder kept the same on two of my computers. Both apps watch their copy
+/// (subfolders too) and send new or changed files to the other. Nothing is ever deleted; when both
+/// changed, the newer file wins. A ledger of "size|modified" per file keeps files from bouncing back.
+final class SyncFolders {
+  struct Sync: Codable { var id: String; var name: String; var path: String; var peer: String; var peerName: String; var active: Bool }
+  var syncs: [Sync] = []
+  var ledger: [String: [String: String]] = [:]   // sync id -> relative path -> key last sent or received
+  var lastLook: [String: String] = [:]
+  var busy = Set<String>()
+  var inFlight: [String: (sid: String, rels: [String], keys: [String])] = [:]
+  var retryAfter: [String: Date] = [:]
+  var timer: Timer?
+  weak var app: AppDelegate?
+
+  init() {
+    if let data = UserDefaults.standard.data(forKey: "syncFolders"), let f = try? JSONDecoder().decode([Sync].self, from: data) { syncs = f }
+    for x in syncs { ledger[x.id] = UserDefaults.standard.dictionary(forKey: "syncLedger." + x.id) as? [String: String] ?? [:] }
+  }
+
+  func save(ledgerOf sid: String? = nil) {
+    UserDefaults.standard.set(try? JSONEncoder().encode(syncs), forKey: "syncFolders")
+    if let sid = sid { UserDefaults.standard.set(ledger[sid] ?? [:], forKey: "syncLedger." + sid) }
+  }
+
+  func start() {
+    timer?.invalidate()
+    timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.tick() }
+  }
+
+  func report() {
+    guard let app = app else { return }
+    let list = syncs.map { ["id": $0.id, "name": $0.name, "path": $0.path, "peer": $0.peer, "peerName": $0.peerName, "active": $0.active] as [String: Any] }
+    if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) { app.js("beamNative.syncs(\(json))") }
+  }
+
+  static func key(_ size: Int, _ mod: Date) -> String { "\(size)|\(Int(mod.timeIntervalSince1970))" }
+
+  /// Every file in the folder and its subfolders (no hidden, temporary or half-written files), by relative path.
+  func walk(_ root: String) -> [(rel: String, url: URL, key: String, mtime: Date)] {
+    let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+    let base = URL(fileURLWithPath: root).standardizedFileURL
+    guard let en = FileManager.default.enumerator(at: base, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
+    var out: [(String, URL, String, Date)] = []
+    for case let f as URL in en {
+      if en.level > 20 { en.skipDescendants(); continue }
+      guard let v = try? f.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
+      if DropFolders.skip.contains(f.pathExtension.lowercased()) || f.lastPathComponent.hasPrefix("~$") { continue }
+      let full = f.standardizedFileURL.path
+      guard full.hasPrefix(base.path + "/") else { continue }
+      let mod = v.contentModificationDate ?? Date()
+      out.append((String(full.dropFirst(base.path.count + 1)), f, Self.key(v.fileSize ?? 0, mod), mod))
+      if out.count >= 50000 { break }
+    }
+    return out
+  }
+
+  func tick() {
+    guard let app = app, app.pageReady else { return }
+    for x in syncs where x.active {
+      if let r = retryAfter[x.id], r > Date() { continue }
+      if inFlight.values.contains(where: { $0.sid == x.id }) { continue }   // one batch at a time per folder
+      var isDir: ObjCBool = false
+      guard FileManager.default.fileExists(atPath: x.path, isDirectory: &isDir), isDir.boolValue else { continue }
+      let known = ledger[x.id] ?? [:]
+      var ready: [(rel: String, url: URL, key: String, mtime: Date)] = []
+      for f in walk(x.path) {
+        let look = x.id + "|" + f.rel
+        if known[f.rel] == f.key || busy.contains(look) { lastLook.removeValue(forKey: look); continue }
+        if lastLook[look] == f.key { ready.append(f) } else { lastLook[look] = f.key }   // unchanged twice in a row: done saving
+        if ready.count >= 500 { break }
+      }
+      guard !ready.isEmpty else { continue }
+      let batch = UUID().uuidString
+      inFlight[batch] = (x.id, ready.map { $0.rel }, ready.map { $0.key })
+      var list: [[String: Any]] = []
+      for f in ready {
+        busy.insert(x.id + "|" + f.rel)
+        let fid = UUID().uuidString
+        app.shared[fid] = f.url
+        let size = (try? f.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let type = UTType(filenameExtension: f.url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+        let dir = (f.rel as NSString).deletingLastPathComponent
+        list.append(["fid": fid, "name": f.url.lastPathComponent, "size": size, "type": type, "path": dir, "mtime": Int(f.mtime.timeIntervalSince1970 * 1000)])
+      }
+      if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
+        app.js("beamNative.syncSend(\(json), \(app.q(x.peer)), \(app.q(batch)), \(app.q(x.id)))")
+      }
+    }
+  }
+
+  func done(batch: String, result: String) {
+    guard let b = inFlight.removeValue(forKey: batch) else { return }
+    for r in b.rels { busy.remove(b.sid + "|" + r) }
+    if result == "done" {
+      var l = ledger[b.sid] ?? [:]
+      for (r, k) in zip(b.rels, b.keys) { l[r] = k }
+      ledger[b.sid] = l
+      save(ledgerOf: b.sid)
+    } else {
+      retryAfter[b.sid] = Date().addingTimeInterval(result == "offline" ? 20 : result == "declined" ? 600 : 60)
+    }
+  }
+
+  func sync(_ id: String) -> Sync? { syncs.first { $0.id == id } }
+
+  func add(_ x: Sync) {
+    syncs.removeAll { $0.id == x.id }
+    syncs.append(x)
+    ledger[x.id] = ledger[x.id] ?? [:]
+    save(ledgerOf: x.id)
+    report()
+  }
+
+  func activate(id: String, peer: String) {
+    guard let i = syncs.firstIndex(where: { $0.id == id && $0.peer == peer }) else { return }
+    syncs[i].active = true
+    save()
+    report()
+  }
+
+  func remove(id: String) {
+    syncs.removeAll { $0.id == id }
+    ledger.removeValue(forKey: id)
+    UserDefaults.standard.removeObject(forKey: "syncLedger." + id)
+    save()
+    report()
+  }
+
+  /// A file arrived and was saved into the folder: remember it so it isn't sent straight back.
+  func received(sid: String, rel: String, url: URL) {
+    guard let v = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return }
+    var l = ledger[sid] ?? [:]
+    l[rel] = Self.key(v.fileSize ?? 0, v.contentModificationDate ?? Date())
+    ledger[sid] = l
+    save(ledgerOf: sid)
+  }
+}
+
 // Lets the page read a shared Finder file piece by piece (so big videos never load all at once).
 final class FileReader: NSObject, WKScriptMessageHandlerWithReply {
   weak var app: AppDelegate?
@@ -635,6 +773,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
   lazy var updater = Updater(self)
   lazy var popup = ProgressPopup(onClick: { [weak self] in self?.showWindow() })
   let drops = DropFolders()
+  let syncer = SyncFolders()
+  var syncSaves: [String: (sid: String, rel: String, final: URL, mtime: Double)] = [:]
   lazy var requests = RequestCards(
     onAnswer: { [weak self] tag, what in
       guard let self = self else { return }
@@ -676,6 +816,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     updater.start()
     drops.app = self
     drops.start()
+    syncer.app = self
+    syncer.start()
   }
 
   // MARK: - Sending files from Finder
@@ -935,13 +1077,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     case "show":
       showWindow()
     case "saveBegin":
-      startSave(id: id, name: d["name"] as? String ?? "file", path: d["path"] as? String ?? "")
+      if let sid = d["sync"] as? String, !sid.isEmpty {
+        startSyncSave(id: id, sid: sid, name: d["name"] as? String ?? "file", path: d["path"] as? String ?? "", mtime: (d["mtime"] as? NSNumber)?.doubleValue ?? 0)
+      } else {
+        startSave(id: id, name: d["name"] as? String ?? "file", path: d["path"] as? String ?? "")
+      }
     case "saveChunk":
       guard let s = saves[id], let b64 = d["b64"] as? String, let data = Data(base64Encoded: b64) else { return }
       do { try s.handle.write(contentsOf: data) } catch { abortSave(id: id); js("beamNative.saveFailed(\(q(id)))") }
     case "saveEnd":
       guard let s = saves.removeValue(forKey: id) else { return }
       try? s.handle.close()
+      if let ss = syncSaves.removeValue(forKey: id) {
+        let path = finishSyncSave(temp: s.url, ss)
+        savedPaths.insert(path.standardizedFileURL.path)
+        js("beamNative.saved(\(q(id)), \(q(path.path)))")
+        return
+      }
       savedPaths.insert(s.url.standardizedFileURL.path)
       js("beamNative.saved(\(q(id)), \(q(s.url.path)))")
     case "saveAbort":
@@ -952,6 +1104,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         let u = URL(fileURLWithPath: p).standardizedFileURL
         if savedPaths.contains(u.path) || u.path.hasPrefix(downloadsDir().path + "/") || u.path.hasPrefix(saveRoot().path + "/") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
       }
+    case "getSyncs":
+      syncer.report()
+    case "syncStart":
+      // This computer picks the folder; the page then asks the other computer to make its copy.
+      let sid = d["sid"] as? String ?? UUID().uuidString, peer = d["peer"] as? String ?? "", peerName = d["peerName"] as? String ?? "your other computer"
+      let panel = NSOpenPanel()
+      panel.canChooseDirectories = true
+      panel.canChooseFiles = false
+      panel.canCreateDirectories = true
+      panel.prompt = "Sync This Folder"
+      panel.message = "Choose a folder to keep the same on \(peerName)"
+      NSApp.activate(ignoringOtherApps: true)
+      panel.begin { r in
+        guard r == .OK, let u = panel.url else { return }
+        let p = u.standardizedFileURL.path
+        self.syncer.add(SyncFolders.Sync(id: sid, name: u.lastPathComponent, path: p, peer: peer, peerName: peerName, active: false))
+        self.js("beamNative.syncPicked(\(self.q(sid)), \(self.q(u.lastPathComponent)))")
+      }
+    case "syncJoin":
+      // The other computer asked: choose where this copy lives. Beam makes (or reuses) a folder with the same name there.
+      let sid = d["sid"] as? String ?? "", peer = d["peer"] as? String ?? "", peerName = d["peerName"] as? String ?? "your other computer"
+      let name = safeName(d["name"] as? String ?? "Synced folder")
+      let panel = NSOpenPanel()
+      panel.canChooseDirectories = true
+      panel.canChooseFiles = false
+      panel.canCreateDirectories = true
+      panel.prompt = "Keep It Here"
+      panel.message = "Choose where to keep \"\(name)\". Beam makes a folder with that name here, or uses the one that's already there."
+      panel.directoryURL = saveRoot()
+      NSApp.activate(ignoringOtherApps: true)
+      panel.begin { r in
+        guard r == .OK, let u = panel.url?.standardizedFileURL else { self.js("beamNative.syncReady(\(self.q(sid)), false)"); return }
+        let folder = u.lastPathComponent == name ? u : u.appendingPathComponent(name)
+        do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+        catch { self.js("beamNative.syncReady(\(self.q(sid)), false)"); return }
+        self.syncer.add(SyncFolders.Sync(id: sid, name: name, path: folder.path, peer: peer, peerName: peerName, active: true))
+        self.js("beamNative.syncReady(\(self.q(sid)), true)")
+      }
+    case "syncActivate":
+      syncer.activate(id: d["id"] as? String ?? "", peer: d["peer"] as? String ?? "")
+    case "syncRemove":
+      syncer.remove(id: d["id"] as? String ?? "")
+    case "syncDone":
+      syncer.done(batch: d["batch"] as? String ?? "", result: d["result"] as? String ?? "failed")
     case "getDropFolders":
       drops.report()
     case "dropAdd":
@@ -1057,7 +1253,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     saves[id] = (h, url)
   }
 
+  /// A file for a synced folder: written next to its place as a hidden temp file, then put in place
+  /// when it's complete (unless the copy here changed more recently).
+  func startSyncSave(id: String, sid: String, name: String, path: String, mtime: Double) {
+    guard let x = syncer.sync(sid) else { js("beamNative.saveFailed(\(q(id)))"); return }
+    let root = URL(fileURLWithPath: x.path, isDirectory: true).standardizedFileURL
+    var folder = root
+    var parts: [String] = []
+    for part in path.split(separator: "/").map(String.init).filter({ !$0.isEmpty && $0 != "." && $0 != ".." }).prefix(20) {
+      let p = safeName(part); parts.append(p); folder = folder.appendingPathComponent(p)
+    }
+    let safe = safeName(name)
+    parts.append(safe)
+    do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) } catch { js("beamNative.saveFailed(\(q(id)))"); return }
+    let temp = folder.appendingPathComponent(".\(safe).\(id.prefix(8)).beam-part")
+    guard FileManager.default.createFile(atPath: temp.path, contents: nil), let h = try? FileHandle(forWritingTo: temp) else {
+      js("beamNative.saveFailed(\(q(id)))")
+      return
+    }
+    saves[id] = (h, temp)
+    syncSaves[id] = (sid, parts.joined(separator: "/"), folder.appendingPathComponent(safe), mtime)
+  }
+
+  func finishSyncSave(temp: URL, _ ss: (sid: String, rel: String, final: URL, mtime: Double)) -> URL {
+    let fm = FileManager.default
+    let incoming = ss.mtime > 0 ? Date(timeIntervalSince1970: ss.mtime / 1000) : Date()
+    if let mine = (try? ss.final.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+       mine.timeIntervalSince1970 > incoming.timeIntervalSince1970 + 1 {
+      try? fm.removeItem(at: temp)          // the copy here is newer: keep it (it goes the other way next)
+      return ss.final
+    }
+    do {
+      if fm.fileExists(atPath: ss.final.path) { _ = try fm.replaceItemAt(ss.final, withItemAt: temp) }
+      else { try fm.moveItem(at: temp, to: ss.final) }
+    } catch {
+      try? fm.removeItem(at: temp)
+      return ss.final
+    }
+    try? fm.setAttributes([.modificationDate: incoming], ofItemAtPath: ss.final.path)
+    syncer.received(sid: ss.sid, rel: ss.rel, url: ss.final)
+    return ss.final
+  }
+
   func abortSave(id: String) {
+    syncSaves.removeValue(forKey: id)
     guard let s = saves.removeValue(forKey: id) else { return }
     try? s.handle.close()
     try? FileManager.default.removeItem(at: s.url)

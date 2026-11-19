@@ -117,6 +117,8 @@ namespace Beam
         SharePicker picker;
         readonly ProgressPopup popup = new ProgressPopup();
         readonly DropFolders drops = new DropFolders();
+        readonly SyncFolders syncer = new SyncFolders();
+        readonly Dictionary<string, (string sid, string rel, string final, long mtime)> syncSaves = new();
         readonly Updater updater;
         readonly ToolStripMenuItem updateItem = new ToolStripMenuItem("Check for updates");
         readonly ToolStripMenuItem shareItem = new ToolStripMenuItem("Add Beam to the Windows Share menu") { Visible = false };
@@ -162,6 +164,22 @@ namespace Beam
                 else drops.Done(batch, "failed");
             };
             drops.Start();
+            // Synced folders: same idea, with each file's place inside the folder and when it changed.
+            syncer.Ready = drops.Ready;
+            syncer.Report = json => Js($"beamNative.syncs({json})");
+            syncer.Send = (to, batch, sid, files) =>
+            {
+                var handles = new List<object>();
+                var meta = new List<object>();
+                foreach (var f in files)
+                {
+                    try { handles.Add(env.CreateWebFileSystemFileHandle(f.full, CoreWebView2FileSystemHandlePermission.ReadOnly)); meta.Add(new { path = f.dir, mtime = f.mtime }); } catch { }
+                }
+                var msg = JsonSerializer.Serialize(new { op = "syncSend", to, batch, sync = sid, meta });
+                if (handles.Count > 0) web.CoreWebView2.PostWebMessageAsJson(msg, handles);
+                else syncer.Done(batch, "failed");
+            };
+            syncer.Start();
             menu.Items.Add(updateItem);
             shareItem.Click += (s, e) => AddToShareMenu(true);
             menu.Items.Add(shareItem);
@@ -562,7 +580,10 @@ namespace Beam
                     ShowMain();
                     break;
                 case "saveBegin":
-                    StartSave(id, Str("name") ?? "file", Str("path") ?? "");
+                    if (!string.IsNullOrEmpty(Str("sync")))
+                        StartSyncSave(id, Str("sync"), Str("name") ?? "file", Str("path") ?? "", d.TryGetProperty("mtime", out var mt) && mt.ValueKind == JsonValueKind.Number ? mt.GetInt64() : 0);
+                    else
+                        StartSave(id, Str("name") ?? "file", Str("path") ?? "");
                     break;
                 case "saveChunk":
                     if (saves.TryGetValue(id, out var sv))
@@ -583,6 +604,13 @@ namespace Beam
                     if (saves.Remove(id, out var done))
                     {
                         done.stream.Dispose();
+                        if (syncSaves.Remove(id, out var ss))
+                        {
+                            var final = FinishSyncSave(done.path, ss);
+                            savedPaths.Add(Path.GetFullPath(final));
+                            Js($"beamNative.saved({Q(id)}, {Q(final)})");
+                            break;
+                        }
                         savedPaths.Add(Path.GetFullPath(done.path));
                         Js($"beamNative.saved({Q(id)}, {Q(done.path)})");
                         if (Converter.Enabled && Converter.Wants(done.path)) ConvertLater(id, done.path);
@@ -599,6 +627,54 @@ namespace Beam
                     break;
                 case "setConvert":
                     Converter.Enabled = d.TryGetProperty("on", out var cv) && cv.ValueKind == JsonValueKind.True;
+                    break;
+                case "getSyncs":
+                    syncer.DoReport();
+                    break;
+                case "syncStart":
+                {
+                    // This PC picks the folder; the page then asks the other computer to make its copy.
+                    string sid = Str("sid") ?? Guid.NewGuid().ToString("N"), peer = Str("peer") ?? "", peerName = Str("peerName") ?? "your other computer";
+                    using var dlg = new FolderBrowserDialog { Description = "Choose a folder to keep the same on " + peerName, UseDescriptionForTitle = true, ShowNewFolderButton = true };
+                    if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
+                    {
+                        var pickedSync = NormDir(dlg.SelectedPath);
+                        var name = Path.GetFileName(pickedSync.TrimEnd('\'));
+                        if (string.IsNullOrEmpty(name)) name = "Synced folder";
+                        syncer.Add(new SyncFolders.Sync { id = sid, name = name, path = pickedSync, peer = peer, peerName = peerName, active = false });
+                        Js($"beamNative.syncPicked({Q(sid)}, {Q(name)})");
+                    }
+                    break;
+                }
+                case "syncJoin":
+                {
+                    // The other computer asked: choose where this copy lives. Beam makes (or reuses) a folder with the same name there.
+                    string sid = Str("sid") ?? "", peer = Str("peer") ?? "", peerName = Str("peerName") ?? "your other computer";
+                    var name = SafeName(Str("name") ?? "Synced folder");
+                    using var dlg = new FolderBrowserDialog { Description = $"Choose where to keep \"{name}\". Beam makes a folder with that name here, or uses the one already there.", UseDescriptionForTitle = true, ShowNewFolderButton = true, InitialDirectory = SaveRoot() };
+                    if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
+                    {
+                        var parent = NormDir(dlg.SelectedPath);
+                        var folder = string.Equals(Path.GetFileName(parent.TrimEnd('\')), name, StringComparison.OrdinalIgnoreCase) ? parent : Path.Combine(parent, name);
+                        try
+                        {
+                            Directory.CreateDirectory(folder);
+                            syncer.Add(new SyncFolders.Sync { id = sid, name = name, path = NormDir(folder), peer = peer, peerName = peerName, active = true });
+                            Js($"beamNative.syncReady({Q(sid)}, true)");
+                        }
+                        catch { Js($"beamNative.syncReady({Q(sid)}, false)"); }
+                    }
+                    else Js($"beamNative.syncReady({Q(sid)}, false)");
+                    break;
+                }
+                case "syncActivate":
+                    syncer.Activate(id, Str("peer") ?? "");
+                    break;
+                case "syncRemove":
+                    syncer.Remove(id);
+                    break;
+                case "syncDone":
+                    syncer.Done(Str("batch") ?? "", Str("result") ?? "failed");
                     break;
                 case "getDropFolders":
                     drops.DoReport();
@@ -765,8 +841,58 @@ namespace Beam
             }
         }
 
+        /// A file for a synced folder: written next to its place as a hidden temp file, then put in place
+        /// when it's complete (unless the copy here changed more recently).
+        void StartSyncSave(string id, string sid, string name, string relPath, long mtime)
+        {
+            var x = syncer.Get(sid);
+            if (x == null) { Js($"beamNative.saveFailed({Q(id)})"); return; }
+            var root = NormDir(x.path);
+            var dir = root;
+            var parts = new List<string>();
+            foreach (var part in (relPath ?? "").Split('/', '\\'))
+            {
+                if (part.Length == 0 || part == "." || part == "..") continue;
+                if (parts.Count >= 20) break;
+                var p = SafeName(part); parts.Add(p); dir = Path.Combine(dir, p);
+            }
+            if (!Path.GetFullPath(dir).StartsWith(root, StringComparison.OrdinalIgnoreCase)) { Js($"beamNative.saveFailed({Q(id)})"); return; }
+            var safe = SafeName(name);
+            parts.Add(safe);
+            try
+            {
+                Directory.CreateDirectory(dir);
+                var temp = Path.Combine(dir, "." + safe + "." + id.Substring(0, Math.Min(8, id.Length)) + ".beam-part");
+                var fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.Read);
+                try { File.SetAttributes(temp, File.GetAttributes(temp) | FileAttributes.Hidden); } catch { }
+                saves[id] = (fs, temp);
+                syncSaves[id] = (sid, string.Join("/", parts), Path.Combine(dir, safe), mtime);
+            }
+            catch { Js($"beamNative.saveFailed({Q(id)})"); }
+        }
+
+        string FinishSyncSave(string temp, (string sid, string rel, string final, long mtime) ss)
+        {
+            var incoming = ss.mtime > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(ss.mtime).UtcDateTime : DateTime.UtcNow;
+            try
+            {
+                if (File.Exists(ss.final) && File.GetLastWriteTimeUtc(ss.final) > incoming.AddSeconds(1))
+                {
+                    File.Delete(temp);           // the copy here is newer: keep it (it goes the other way next)
+                    return ss.final;
+                }
+                try { File.SetAttributes(temp, File.GetAttributes(temp) & ~FileAttributes.Hidden); } catch { }
+                File.Move(temp, ss.final, true);
+                File.SetLastWriteTimeUtc(ss.final, incoming);
+                syncer.Received(ss.sid, ss.rel, ss.final);
+            }
+            catch { try { File.Delete(temp); } catch { } }
+            return ss.final;
+        }
+
         void AbortSave(string id)
         {
+            syncSaves.Remove(id);
             if (!saves.Remove(id, out var s)) return;
             try { s.stream.Dispose(); File.Delete(s.path); } catch { }
         }
@@ -1369,6 +1495,171 @@ namespace Beam
             foreach (var p in b.paths) busy.Remove(p);
             if (result == "done" || result == "declined") { foreach (var k in b.keys) sent.Add(k); Save(); }
             else retryAfter[b.folder] = DateTime.UtcNow.AddMinutes(1);
+        }
+    }
+
+    /// Synced folders: one folder kept the same on two of my computers. Both apps watch their copy
+    /// (subfolders too) and send new or changed files to the other. Nothing is ever deleted; when both
+    /// changed, the newer file wins. A ledger of "size|modified" per file keeps files from bouncing back.
+    sealed class SyncFolders
+    {
+        public sealed class Sync { public string id { get; set; } public string name { get; set; } public string path { get; set; } public string peer { get; set; } public string peerName { get; set; } public bool active { get; set; } }
+        public List<Sync> Syncs = new List<Sync>();
+        readonly Dictionary<string, Dictionary<string, string>> ledger = new Dictionary<string, Dictionary<string, string>>();
+        readonly Dictionary<string, string> lastLook = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        readonly HashSet<string> busy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        readonly Dictionary<string, (string sid, List<string> rels, List<string> keys)> inFlight = new Dictionary<string, (string, List<string>, List<string>)>();
+        readonly Dictionary<string, DateTime> retryAfter = new Dictionary<string, DateTime>();
+        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 4000 };
+        static readonly HashSet<string> Skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".tmp", ".part", ".crdownload", ".download", ".partial", ".opdownload", ".beam-part" };
+        static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Beam");
+        static string LedgerFile(string id) => Path.Combine(Dir, "sync-" + string.Concat(id.Where(char.IsLetterOrDigit)) + ".json");
+        public Func<bool> Ready = () => false;
+        public Action<string> Report = _ => { };
+        /// to, batch, sync id, files (full path, folder inside the sync with "/", modified in ms)
+        public Action<string, string, string, List<(string full, string dir, long mtime)>> Send = (to, batch, sid, files) => { };
+
+        public SyncFolders()
+        {
+            try
+            {
+                using var k = Registry.CurrentUser.OpenSubKey(@"Software\Beam");
+                if (k?.GetValue("syncFolders") is string json) Syncs = JsonSerializer.Deserialize<List<Sync>>(json) ?? new List<Sync>();
+            }
+            catch { }
+            foreach (var x in Syncs)
+            {
+                var l = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                try { if (File.Exists(LedgerFile(x.id))) foreach (var kv in JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(LedgerFile(x.id))) ?? new()) l[kv.Key] = kv.Value; } catch { }
+                ledger[x.id] = l;
+            }
+            timer.Tick += (s, e) => Tick();
+        }
+
+        public void Start() => timer.Start();
+
+        void Save(string ledgerOf = null)
+        {
+            try { using var k = Registry.CurrentUser.CreateSubKey(@"Software\Beam"); k.SetValue("syncFolders", JsonSerializer.Serialize(Syncs)); } catch { }
+            if (ledgerOf != null && ledger.TryGetValue(ledgerOf, out var l))
+                try { Directory.CreateDirectory(Dir); File.WriteAllText(LedgerFile(ledgerOf), JsonSerializer.Serialize(l)); } catch { }
+        }
+
+        public void DoReport() => Report(JsonSerializer.Serialize(Syncs));
+
+        public Sync Get(string id) => Syncs.FirstOrDefault(x => x.id == id);
+
+        static string Key(long size, DateTime utc) => $"{size}|{new DateTimeOffset(utc).ToUnixTimeSeconds()}";
+
+        /// Every file in the folder and its subfolders (no hidden, temporary or half-written files), by relative path ("a/b.txt").
+        static List<(string rel, string full, string key, DateTime mtime)> Walk(string root)
+        {
+            var o = new List<(string, string, string, DateTime)>();
+            var stack = new Stack<(DirectoryInfo dir, string rel, int depth)>();
+            try { stack.Push((new DirectoryInfo(root), "", 0)); } catch { return o; }
+            while (stack.Count > 0 && o.Count < 50000)
+            {
+                var (dir, rel, depth) = stack.Pop();
+                try
+                {
+                    foreach (var e in dir.EnumerateFileSystemInfos())
+                    {
+                        if ((e.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0 || e.Name.StartsWith(".") || e.Name.StartsWith("~$")) continue;
+                        var r = rel.Length == 0 ? e.Name : rel + "/" + e.Name;
+                        if (e is DirectoryInfo d)
+                        {
+                            if (depth < 20 && (d.Attributes & FileAttributes.ReparsePoint) == 0) stack.Push((d, r, depth + 1));
+                        }
+                        else if (e is FileInfo f && !Skip.Contains(f.Extension))
+                            o.Add((r, f.FullName, Key(f.Length, f.LastWriteTimeUtc), f.LastWriteTimeUtc));
+                    }
+                }
+                catch { }
+            }
+            return o;
+        }
+
+        void Tick()
+        {
+            if (!Ready()) return;
+            foreach (var x in Syncs.Where(y => y.active).ToList())
+            {
+                if (retryAfter.TryGetValue(x.id, out var r) && r > DateTime.UtcNow) continue;
+                if (inFlight.Values.Any(b => b.sid == x.id)) continue;   // one batch at a time per folder
+                if (!Directory.Exists(x.path)) continue;
+                var known = ledger.TryGetValue(x.id, out var l) ? l : new Dictionary<string, string>();
+                var ready = new List<(string rel, string full, string key, DateTime mtime)>();
+                foreach (var f in Walk(x.path))
+                {
+                    var look = x.id + "|" + f.rel;
+                    if ((known.TryGetValue(f.rel, out var k) && k == f.key) || busy.Contains(look)) { lastLook.Remove(look); continue; }
+                    if (lastLook.TryGetValue(look, out var prev) && prev == f.key) ready.Add(f); // unchanged twice in a row: done saving
+                    else lastLook[look] = f.key;
+                    if (ready.Count >= 500) break;
+                }
+                if (ready.Count == 0) continue;
+                var batch = Guid.NewGuid().ToString("N");
+                inFlight[batch] = (x.id, ready.Select(f => f.rel).ToList(), ready.Select(f => f.key).ToList());
+                foreach (var f in ready) busy.Add(x.id + "|" + f.rel);
+                Send(x.peer, batch, x.id, ready.Select(f =>
+                {
+                    var i = f.rel.LastIndexOf('/');
+                    return (f.full, i < 0 ? "" : f.rel.Substring(0, i), new DateTimeOffset(f.mtime).ToUnixTimeMilliseconds());
+                }).ToList());
+            }
+        }
+
+        public void Done(string batch, string result)
+        {
+            if (!inFlight.Remove(batch, out var b)) return;
+            foreach (var r in b.rels) busy.Remove(b.sid + "|" + r);
+            if (result == "done")
+            {
+                if (!ledger.TryGetValue(b.sid, out var l)) ledger[b.sid] = l = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < b.rels.Count; i++) l[b.rels[i]] = b.keys[i];
+                Save(b.sid);
+            }
+            else retryAfter[b.sid] = DateTime.UtcNow.AddSeconds(result == "offline" ? 20 : result == "declined" ? 600 : 60);
+        }
+
+        public void Add(Sync x)
+        {
+            Syncs.RemoveAll(y => y.id == x.id);
+            Syncs.Add(x);
+            if (!ledger.ContainsKey(x.id)) ledger[x.id] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            Save(x.id);
+            DoReport();
+        }
+
+        public void Activate(string id, string peer)
+        {
+            var x = Syncs.FirstOrDefault(y => y.id == id && y.peer == peer);
+            if (x == null) return;
+            x.active = true;
+            Save();
+            DoReport();
+        }
+
+        public void Remove(string id)
+        {
+            Syncs.RemoveAll(y => y.id == id);
+            ledger.Remove(id);
+            try { File.Delete(LedgerFile(id)); } catch { }
+            Save();
+            DoReport();
+        }
+
+        /// A file arrived and was saved into the folder: remember it so it isn't sent straight back.
+        public void Received(string sid, string rel, string full)
+        {
+            try
+            {
+                var f = new FileInfo(full);
+                if (!ledger.TryGetValue(sid, out var l)) ledger[sid] = l = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                l[rel] = Key(f.Length, f.LastWriteTimeUtc);
+                Save(sid);
+            }
+            catch { }
         }
     }
 

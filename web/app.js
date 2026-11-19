@@ -313,6 +313,7 @@ async function onSignal(from, d) {
     if (t && t.dir === "in") closePrompt(t.tid);
     return;
   }
+  if (d.k === "sync-invite" || d.k === "sync-accept" || d.k === "sync-decline" || d.k === "sync-stop") return onSyncSignal(from, d);
   if (d.k === "pair") {
     if ((await idFromPub(d.pub)) !== from) return;
     if (!S.pairing || S.pairing.mode !== "show") return wsSend({ t: "signal", to: from, data: { k: "pair-no" } });
@@ -357,9 +358,9 @@ function closePc(t) {
 }
 
 // ---------- sending ----------
-async function sendItems(peer, files, text) {
+async function sendItems(peer, files, text, opts = {}) {
   if (files.length > MAX_ITEMS - 1) { toast(`Sending the first ${MAX_ITEMS - 1} files. Send the rest separately`); files = files.slice(0, MAX_ITEMS - 1); }
-  const items = files.map((f) => { const it = { name: cleanName(f.name), size: f.size, type: f.type || "application/octet-stream" }; const p = cleanPath(relPathOf(f)); if (p) it.path = p; return it; });
+  const items = files.map((f) => { const it = { name: cleanName(f.name), size: f.size, type: f.type || "application/octet-stream" }; const p = cleanPath(relPathOf(f)); if (p) it.path = p; if (f.beamMtime) it.mtime = f.beamMtime; return it; });
   const blobs = files.slice();
   if (text) {
     const b = new Blob([text], { type: "text/plain" });
@@ -367,7 +368,7 @@ async function sendItems(peer, files, text) {
     blobs.push(b);
   }
   if (!items.length) return;
-  const t = { tid: randId(), dir: "out", peer, items, blobs, total: items.reduce((a, b) => a + b.size, 0), done: 0, state: "preparing", gen: 0, sentText: text || "" };
+  const t = { tid: randId(), dir: "out", peer, items, blobs, total: items.reduce((a, b) => a + b.size, 0), done: 0, state: "preparing", gen: 0, sentText: text || "", sync: opts.sync || undefined };
   S.tx.set(t.tid, t);
   renderTx(t);
   setTimeout(() => { if (t.state === "waiting") { wsSend({ t: "signal", to: peer.id, data: { k: "cancel", tid: t.tid } }); fail(t, "No response"); } }, OFFER_TIMEOUT);
@@ -404,7 +405,7 @@ async function connectOut(t, mode) {
   if (!live()) return;
   const sdp = pc.localDescription.sdp;
   const data = { k: mode, tid: t.tid, gen, sdp, sig: await Id.sign(`beam-${mode}|${t.tid}|${t.peer.id}|${sdp}`), pub: Id.pub };
-  if (mode === "offer") Object.assign(data, { name: S.name, kind }, await packFiles(t.items));
+  if (mode === "offer") Object.assign(data, { name: S.name, kind }, await packFiles(t.items), t.sync ? { sync: t.sync } : {});
   if (t.state === "preparing") t.state = "waiting";
   renderTx(t);
   wsSend({ t: "signal", to: t.peer.id, data });
@@ -494,7 +495,7 @@ function sendAgain(t) {
 // Big batches: the file list goes gzipped so the offer stays small (thousands of names fit).
 const MAX_ITEMS = 5000;
 async function packFiles(items) {
-  const files = items.map((it) => { const o = { name: it.name, size: it.size, type: it.type }; if (it.text) o.text = true; if (it.path) o.path = it.path; return o; });
+  const files = items.map((it) => { const o = { name: it.name, size: it.size, type: it.type }; if (it.text) o.text = true; if (it.path) o.path = it.path; if (it.mtime) o.mtime = it.mtime; return o; });
   const json = JSON.stringify(files);
   if (json.length < 40000 || typeof CompressionStream === "undefined") return { files };
   const z = await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer();
@@ -519,7 +520,7 @@ async function onOffer(from, d) {
   if (!(await verifySig(d.pub, d.sig, `beam-offer|${d.tid}|${Id.id}|${d.sdp}`))) return;
   const items = (await unpackFiles(d)).slice(0, MAX_ITEMS).map((f) => ({
     name: cleanName(f.name), size: Math.max(0, Number(f.size) || 0), type: String(f.type || "application/octet-stream").slice(0, 100), text: !!f.text,
-    path: cleanPath(f.path) || undefined,
+    path: cleanPath(f.path) || undefined, mtime: Number(f.mtime) > 0 ? Number(f.mtime) : undefined,
   }));
   if (!items.length) return;
   const paired = !!S.paired[from];
@@ -528,6 +529,13 @@ async function onOffer(from, d) {
     tid: d.tid, dir: "in", peer: { id: from, name: peerName, kind: d.kind, paired }, items, total: items.reduce((a, b) => a + b.size, 0),
     done: 0, state: "asking", sdp: d.sdp, gen: d.gen | 0, received: [], cur: -1, curDone: true, got: 0, q: Promise.resolve(),
   };
+  // A synced folder on this computer, paired with the sender: always accept, save into that folder.
+  if (d.sync) {
+    const sync = native && (S.syncs || []).find((x) => x.id === String(d.sync) && x.peer === from);
+    // Not (or no longer) synced here: say no, so it never lands in Downloads by surprise.
+    if (!sync) return wsSend({ t: "signal", to: from, data: { k: "decline", tid: d.tid } });
+    t.sync = sync.id; S.tx.set(t.tid, t); return accept(t, false);
+  }
   S.tx.set(t.tid, t);
   // Auto-accept from my devices, unless it's big and this browser would have to hold it in memory.
   if (paired && S.autoAccept && (native || t.total < BIG || (await savedFolder(false)))) return accept(t, false);
@@ -692,7 +700,7 @@ function makeWriter(t, it, index) {
   }
   if (t.sink === "native") {
     const nid = t.tid + ":" + index;
-    native.postMessage({ op: "saveBegin", id: nid, name: it.name, path: it.path || "" });
+    native.postMessage({ op: "saveBegin", id: nid, name: it.name, path: it.path || "", sync: t.sync || undefined, mtime: it.mtime || undefined });
     // Batch chunks into ~1 MB messages: far fewer hops across the bridge.
     let pend = [], pendBytes = 0;
     const flush = () => {
@@ -920,6 +928,105 @@ async function renderGuestLink(m) {
   $("#gdone").onclick = closeSheet;
 }
 
+// ----- synced folders (Mac and Windows apps) -----
+// Two computers of mine each keep a folder with the same name; new and changed files go both ways
+// (subfolders too). Nothing is ever deleted. The apps watch the folders; the page carries the files.
+function syncSummary() {
+  const n = (S.syncs || []).filter((x) => x.active).length;
+  return n ? n + (n === 1 ? " folder in sync" : " folders in sync") : "Keep a folder the same on two computers";
+}
+async function syncSend(files, to, batch, sid) {
+  const peer = S.peers.find((p) => p.id === to);
+  if (!peer || !files.length) return native.postMessage({ op: "syncDone", batch, result: peer ? "done" : "offline" });
+  const t = await sendItems(peer, files, null, { sync: sid });
+  if (t) t.syncBatch = batch; else native.postMessage({ op: "syncDone", batch, result: "failed" });
+}
+function syncSheet() {
+  const list = (S.syncs || []);
+  const dev = (id) => S.peers.concat(S.offline || []).find((p) => p.id === id);
+  const rows = list.map((x, i) => {
+    const p = dev(x.peer), online = p && !p.offline;
+    const state = !x.active ? "Waiting for " + esc(x.peerName) + " to accept" : online ? "In sync with " + esc(p.name) : "With " + esc(p ? p.name : x.peerName) + ", offline now";
+    return `<div class="opt drop-row">
+      <i class="ico">${SET_ICONS.sync}</i>
+      <span>${esc(x.name)}<small class="drop-to"><span class="dot ${x.active && online ? "on" : ""}"></span>${state}</small><small class="drop-path" title="${esc(x.path)}">${esc(shortPath(x.path))}</small></span>
+      <button class="btn ghost small" data-srm="${i}">Stop</button>
+    </div>`;
+  }).join("");
+  settingsPage("Synced folders", `
+    <p>Keep a folder the same on two of your computers. Files added or changed on either side show up on the other, subfolders too.</p>
+    ${list.length ? `<div class="group">${rows}</div>` : `<div class="drop-empty"><i class="ico big">${SET_ICONS.sync}</i><b>No synced folders yet</b><small>Great for a media folder the booth Mac and lobby PC both use.</small></div>`}
+    <div class="group">${navRow("sadd", "sync", "Sync a folder", "Choose the other computer, then the folder")}</div>
+    <h3>Good to know</h3>
+    <ul class="drop-notes">
+      <li>The other computer gets a folder with the same name, wherever you choose to keep it.</li>
+      <li>Nothing is deleted automatically. Deleting a file on one side leaves the other copy.</li>
+      <li>If the same file changes on both, the newer change wins.</li>
+      <li>Only works between your own Macs and PCs, while Beam is running on both.</li>
+    </ul>`,
+  () => {
+    document.querySelectorAll("[data-srm]").forEach((b) => (b.onclick = () => {
+      const x = list[+b.dataset.srm];
+      if (!confirm(`Stop syncing "${x.name}"? Both copies stay where they are.`)) return;
+      native.postMessage({ op: "syncRemove", id: x.id });
+      wsSend({ t: "signal", to: x.peer, data: { k: "sync-stop", sid: x.id } });
+    }));
+    $("#sadd").onclick = () => { sheetOnClose = null; syncPickDevice(); };
+  });
+}
+function syncPickDevice() {
+  const devs = byFavorite(S.peers).filter((p) => p.mine && (p.kind === "mac" || p.kind === "windows"));
+  settingsPage("Sync with…", `
+    <p>Pick your other computer. Then choose the folder on this one to keep in sync.</p>
+    ${devs.length ? `<div class="group">${devs.map((p) => `<button class="nav dev-pick" data-sto="${p.id}"><i class="ico dev">${iconFor(p.kind)}</i><span>${esc(p.name)}<small>My device</small></span>${CHEV}</button>`).join("")}</div>`
+      : `<div class="drop-empty"><b>No other computer online</b><small>Open the Beam app on your other Mac or PC (signed in as you), then try again.</small></div>`}`,
+  () => {
+    $("#pgBack").onclick = () => { sheetOnClose = null; syncSheet(); };
+    $("#pgBack span").textContent = "Synced folders";
+    document.querySelectorAll("[data-sto]").forEach((b) => (b.onclick = () => {
+      const p = devs.find((x) => x.id === b.dataset.sto);
+      native.postMessage({ op: "syncStart", sid: randId(), peer: p.id, peerName: p.name });
+      sheetOnClose = null;
+      syncSheet();
+    }));
+  });
+}
+// This computer picked its folder: ask the other one to make its copy.
+function syncInvite(sid, name) {
+  const x = (S.syncs || []).find((y) => y.id === sid);
+  if (!x) return;
+  wsSend({ t: "signal", to: x.peer, data: { k: "sync-invite", sid, name } });
+  toast(`Asked ${x.peerName} to sync "${name}"`);
+}
+function onSyncSignal(from, d) {
+  const peer = S.peers.find((p) => p.id === from);
+  if (!native || !peer || !peer.mine) return;
+  const sid = String(d.sid || "").slice(0, 40);
+  if (d.k === "sync-invite") {
+    const name = cleanName(d.name || "Synced folder");
+    openSheet(`<h2>Sync "${esc(name)}" with ${esc(peer.name)}?</h2>
+      <p>${esc(peer.name)} wants to keep its folder "${esc(name)}" the same as one on this ${nativeKind === "windows" ? "PC" : "Mac"}. Choose where to keep it here: Beam makes a folder called "${esc(name)}" there (or uses the one already there).</p>
+      <p class="hint">New and changed files go both ways. Nothing is ever deleted.</p>
+      <div class="actions"><button class="btn ghost" id="sno">Not now</button><button class="btn primary" id="syes">Choose where…</button></div>`);
+    $("#sno").onclick = () => { wsSend({ t: "signal", to: from, data: { k: "sync-decline", sid } }); closeSheet(); };
+    $("#syes").onclick = () => { native.postMessage({ op: "syncJoin", sid, name, peer: from, peerName: peer.name }); closeSheet(); };
+    S.syncInvite = { sid, from };
+    notify("sync-" + sid, `${peer.name} wants to sync a folder`, `Open Beam to set up "${name}" on this computer`, false);
+    return;
+  }
+  if (d.k === "sync-accept") return native.postMessage({ op: "syncActivate", id: sid, peer: from });
+  if (d.k === "sync-decline") { native.postMessage({ op: "syncRemove", id: sid }); return toast(peer.name + " didn't set up the synced folder"); }
+  if (d.k === "sync-stop") { native.postMessage({ op: "syncRemove", id: sid }); return toast(peer.name + " stopped syncing a folder. Your copy stays where it is"); }
+}
+// The other side made its folder (or gave up picking one).
+function syncAccepted(sid, ok) {
+  const x = (S.syncs || []).find((y) => y.id === sid);
+  const to = x ? x.peer : S.syncInvite && S.syncInvite.sid === sid ? S.syncInvite.from : null;
+  if (!to) return;
+  wsSend({ t: "signal", to, data: { k: ok ? "sync-accept" : "sync-decline", sid } });
+  if (ok) toast("Folder synced. Files will start arriving");
+}
+
 // ----- drop folders (Mac and Windows apps) -----
 // The app watches folders; when new files have settled it hands them here to send to the folder's
 // device, and we tell it how that went so it never sends the same file twice.
@@ -930,6 +1037,7 @@ async function dropSend(files, to, batch, folder) {
   if (t) { t.dropBatch = batch; t.dropFolder = folder; } else native.postMessage({ op: "dropDone", batch, result: "failed" });
 }
 function dropReport(t, result) {
+  if (t.syncBatch && native) { native.postMessage({ op: "syncDone", batch: t.syncBatch, result }); t.syncBatch = null; }
   if (!t.dropBatch || !native) return;
   native.postMessage({ op: "dropDone", batch: t.dropBatch, result });
   t.dropBatch = null;
@@ -1066,12 +1174,12 @@ function finish(t) {
   if (t.state === "done" || t.state === "failed") return;
   t.state = "done";
   recordHistory(t);
-  openLinkIfMine(t);
+  if (!t.sync) openLinkIfMine(t);
   dropReport(t, "done");
   renderTx(t);
   progressFinal(t);
   setTimeout(() => { if (t.state === "done") closePc(t); }, 1500);
-  if (t.dir === "in") {
+  if (t.dir === "in" && !t.sync) {
     const texts = t.received.filter((r) => r.text);
     notify(t.tid, "From " + t.peer.name, texts.length && t.items.length === 1 ? "Text received" : "Received " + describeItems(t.items), false);
   }
@@ -1105,6 +1213,11 @@ window.beamNative = {
   // Drop folders: the app's list changed, or it has new files to send (Mac passes file refs).
   dropFolders(list) { S.dropFolders = Array.isArray(list) ? list : []; if (!$("#sheet").hidden && $("#dadd")) dropFoldersSheet(); if (!$("#sheet").hidden && $("#drops")) { const sm = $("#dropsSub"); if (sm) sm.textContent = dropSummary(); } },
   dropSend(list, to, batch, folder) { dropSend((list || []).map(macFile), to, batch, folder); },
+  // Synced folders: the app's list, new/changed files to send, and a folder it just made or picked.
+  syncs(list) { S.syncs = Array.isArray(list) ? list : []; if (!$("#sheet").hidden && $("#sadd")) syncSheet(); const sm = $("#syncSub"); if (sm) sm.textContent = syncSummary(); },
+  syncSend(list, to, batch, sid) { syncSend((list || []).map((f) => { const x = macFile(f); x.beamMtime = f.mtime; return x; }), to, batch, sid); },
+  syncPicked(sid, name) { syncInvite(sid, name); },
+  syncReady(sid, ok) { syncAccepted(sid, ok); },
   // Mac and Windows apps report their version (shown in Settings → About).
   appVersion(v) { S.appVersion = String(v || ""); const el = $("#appVer"); if (el) el.textContent = "Version " + S.appVersion; },
   // Mac and Windows apps: where received files go (the folder picker lives in the app).
@@ -1146,7 +1259,7 @@ if (nativeKind === "windows") native.postMessage({ op: "setConvert", on: S.conve
 // Windows app: files from Explorer arrive as real file handles, so the browser reads them directly.
 if (nativeKind === "windows") {
   window.chrome.webview.addEventListener("message", async (e) => {
-    if (!e.data || (e.data.op !== "share" && e.data.op !== "dropSend")) return;
+    if (!e.data || (e.data.op !== "share" && e.data.op !== "dropSend" && e.data.op !== "syncSend")) return;
     const files = [];
     const walk = async (dir, prefix) => {
       if (files.length >= MAX_ITEMS) return;
@@ -1160,6 +1273,11 @@ if (nativeKind === "windows") {
         if (h.kind === "directory") await walk(h, h.name);
         else files.push(await h.getFile());
       } catch {}
+    }
+    if (e.data.op === "syncSend") {
+      // Same order as the handles: where each file sits inside the synced folder, and when it was changed.
+      (e.data.meta || []).forEach((m, i) => { const f = files[i]; if (!f) return; try { f.beamPath = (m.path ? m.path + "/" : "") + f.name; f.beamMtime = m.mtime; } catch {} });
+      return syncSend(files, e.data.to, e.data.batch, e.data.sync);
     }
     if (e.data.op === "dropSend") return dropSend(files, e.data.to, e.data.batch, e.data.folder);
     shareFromDesktop(files, e.data.text || null, e.data.to || null);
@@ -1984,6 +2102,7 @@ const SET_ICONS = {
   test: SI("M3 12h4l2.5-6 5 12 2.5-6h4"),
   update: SI("M20 11a8 8 0 0 0-14.3-4.9M4 4v4h4M4 13a8 8 0 0 0 14.3 4.9M20 20v-4h-4"),
   people: SI("M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19M10 10.5a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM20 19v-1.5a3.5 3.5 0 0 0-2.5-3.3M15.5 4.6a3 3 0 0 1 0 5.8"),
+  sync: SI("M20 8a8 8 0 0 0-14.3-2.4L4 7.5M4 4v3.5h3.5M4 16a8 8 0 0 0 14.3 2.4L20 16.5M20 20v-3.5h-3.5M9 12h6"),
   pin: SI("M7 11V8a5 5 0 0 1 10 0v3M6 11h12v9H6zM12 15v2"),
   out: SI("M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10"),
 };
@@ -2026,6 +2145,7 @@ function showSettings() {
 
     <h3>Other ways to send</h3>
     <div class="group">
+      ${native ? navRow("syncs", "sync", "Synced folders", `<span id="syncSub">${syncSummary()}</span>`) : ""}
       ${native ? navRow("drops", "drop", "Drop folders", `<span id="dropsSub">${dropSummary()}</span>`) : ""}
       ${navRow("guestqr", "qr", "Guest QR code", "Someone without Beam sends to this device")}
       ${navRow("iphone", "phone", "Send from iPhone", "Beam in the iPhone share sheet")}
@@ -2046,12 +2166,13 @@ function showSettings() {
   go("rxPage", receivingPage);
   go("pairPage", pairedPage);
   go("drops", dropFoldersSheet);
+  go("syncs", syncSheet);
   go("guestqr", guestSheet);
   go("iphone", shortcutSheet);
   go("hist", showHistory);
   go("ctest", connectionTest);
   if ($("#upd")) $("#upd").onclick = () => { native.postMessage({ op: "checkUpdates" }); toast("Checking for updates…"); };
-  if (native) { native.postMessage({ op: "getDropFolders" }); native.postMessage({ op: "getVersion" }); native.postMessage({ op: "getSaveDir" }); }
+  if (native) { native.postMessage({ op: "getSyncs" }); native.postMessage({ op: "getDropFolders" }); native.postMessage({ op: "getVersion" }); native.postMessage({ op: "getSaveDir" }); }
 }
 
 function receivingPage() {
