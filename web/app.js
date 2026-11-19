@@ -340,8 +340,9 @@ async function sendItems(peer, files, text) {
   const t = { tid: randId(), dir: "out", peer, items, blobs, total: items.reduce((a, b) => a + b.size, 0), done: 0, state: "preparing", gen: 0, sentText: text || "" };
   S.tx.set(t.tid, t);
   renderTx(t);
-  await connectOut(t, "offer");
   setTimeout(() => { if (t.state === "waiting") { wsSend({ t: "signal", to: peer.id, data: { k: "cancel", tid: t.tid } }); fail(t, "No response"); } }, OFFER_TIMEOUT);
+  connectOut(t, "offer").catch(() => fail(t, "Couldn't connect"));
+  return t;
 }
 
 // Opens a new connection for a transfer: the first offer, or a resume after a drop.
@@ -730,6 +731,48 @@ function setupReceive(t, dc, gen) {
   };
 }
 
+// ----- drop folders (Mac and Windows apps) -----
+// The app watches folders; when new files have settled it hands them here to send to the folder's
+// device, and we tell it how that went so it never sends the same file twice.
+async function dropSend(files, to, batch, folder) {
+  const peer = S.peers.find((p) => p.id === to);
+  if (!peer || !files.length) return native && native.postMessage({ op: "dropDone", batch, result: peer ? "done" : "offline" });
+  const t = await sendItems(peer, files, null);
+  if (t) { t.dropBatch = batch; t.dropFolder = folder; } else native.postMessage({ op: "dropDone", batch, result: "failed" });
+}
+function dropReport(t, result) {
+  if (!t.dropBatch || !native) return;
+  native.postMessage({ op: "dropDone", batch: t.dropBatch, result });
+  t.dropBatch = null;
+}
+function dropSummary() {
+  const n = (S.dropFolders || []).length;
+  return n ? n + (n === 1 ? " folder sends automatically" : " folders send automatically") : "Send new files from a folder automatically";
+}
+function dropFoldersSheet() {
+  const list = S.dropFolders || [];
+  const rows = list.map((d, i) => `<div class="opt"><span>${esc(d.name)}<small>Sends new files to ${esc(d.toName)}</small></span><button class="btn danger small" data-drm="${i}">Remove</button></div>`).join("");
+  openSheet(`<h2>Drop folders</h2>
+    <p>Anything saved into a drop folder on this ${nativeKind === "windows" ? "PC" : "Mac"} is sent to its device automatically, as soon as the file has finished saving. Files already in the folder when you add it aren't sent.</p>
+    <div class="group">${rows || '<div class="opt"><span class="sub">No drop folders yet</span></div>'}</div>
+    <div class="actions"><button class="btn ghost" id="dback">Back</button><button class="btn primary" id="dadd">Add a drop folder…</button></div>`);
+  $("#dback").onclick = () => { sheetOnClose = null; showSettings(); };
+  document.querySelectorAll("[data-drm]").forEach((b) => (b.onclick = () => { native.postMessage({ op: "dropRemove", path: list[+b.dataset.drm].path }); }));
+  $("#dadd").onclick = () => {
+    const devs = byFavorite(S.peers).concat(S.offline || []);
+    if (!devs.length) return toast("No devices to send to yet");
+    openSheet(`<h2>Send new files to…</h2><p>Pick the device, then the folder to watch.</p>
+      <div class="list">${devs.map((p) => `<button class="item pick" data-dto="${p.id}"><span>${iconFor(p.kind)}<span>${esc(p.name)}<small class="sub">${p.offline ? "Offline now" : p.mine ? "My device" : "Nearby"}</small></span></span></button>`).join("")}</div>
+      <div class="actions"><button class="btn ghost" id="dcx">Cancel</button></div>`);
+    $("#dcx").onclick = dropFoldersSheet;
+    document.querySelectorAll("[data-dto]").forEach((b) => (b.onclick = () => {
+      const p = devs.find((x) => x.id === b.dataset.dto);
+      native.postMessage({ op: "dropAdd", to: p.id, toName: p.name });
+      dropFoldersSheet();
+    }));
+  };
+}
+
 // ----- links that open themselves -----
 // A single link sent from one of my own devices (same account) opens straight in the browser.
 function openLinkIfMine(t) {
@@ -806,6 +849,7 @@ function finish(t) {
   t.state = "done";
   recordHistory(t);
   openLinkIfMine(t);
+  dropReport(t, "done");
   renderTx(t);
   progressFinal(t);
   setTimeout(() => { if (t.state === "done") closePc(t); }, 1500);
@@ -820,6 +864,7 @@ function fail(t, why) {
   t.state = "failed";
   t.reason = why;
   if (t.dir === "out" || t.everOpen || t.got) recordHistory(t);
+  dropReport(t, why === "Declined" ? "declined" : "failed");
   closePc(t);
   if (t.w) { const w = t.w; t.w = null; t.q = t.q.then(() => w.abort()).catch(() => {}); }
   renderTx(t);
@@ -839,6 +884,9 @@ function notify(tag, title, body, actions) {
   }
 }
 window.beamNative = {
+  // Drop folders: the app's list changed, or it has new files to send (Mac passes file refs).
+  dropFolders(list) { S.dropFolders = Array.isArray(list) ? list : []; if (!$("#sheet").hidden && $("#dadd")) dropFoldersSheet(); if (!$("#sheet").hidden && $("#drops")) { const sm = $("#dropsSub"); if (sm) sm.textContent = dropSummary(); } },
+  dropSend(list, to, batch, folder) { dropSend((list || []).map(macFile), to, batch, folder); },
   // Mac and Windows apps report their version (shown in Settings → About).
   appVersion(v) { S.appVersion = String(v || ""); const el = $("#appVer"); if (el) el.textContent = "Version " + S.appVersion; },
   // Mac and Windows apps: where received files go (the folder picker lives in the app).
@@ -880,7 +928,7 @@ if (nativeKind === "windows") native.postMessage({ op: "setConvert", on: S.conve
 // Windows app: files from Explorer arrive as real file handles, so the browser reads them directly.
 if (nativeKind === "windows") {
   window.chrome.webview.addEventListener("message", async (e) => {
-    if (!e.data || e.data.op !== "share") return;
+    if (!e.data || (e.data.op !== "share" && e.data.op !== "dropSend")) return;
     const files = [];
     const walk = async (dir, prefix) => {
       if (files.length >= MAX_ITEMS) return;
@@ -895,6 +943,7 @@ if (nativeKind === "windows") {
         else files.push(await h.getFile());
       } catch {}
     }
+    if (e.data.op === "dropSend") return dropSend(files, e.data.to, e.data.batch, e.data.folder);
     shareFromDesktop(files, e.data.text || null, e.data.to || null);
   });
 }
@@ -1729,6 +1778,7 @@ function showSettings() {
 
     <h3>Activity</h3>
     <div class="group">
+      ${native ? nav("drops", "Drop folders", `<span id="dropsSub">${dropSummary()}</span>`) : ""}
       ${nav("hist", "Transfer history", "What this device sent and received")}
       ${nav("ctest", "Test connection", "Check the server, relay and your devices")}
     </div>
@@ -1755,6 +1805,8 @@ function showSettings() {
     <div class="actions sticky"><button class="btn primary" id="done">Done</button></div>`, saveSettings);
   $("#done").onclick = closeSheet;
   $("#ctest").onclick = () => { saveSettings(); sheetOnClose = null; connectionTest(); };
+  if ($("#drops")) $("#drops").onclick = () => { saveSettings(); sheetOnClose = null; dropFoldersSheet(); };
+  if (native) native.postMessage({ op: "getDropFolders" });
   if ($("#upd")) $("#upd").onclick = () => { native.postMessage({ op: "checkUpdates" }); toast("Checking for updates…"); };
   if (native) native.postMessage({ op: "getVersion" });
   $("#hist").onclick = () => { saveSettings(); sheetOnClose = null; showHistory(); };

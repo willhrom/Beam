@@ -496,6 +496,114 @@ final class RequestCards: NSObject {
   func closeAll() { for c in cards.map({ $0.tag }) { close(c) } }
 }
 
+/// Drop folders: watches chosen folders and hands newly saved files to the page, which sends them to
+/// that folder's device. Files stay where they are; Beam remembers what it already sent.
+final class DropFolders {
+  struct Folder: Codable { var path: String; var to: String; var toName: String }
+  var folders: [Folder] = []
+  var sent = Set<String>()                 // "path|size|modified" already sent (or there when the folder was added)
+  var lastLook: [String: String] = [:]     // path -> key at the previous look: unchanged twice in a row = done saving
+  var inFlight: [String: (keys: [String], paths: [String], folder: String)] = [:]
+  var busy = Set<String>()
+  var retryAfter: [String: Date] = [:]
+  var timer: Timer?
+  weak var app: AppDelegate?
+  static let skip: Set<String> = ["tmp", "part", "crdownload", "download", "partial", "icloud", "sb"]
+
+  init() {
+    if let data = UserDefaults.standard.data(forKey: "dropFolders"), let f = try? JSONDecoder().decode([Folder].self, from: data) { folders = f }
+    sent = Set(UserDefaults.standard.stringArray(forKey: "dropSent") ?? [])
+  }
+
+  func save() {
+    UserDefaults.standard.set(try? JSONEncoder().encode(folders), forKey: "dropFolders")
+    var list = Array(sent)
+    if list.count > 20000 { list = Array(list.suffix(20000)) }
+    UserDefaults.standard.set(list, forKey: "dropSent")
+  }
+
+  func start() {
+    timer?.invalidate()
+    timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
+  }
+
+  /// The files directly inside a folder (not hidden, not half-downloaded), with a key that changes if the file does.
+  func files(in dir: String) -> [(url: URL, key: String)] {
+    let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+    guard let items = try? FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: dir), includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else { return [] }
+    var out: [(URL, String)] = []
+    for f in items {
+      guard let v = try? f.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
+      if Self.skip.contains(f.pathExtension.lowercased()) || f.lastPathComponent.hasPrefix("~$") { continue }
+      let mod = Int((v.contentModificationDate ?? Date()).timeIntervalSince1970)
+      out.append((f, "\(f.path)|\(v.fileSize ?? 0)|\(mod)"))
+    }
+    return out
+  }
+
+  func add(path: String, to: String, toName: String) {
+    for f in files(in: path) { sent.insert(f.key) } // what's already there isn't sent
+    folders.removeAll { $0.path == path }
+    folders.append(Folder(path: path, to: to, toName: toName))
+    save()
+    report()
+  }
+
+  func remove(path: String) {
+    folders.removeAll { $0.path == path }
+    save()
+    report()
+  }
+
+  func report() {
+    guard let app = app else { return }
+    let list = folders.map { ["path": $0.path, "name": URL(fileURLWithPath: $0.path).lastPathComponent, "to": $0.to, "toName": $0.toName] }
+    if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
+      app.js("beamNative.dropFolders(\(json))")
+    }
+  }
+
+  func tick() {
+    guard let app = app, app.pageReady else { return }
+    for f in folders {
+      if let r = retryAfter[f.path], r > Date() { continue }
+      var ready: [(url: URL, key: String)] = []
+      for file in files(in: f.path) {
+        if sent.contains(file.key) || busy.contains(file.url.path) { continue }
+        if lastLook[file.url.path] == file.key { ready.append(file) } else { lastLook[file.url.path] = file.key }
+        if ready.count >= 500 { break }
+      }
+      guard !ready.isEmpty else { continue }
+      let batch = UUID().uuidString
+      inFlight[batch] = (ready.map { $0.key }, ready.map { $0.url.path }, f.path)
+      for r in ready { busy.insert(r.url.path) }
+      var list: [[String: Any]] = []
+      for (u, _) in ready {
+        let fid = UUID().uuidString
+        app.shared[fid] = u
+        let size = (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let type = UTType(filenameExtension: u.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+        list.append(["fid": fid, "name": u.lastPathComponent, "size": size, "type": type, "path": ""])
+      }
+      if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
+        app.js("beamNative.dropSend(\(json), \(app.q(f.to)), \(app.q(batch)), \(app.q(URL(fileURLWithPath: f.path).lastPathComponent)))")
+      }
+    }
+  }
+
+  /// The page says how a batch went. Sent (or declined): never send those files again. Otherwise try again in a minute.
+  func done(batch: String, result: String) {
+    guard let b = inFlight.removeValue(forKey: batch) else { return }
+    for p in b.paths { busy.remove(p) }
+    if result == "done" || result == "declined" {
+      sent.formUnion(b.keys)
+      save()
+    } else {
+      retryAfter[b.folder] = Date().addingTimeInterval(60)
+    }
+  }
+}
+
 // Lets the page read a shared Finder file piece by piece (so big videos never load all at once).
 final class FileReader: NSObject, WKScriptMessageHandlerWithReply {
   weak var app: AppDelegate?
@@ -526,6 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
   var busy = false                   // a transfer is running (don't restart for an update)
   lazy var updater = Updater(self)
   lazy var popup = ProgressPopup(onClick: { [weak self] in self?.showWindow() })
+  let drops = DropFolders()
   lazy var requests = RequestCards(
     onAnswer: { [weak self] tag, what in
       guard let self = self else { return }
@@ -565,6 +674,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     NSApp.servicesProvider = self
     NSUpdateDynamicServices()
     updater.start()
+    drops.app = self
+    drops.start()
   }
 
   // MARK: - Sending files from Finder
@@ -841,6 +952,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         let u = URL(fileURLWithPath: p).standardizedFileURL
         if savedPaths.contains(u.path) || u.path.hasPrefix(downloadsDir().path + "/") || u.path.hasPrefix(saveRoot().path + "/") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
       }
+    case "getDropFolders":
+      drops.report()
+    case "dropAdd":
+      let to = d["to"] as? String ?? "", toName = d["toName"] as? String ?? "device"
+      let panel = NSOpenPanel()
+      panel.canChooseDirectories = true
+      panel.canChooseFiles = false
+      panel.canCreateDirectories = true
+      panel.prompt = "Watch This Folder"
+      panel.message = "New files saved here will be sent to \(toName)"
+      NSApp.activate(ignoringOtherApps: true)
+      panel.begin { r in
+        if r == .OK, let u = panel.url { self.drops.add(path: u.standardizedFileURL.path, to: to, toName: toName) }
+      }
+    case "dropRemove":
+      if let p = d["path"] as? String { drops.remove(path: p) }
+    case "dropDone":
+      drops.done(batch: d["batch"] as? String ?? "", result: d["result"] as? String ?? "failed")
     case "getVersion":
       js("beamNative.appVersion('1.0.\(Updater.current)')")
     case "checkUpdates":

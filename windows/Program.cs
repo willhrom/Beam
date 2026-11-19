@@ -116,6 +116,7 @@ namespace Beam
         public List<DeviceInfo> Devices = new();
         SharePicker picker;
         readonly ProgressPopup popup = new ProgressPopup();
+        readonly DropFolders drops = new DropFolders();
         readonly Updater updater;
         readonly ToolStripMenuItem updateItem = new ToolStripMenuItem("Check for updates");
         readonly ToolStripMenuItem shareItem = new ToolStripMenuItem("Add Beam to the Windows Share menu") { Visible = false };
@@ -149,6 +150,18 @@ namespace Beam
             menu.Items.Add(startupItem);
             menu.Items.Add("Reload", null, (s, e) => web.CoreWebView2?.Reload());
             updateItem.Click += (s, e) => updater.CheckNow(true);
+            // Drop folders: hand new files to the page as real file handles (like Explorer shares).
+            drops.Ready = () => pageReady && env != null && web.CoreWebView2 != null;
+            drops.Report = json => Js($"beamNative.dropFolders({json})");
+            drops.Send = (to, batch, folder, paths) =>
+            {
+                var handles = new List<object>();
+                foreach (var p in paths) { try { handles.Add(env.CreateWebFileSystemFileHandle(p, CoreWebView2FileSystemHandlePermission.ReadOnly)); } catch { } }
+                var msg = JsonSerializer.Serialize(new { op = "dropSend", to, batch, folder });
+                if (handles.Count > 0) web.CoreWebView2.PostWebMessageAsJson(msg, handles);
+                else drops.Done(batch, "failed");
+            };
+            drops.Start();
             menu.Items.Add(updateItem);
             shareItem.Click += (s, e) => AddToShareMenu(true);
             menu.Items.Add(shareItem);
@@ -586,6 +599,22 @@ namespace Beam
                     break;
                 case "setConvert":
                     Converter.Enabled = d.TryGetProperty("on", out var cv) && cv.ValueKind == JsonValueKind.True;
+                    break;
+                case "getDropFolders":
+                    drops.DoReport();
+                    break;
+                case "dropAdd":
+                {
+                    string to = Str("to") ?? "", toName = Str("toName") ?? "device";
+                    using var dlg = new FolderBrowserDialog { Description = "New files saved here will be sent to " + toName, UseDescriptionForTitle = true, ShowNewFolderButton = true };
+                    if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath)) drops.Add(NormDir(dlg.SelectedPath), to, toName);
+                    break;
+                }
+                case "dropRemove":
+                    drops.Remove(Str("path") ?? "");
+                    break;
+                case "dropDone":
+                    drops.Done(Str("batch") ?? "", Str("result") ?? "failed");
                     break;
                 case "getVersion":
                     Js($"beamNative.appVersion({Q("1.0." + Updater.Current)})");
@@ -1228,6 +1257,121 @@ namespace Beam
     /// "Someone wants to send you something" card. While Beam's window isn't in front, each request
     /// drops down from the top-right corner with Accept and Decline, and stays until it's answered
     /// (or the sender gives up). Several requests stack downwards.
+    /// Drop folders: watches chosen folders and hands newly saved files to the page, which sends them to
+    /// that folder's device. Files stay where they are; Beam remembers what it already sent.
+    sealed class DropFolders
+    {
+        public sealed class Folder { public string path { get; set; } public string to { get; set; } public string toName { get; set; } }
+        public List<Folder> Folders = new List<Folder>();
+        readonly HashSet<string> sent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // "path|size|modified"
+        readonly Dictionary<string, string> lastLook = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        readonly Dictionary<string, (List<string> keys, List<string> paths, string folder)> inFlight = new Dictionary<string, (List<string>, List<string>, string)>();
+        readonly HashSet<string> busy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        readonly Dictionary<string, DateTime> retryAfter = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 3000 };
+        static readonly HashSet<string> Skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".tmp", ".part", ".crdownload", ".download", ".partial", ".opdownload" };
+        static string SentFile => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Beam", "drop-sent.txt");
+        public Func<bool> Ready = () => false;
+        public Action<string> Report = _ => { };
+        public Action<string, string, string, List<string>> Send = (to, batch, folder, paths) => { };
+
+        public DropFolders()
+        {
+            try
+            {
+                using var k = Registry.CurrentUser.OpenSubKey(@"Software\Beam");
+                if (k?.GetValue("dropFolders") is string json) Folders = JsonSerializer.Deserialize<List<Folder>>(json) ?? new List<Folder>();
+            }
+            catch { }
+            try { if (File.Exists(SentFile)) foreach (var l in File.ReadAllLines(SentFile)) if (l.Length > 0) sent.Add(l); } catch { }
+            timer.Tick += (s, e) => Tick();
+        }
+
+        public void Start() => timer.Start();
+
+        void Save()
+        {
+            try { using var k = Registry.CurrentUser.CreateSubKey(@"Software\Beam"); k.SetValue("dropFolders", JsonSerializer.Serialize(Folders)); } catch { }
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(SentFile));
+                var list = sent.ToList();
+                if (list.Count > 20000) list = list.Skip(list.Count - 20000).ToList();
+                File.WriteAllLines(SentFile, list);
+            }
+            catch { }
+        }
+
+        static List<(string path, string key)> FilesIn(string dir)
+        {
+            var o = new List<(string, string)>();
+            try
+            {
+                foreach (var f in new DirectoryInfo(dir).EnumerateFiles())
+                {
+                    if ((f.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue;
+                    if (Skip.Contains(f.Extension) || f.Name.StartsWith("~$") || f.Name.StartsWith(".")) continue;
+                    o.Add((f.FullName, $"{f.FullName}|{f.Length}|{f.LastWriteTimeUtc.Ticks / 10000000}"));
+                }
+            }
+            catch { }
+            return o;
+        }
+
+        public void Add(string path, string to, string toName)
+        {
+            foreach (var f in FilesIn(path)) sent.Add(f.key); // what's already there isn't sent
+            Folders.RemoveAll(x => string.Equals(x.path, path, StringComparison.OrdinalIgnoreCase));
+            Folders.Add(new Folder { path = path, to = to, toName = toName });
+            Save();
+            DoReport();
+        }
+
+        public void Remove(string path)
+        {
+            Folders.RemoveAll(x => string.Equals(x.path, path, StringComparison.OrdinalIgnoreCase));
+            Save();
+            DoReport();
+        }
+
+        public void DoReport()
+        {
+            var list = Folders.Select(f => new { f.path, name = Path.GetFileName(f.path.TrimEnd('\\')) is string n && n.Length > 0 ? n : f.path, f.to, f.toName }).ToList();
+            Report(JsonSerializer.Serialize(list));
+        }
+
+        void Tick()
+        {
+            if (!Ready()) return;
+            foreach (var f in Folders.ToList())
+            {
+                if (retryAfter.TryGetValue(f.path, out var r) && r > DateTime.UtcNow) continue;
+                var ready = new List<(string path, string key)>();
+                foreach (var file in FilesIn(f.path))
+                {
+                    if (sent.Contains(file.key) || busy.Contains(file.path)) continue;
+                    if (lastLook.TryGetValue(file.path, out var prev) && prev == file.key) ready.Add(file); // unchanged twice in a row: done saving
+                    else lastLook[file.path] = file.key;
+                    if (ready.Count >= 500) break;
+                }
+                if (ready.Count == 0) continue;
+                var batch = Guid.NewGuid().ToString("N");
+                inFlight[batch] = (ready.Select(x => x.key).ToList(), ready.Select(x => x.path).ToList(), f.path);
+                foreach (var x in ready) busy.Add(x.path);
+                Send(f.to, batch, Path.GetFileName(f.path.TrimEnd('\\')), ready.Select(x => x.path).ToList());
+            }
+        }
+
+        /// The page says how a batch went. Sent (or declined): never send those files again. Otherwise try again in a minute.
+        public void Done(string batch, string result)
+        {
+            if (!inFlight.Remove(batch, out var b)) return;
+            foreach (var p in b.paths) busy.Remove(p);
+            if (result == "done" || result == "declined") { foreach (var k in b.keys) sent.Add(k); Save(); }
+            else retryAfter[b.folder] = DateTime.UtcNow.AddMinutes(1);
+        }
+    }
+
     sealed class RequestCard : Form
     {
         public readonly string Tag2;
