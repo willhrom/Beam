@@ -742,6 +742,21 @@ final class SyncFolders {
   }
 }
 
+/// A see-through strip over the top of the window: drag it to move the window, double-click to zoom
+/// (or minimize, following the "double-click a window's title bar" setting).
+final class DragStrip: NSView {
+  override func mouseDown(with e: NSEvent) {
+    guard let w = window else { return }
+    if e.clickCount == 2 {
+      let action = UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain)?["AppleActionOnDoubleClick"] as? String
+      if action == "Minimize" { w.miniaturize(nil) } else if action != "None" { w.zoom(nil) }
+      return
+    }
+    w.performDrag(with: e)
+  }
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 // Lets the page read a shared Finder file piece by piece (so big videos never load all at once).
 final class FileReader: NSObject, WKScriptMessageHandlerWithReply {
   weak var app: AppDelegate?
@@ -934,7 +949,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     window.isReleasedWhenClosed = false
     window.minSize = NSSize(width: 340, height: 480)
     window.delegate = self
-    window.contentView = web
+    // The page fills the title bar, so a see-through strip along the top lets the window be dragged
+    // (and double-clicked to zoom) like any other Mac window.
+    let box = NSView(frame: web.frame)
+    web.autoresizingMask = [.width, .height]
+    box.addSubview(web)
+    let strip = DragStrip(frame: NSRect(x: 0, y: web.frame.height - 32, width: web.frame.width, height: 32))
+    strip.autoresizingMask = [.width, .minYMargin]
+    box.addSubview(strip)
+    window.contentView = box
     window.center()
     window.setFrameAutosaveName("BeamMain")
     web.load(URLRequest(url: URL(string: serverURL.absoluteString + "/?app=mac")!))
