@@ -79,7 +79,7 @@ final class Beam {
   boolean needLogin, needSetup;
   String loginError;
 
-  private final OkHttpClient http = new OkHttpClient.Builder().pingInterval(25, TimeUnit.SECONDS).readTimeout(0, TimeUnit.MILLISECONDS).build();
+  final OkHttpClient http = new OkHttpClient.Builder().pingInterval(25, TimeUnit.SECONDS).readTimeout(0, TimeUnit.MILLISECONDS).build();
   private WebSocket ws;
   private long backoff = 1000;
   private int generation;
@@ -190,7 +190,7 @@ final class Beam {
         JSONObject hello = new JSONObject()
             .put("t", "hello").put("pub", me.pub).put("sig", me.sign("beam-hello:" + m.getString("nonce")))
             .put("name", prefs.name).put("kind", "android").put("nearby", prefs.nearby).put("watch", new JSONArray(prefs.watch()))
-            .put("caps", new JSONArray().put("offline"));
+            .put("caps", new JSONArray().put("offline").put("inbox"));
         wsSend(hello);
         break;
       }
@@ -223,6 +223,9 @@ final class Beam {
         if (fresh != null && fresh.length() > 0) { ice = fresh; iceAt = System.currentTimeMillis(); }
         break;
       }
+      case "inbox":
+        onInbox(m);
+        break;
       case "pong":
         if (pongWait != null) { PongWait w = pongWait; pongWait = null; w.got(m); }
         break;
@@ -460,7 +463,8 @@ final class Beam {
     Transfer t = tx.get(tid);
     if (t == null || !Transfer.ASKING.equals(t.state)) return;
     notify.cancelRequest(t);
-    if (t.offeredOn != null) nearby.decline(t);
+    if (t.inboxId != null) inboxDone(t.inboxId); // sent from iPhone: delete it from the server
+    else if (t.offeredOn != null) nearby.decline(t);
     else try { signal(t.peerId, new JSONObject().put("k", "decline").put("tid", tid)); } catch (Exception ignored) {}
     t.state = Transfer.FAILED;
     t.reason = "Declined";
@@ -508,8 +512,39 @@ final class Beam {
     if (prefs.favs.remove(id)) prefs.save();
   }
 
+  // ---- sent from iPhone (the Shortcut): the file waits on the server; we fetch it and save it as usual ----
+  void onInbox(JSONObject m) {
+    String id = m.optString("id");
+    if (id.isEmpty() || tx.containsKey(id)) return;
+    String from = m.optString("from", "iPhone");
+    List<Transfer.Item> items = new ArrayList<>();
+    if (m.has("text")) {
+      String text = m.optString("text");
+      if (text.length() > 65536) text = text.substring(0, 65536);
+      Transfer.Item it = new Transfer.Item("Text", text.length(), "text/plain", true);
+      it.textValue = text;
+      items.add(it);
+      Transfer t = new Transfer(this, id, true, "iphone", from, "phone", true, items);
+      tx.put(id, t);
+      t.done = t.total;
+      t.finish();
+      changed();
+      return;
+    }
+    items.add(new Transfer.Item(Transfer.cleanName(m.optString("name", "File")), Math.max(0, m.optLong("size")), m.optString("type", "application/octet-stream"), false));
+    Transfer t = new Transfer(this, id, true, "iphone", from, "phone", true, items);
+    t.inboxId = id;
+    t.inboxDl = m.optString("dl");
+    incoming(t);
+  }
+
+  void inboxDone(String id) {
+    try { wsSend(new JSONObject().put("t", "inbox-done").put("id", id)); } catch (Exception ignored) {}
+  }
+
   /** Signed in to my own account. */
   boolean isMine(String id) {
+    if ("iphone".equals(id)) return true; // sent from my own iPhone Shortcut
     for (Peer p : allPeers()) if (p.id.equals(id)) return p.mine;
     return false;
   }

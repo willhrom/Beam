@@ -159,7 +159,7 @@ async function onServer(m) {
         S.serverVersion = m.v;
       }
       if (GUEST) { wsSend({ t: "hello", pub: Id.pub, sig: await Id.sign("beam-hello:" + m.nonce), name: store.get("guestName", "") || "Guest", kind, guest: GUEST }); break; }
-      wsSend({ t: "hello", pub: Id.pub, sig: await Id.sign("beam-hello:" + m.nonce), name: S.name, kind, nearby: S.nearby, watch: Object.keys(S.paired), caps: ["offline"] });
+      wsSend({ t: "hello", pub: Id.pub, sig: await Id.sign("beam-hello:" + m.nonce), name: S.name, kind, nearby: S.nearby, watch: Object.keys(S.paired), caps: ["offline", "inbox"] });
       break;
     case "welcome":
       if (m.id !== Id.id) console.warn("server id mismatch");
@@ -197,6 +197,12 @@ async function onServer(m) {
       break;
     case "ice":
       if (Array.isArray(m.ice) && m.ice.length) { S.ice = m.ice; S.iceAt = Date.now(); }
+      break;
+    case "inbox":
+      onInbox(m);
+      break;
+    case "shortcut-key":
+      renderShortcutKey(m);
       break;
     case "guest-link":
       renderGuestLink(m);
@@ -572,7 +578,63 @@ async function accept(t, gesture) {
     if (!dir && gesture && (t.total >= BIG || topFolder(t.items))) dir = await pickFolder().catch(() => null);
     if (dir) { t.sink = "fs"; t.dirHandle = dir; }
   }
+  if (t.inbox) return downloadInbox(t);
   await answerConn(t, t.sdp, t.gen);
+}
+
+// ----- sent from iPhone (the Shortcut) -----
+// The file waits on the server; we download it into the usual place, then tell the server to delete it.
+function onInbox(m) {
+  if (S.tx.has(m.id)) return;
+  const peer = { id: "iphone", name: m.from || "iPhone", kind: "phone", paired: true, mine: true };
+  if (typeof m.text === "string") {
+    const text = m.text.slice(0, 64 * 1024);
+    const t = { tid: m.id, dir: "in", peer, items: [{ name: "Text", size: text.length, type: "text/plain", text: true }], total: text.length, done: text.length, state: "receiving", received: [{ text }], fromMine: true };
+    S.tx.set(t.tid, t);
+    finish(t);
+    renderTx(t);
+    notify(t.tid, "From " + peer.name, text.trim().slice(0, 200), false);
+    return;
+  }
+  const item = { name: cleanName(m.name || "File"), size: Math.max(0, Number(m.size) || 0), type: String(m.type || "application/octet-stream").slice(0, 100), text: false };
+  const t = {
+    tid: m.id, dir: "in", peer, items: [item], total: item.size, done: 0, state: "asking", gen: 0, received: [], cur: -1, curDone: true, got: 0,
+    q: Promise.resolve(), inbox: { id: m.id, dl: m.dl }, fromMine: true,
+  };
+  S.tx.set(t.tid, t);
+  (async () => {
+    if (S.autoAccept && (native || t.total < BIG || (await savedFolder(false)))) return accept(t, false);
+    renderTx(t);
+    promptIncoming(t);
+  })();
+}
+async function downloadInbox(t) {
+  t.state = "receiving";
+  renderTx(t);
+  const it = t.items[0];
+  let w = null;
+  try {
+    const r = await fetch(`/api/inbox/${encodeURIComponent(t.inbox.id)}?t=${encodeURIComponent(t.inbox.dl)}`, { cache: "no-store" });
+    if (!r.ok || !r.body) throw new Error("gone");
+    w = makeWriter(t, it, 0);
+    const reader = r.body.getReader();
+    for (;;) {
+      if (t.state !== "receiving") { await w.abort(); return; } // cancelled
+      const { done, value } = await reader.read();
+      if (done) break;
+      await w.write(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+      t.done += value.byteLength;
+      renderProgress(t);
+    }
+    if (t.done !== it.size) throw new Error("short");
+    await w.close();
+    wsSend({ t: "inbox-done", id: t.inbox.id });
+    finish(t);
+    renderTx(t);
+  } catch {
+    try { if (w) await w.abort(); } catch {}
+    fail(t, "Couldn't download it. Send it again");
+  }
 }
 
 async function answerConn(t, sdp, gen) {
@@ -605,7 +667,8 @@ async function onResume(from, d) {
 
 function decline(t) {
   closePrompt(t.tid);
-  wsSend({ t: "signal", to: t.peer.id, data: { k: "decline", tid: t.tid } });
+  if (t.inbox) wsSend({ t: "inbox-done", id: t.inbox.id }); // sent from iPhone: delete it from the server
+  else wsSend({ t: "signal", to: t.peer.id, data: { k: "decline", tid: t.tid } });
   t.state = "failed";
   t.reason = "Declined";
   S.tx.delete(t.tid);
@@ -755,6 +818,53 @@ function setupReceive(t, dc, gen) {
   };
 }
 
+// ----- iPhone Shortcut -----
+// On any signed-in device: make the personal key and show a QR code that opens the setup steps on the iPhone.
+function shortcutSheet() {
+  S.scOpen = true;
+  openSheet(`<h2>Send from iPhone</h2>
+    <p>Add Beam to the iPhone share sheet with a Shortcut. It sends photos, videos (up to 100 MB each), files, text and links to any of your devices that are online.</p>
+    <p class="hint">iPhone Shortcuts can't make Beam's direct connection, so files from the Shortcut pass through the Beam server: they're stored briefly and deleted as soon as your device has them (or after a day). Text and links aren't stored.</p>
+    <div id="scBody"><div class="actions"><button class="btn ghost" id="scBack">Back</button><button class="btn primary" id="scMake">Set up the Shortcut</button></div></div>`, () => { S.scOpen = false; });
+  $("#scBack").onclick = () => { sheetOnClose = null; S.scOpen = false; showSettings(); };
+  $("#scMake").onclick = () => wsSend({ t: "shortcut-key" });
+}
+async function renderShortcutKey(m) {
+  if (!S.scOpen || !$("#scBody")) return;
+  if (!m.key) { $("#scBody").innerHTML = '<p>The Shortcut is turned off. Any iPhone set up before can\'t send any more.</p><div class="actions"><button class="btn primary" id="scDone">Done</button></div>'; $("#scDone").onclick = closeSheet; return; }
+  const url = location.origin + "/?sc=" + m.key;
+  if (!window.qrcode) await new Promise((res, rej) => { const sc = document.createElement("script"); sc.src = "/qrcode.js"; sc.onload = res; sc.onerror = rej; document.head.appendChild(sc); }).catch(() => {});
+  let svg = "";
+  if (window.qrcode) { const q = qrcode(0, "M"); q.addData(url); q.make(); svg = q.createSvgTag({ cellSize: 6, margin: 3, scalable: true }); }
+  $("#scBody").innerHTML = `<div class="qr">${svg}</div>
+    <p class="hint center">Scan this with the iPhone's camera. It opens the setup steps with everything ready to copy. This code is a key to sending to your devices: don't share it.</p>
+    <div class="actions"><button class="btn danger" id="scOff">Turn off</button><button class="btn primary" id="scDone">Done</button></div>`;
+  $("#scDone").onclick = closeSheet;
+  $("#scOff").onclick = () => wsSend({ t: "shortcut-revoke" });
+}
+// On the iPhone: the steps to build the Shortcut, with each value ready to copy.
+function shortcutSetup(key) {
+  const base = location.origin;
+  const devices = `${base}/api/sc/devices?key=${key}`;
+  const sendUrl = `${base}/api/sc/send?key=${key}`;
+  const copy = (id, label, value) => `<div class="sc-copy"><span>${label}</span><div><input type="text" readonly value="${esc(value)}" id="${id}"><button class="btn ghost small" data-copy-from="${id}">Copy</button></div></div>`;
+  openSheet(`<h2>Add Beam to your iPhone share sheet</h2>
+    <p>In the <b>Shortcuts</b> app, tap <b>+</b> to make a new Shortcut named <b>Beam</b>, then add these actions in order:</p>
+    <ol class="sc-steps">
+      <li>Tap the <b>ⓘ</b> (Details) button and turn on <b>Show in Share Sheet</b>. Set it to receive <b>Images, Media, Files, Text and URLs</b>.</li>
+      <li>Add <b>Get Contents of URL</b> and paste this as the URL:${copy("scDev", "Your devices", devices)}</li>
+      <li>Add <b>Choose from List</b>, choosing from <b>Contents of URL</b>. (It lists your devices that are online.)</li>
+      <li>Add <b>Get Dictionary Value</b>: get the value for <b>Chosen Item</b> in <b>Contents of URL</b>.</li>
+      <li>Add <b>Repeat with Each</b> item in <b>Shortcut Input</b>.</li>
+      <li>Inside the repeat, add <b>Get Contents of URL</b>. Paste this URL, then type <b>&amp;to=</b> and insert <b>Dictionary Value</b>, then <b>&amp;name=</b> and insert <b>Repeat Item</b> (tap it and choose <b>Name</b>):${copy("scSend", "Send to Beam", sendUrl)}
+        Tap <b>Show More</b>: set <b>Method</b> to <b>POST</b> and <b>Request Body</b> to <b>File</b>, and choose <b>Repeat Item</b>.</li>
+      <li>After the repeat, add <b>Show Notification</b> saying <b>Sent with Beam</b>.</li>
+    </ol>
+    <p>Now in Photos (or anywhere), tap Share, then <b>Beam</b>, and pick a device. Text and links work too.</p>
+    <p class="hint">Keep this page private: these links let anyone send to your devices. You can turn them off in Beam's Settings on any of your devices.</p>`);
+  document.querySelectorAll("[data-copy-from]").forEach((b) => (b.onclick = () => { const i = $("#" + b.dataset.copyFrom); i.select(); navigator.clipboard.writeText(i.value).then(() => toast("Copied"), () => document.execCommand("copy")); }));
+}
+
 // ----- guests (QR code) -----
 function guestWelcome() {
   openSheet(`<h2>Send files to ${esc(S.guest.toName)}</h2>
@@ -859,7 +969,7 @@ function openLinkIfMine(t) {
   const url = t.received[0].text.trim();
   if (!/^https?:\/\/\S+$/.test(url)) return;
   const peer = S.peers.find((p) => p.id === t.peer.id);
-  if (!peer || !peer.mine) return;
+  if (!t.fromMine && (!peer || !peer.mine)) return;
   if (native) { native.postMessage({ op: "openUrl", url }); return; }
   // A browser tab may block opening a window it wasn't asked to; then the notification opens it.
   const w = window.open(url, "_blank", "noopener");
@@ -1861,6 +1971,7 @@ function showSettings() {
     <div class="group">
       ${native ? nav("drops", "Drop folders", `<span id="dropsSub">${dropSummary()}</span>`) : ""}
       ${nav("guestqr", "Guest QR code", "Let someone without Beam send files to this device")}
+      ${nav("iphone", "Send from iPhone", "Add Beam to the iPhone share sheet")}
       ${nav("hist", "Transfer history", "What this device sent and received")}
       ${nav("ctest", "Test connection", "Check the server, relay and your devices")}
     </div>
@@ -1889,6 +2000,7 @@ function showSettings() {
   $("#ctest").onclick = () => { saveSettings(); sheetOnClose = null; connectionTest(); };
   if ($("#drops")) $("#drops").onclick = () => { saveSettings(); sheetOnClose = null; dropFoldersSheet(); };
   $("#guestqr").onclick = () => { saveSettings(); sheetOnClose = null; guestSheet(); };
+  $("#iphone").onclick = () => { saveSettings(); sheetOnClose = null; shortcutSheet(); };
   if (native) native.postMessage({ op: "getDropFolders" });
   if ($("#upd")) $("#upd").onclick = () => { native.postMessage({ op: "checkUpdates" }); toast("Checking for updates…"); };
   if (native) native.postMessage({ op: "getVersion" });
@@ -2223,6 +2335,9 @@ function showInvite(m) {
   const shared = [q.get("title"), q.get("text"), q.get("url")].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join("\n");
   if (shared) { S.pending = { files: [], text: shared }; history.replaceState(null, "", location.pathname + (nativeKind ? "?app=" + nativeKind : "")); }
   if ("serviceWorker" in navigator && !native) navigator.serviceWorker.register("/sw.js").catch(() => {});
+  // Opened on an iPhone from the Shortcut setup QR code: just the instructions, no sign-in.
+  const sc = q.get("sc");
+  if (sc && /^[A-Za-z0-9_-]{20,64}$/.test(sc)) { document.documentElement.classList.add("guest-mode"); render(); return shortcutSetup(sc); }
   render();
   connect();
 })();

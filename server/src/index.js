@@ -28,6 +28,10 @@ export default {
       return hub.fetch(req);
     }
     if (url.pathname === "/api/health") return Response.json({ ok: true });
+    // iPhone Shortcut: list my devices, send to one; devices fetch what was sent to them.
+    if (url.pathname.startsWith("/api/sc/") || url.pathname.startsWith("/api/inbox/")) {
+      return env.HUB.get(env.HUB.idFromName("global")).fetch(req);
+    }
     return env.ASSETS ? env.ASSETS.fetch(req) : new Response("Not found", { status: 404 });
   },
 };
@@ -106,6 +110,8 @@ export class Hub extends DurableObject {
   }
 
   async fetch(req) {
+    const path = new URL(req.url).pathname;
+    if (path.startsWith("/api/")) return this.api(req).catch((e) => Response.json({ error: "Something went wrong: " + String(e && e.message || e).slice(0, 100) }, { status: 500 }));
     // Limit connections that haven't signed in yet, so nobody can tie the server up.
     const net = netKey(req.headers.get("CF-Connecting-IP"));
     const waiting = this.ctx.getWebSockets().map((w) => w.deserializeAttachment() || {}).filter((x) => !x.user);
@@ -140,6 +146,85 @@ export class Hub extends DurableObject {
   async hasUsers() { return !!(await this.ctx.storage.get("meta:hasUsers")); }
 
   /** Finish connecting a device that belongs to an account. */
+  // ---- iPhone Shortcut inbox ----
+  // A Shortcut can't make Beam's direct device-to-device connection, so it uploads here: the file waits in
+  // R2 (deleted once the device has it, or after a day), and the device is told to come and get it.
+  async api(req) {
+    const url = new URL(req.url);
+    const p = url.pathname;
+    await this.loadDevs();
+    if (p.startsWith("/api/inbox/")) {
+      const id = p.slice("/api/inbox/".length);
+      const rec = /^[A-Za-z0-9_-]{10,40}$/.test(id) ? await this.ctx.storage.get("inbox:" + id) : null;
+      if (!rec || rec.dl !== url.searchParams.get("t") || rec.exp < Date.now() || !this.env.INBOX) return new Response("Not found", { status: 404 });
+      const obj = await this.env.INBOX.get("inbox/" + id);
+      if (!obj) return new Response("Not found", { status: 404 });
+      return new Response(obj.body, { headers: { "Content-Type": rec.type || "application/octet-stream", "Content-Length": String(obj.size), "Cache-Control": "no-store" } });
+    }
+    const key = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("key") || "";
+    const k = /^[A-Za-z0-9_-]{20,64}$/.test(key) ? await this.ctx.storage.get("skey:" + hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key)))) : null;
+    const user = k && (await this.ctx.storage.get("user:" + k.user)) ? k.user : null;
+    if (!user) return Response.json({ error: "This Beam Shortcut isn't set up any more. Set it up again from Beam's Settings." }, { status: 401 });
+    const mine = this.sockets().filter((s) => s.a.user === user && s.a.inbox);
+
+    if (p === "/api/sc/devices") {
+      // Name → device id, for the Shortcut's "Choose from List".
+      const out = {};
+      for (const s of mine.sort((x, y) => x.a.name.localeCompare(y.a.name))) {
+        let n = s.a.name, i = 2;
+        while (out[n]) n = s.a.name + " (" + i++ + ")";
+        out[n] = s.a.id;
+      }
+      if (!Object.keys(out).length) return Response.json({ error: "None of your devices are online. Open Beam on one and try again." }, { status: 409 });
+      return Response.json(out);
+    }
+
+    if (p === "/api/sc/send" && req.method === "POST") {
+      const to = url.searchParams.get("to") || "";
+      const target = mine.find((s) => s.a.id === to);
+      if (!target) return Response.json({ error: "That device isn't online. Open Beam on it and try again." }, { status: 409 });
+      const type = (req.headers.get("Content-Type") || "application/octet-stream").split(";")[0].trim().slice(0, 100);
+      const size = Number(req.headers.get("Content-Length") || 0);
+      const name = clean(url.searchParams.get("name"), 200) || "File";
+      // Text and links (small plain text) go straight to the device.
+      if (type === "text/plain" && size <= 64 * 1024 && !/\.(txt|md|csv|log)$/i.test(name)) {
+        const text = (await req.text()).slice(0, 64 * 1024);
+        send(target.ws, { t: "inbox", id: b64u(crypto.getRandomValues(new Uint8Array(12))), text, from: "iPhone" });
+        return Response.json({ ok: true, sent: "text" });
+      }
+      if (!this.env.INBOX) return Response.json({ error: "Sending files from iPhone isn't switched on yet (R2 storage is missing)." }, { status: 503 });
+      if (!size) return Response.json({ error: "Empty file" }, { status: 400 });
+      if (size > 100 * 1048576) return Response.json({ error: "That file is over 100 MB. Use the Beam web page in Safari for big files." }, { status: 413 });
+      const id = b64u(crypto.getRandomValues(new Uint8Array(15)));
+      await this.env.INBOX.put("inbox/" + id, req.body, { httpMetadata: { contentType: type } });
+      const rec = { to, user, name, size, type, dl: b64u(crypto.getRandomValues(new Uint8Array(18))), exp: Date.now() + 24 * 3600 * 1000 };
+      await this.ctx.storage.put("inbox:" + id, rec);
+      if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + 3600 * 1000);
+      send(target.ws, { t: "inbox", id, name, size, type, dl: rec.dl, from: "iPhone" });
+      return Response.json({ ok: true, sent: name });
+    }
+    return Response.json({ error: "Not found" }, { status: 404 });
+  }
+
+  /** Hand a device anything sent to it from iPhone while it was briefly away. */
+  async deliverInbox(ws, id) {
+    const list = await this.ctx.storage.list({ prefix: "inbox:" });
+    for (const [k, r] of list) if (r.to === id && r.exp > Date.now()) send(ws, { t: "inbox", id: k.slice(6), name: r.name, size: r.size, type: r.type, dl: r.dl, from: "iPhone" });
+  }
+
+  async dropInbox(id) {
+    await this.ctx.storage.delete("inbox:" + id);
+    try { if (this.env.INBOX) await this.env.INBOX.delete("inbox/" + id); } catch {}
+  }
+
+  // Hourly while anything is waiting: delete what nobody picked up within a day.
+  async alarm() {
+    const list = await this.ctx.storage.list({ prefix: "inbox:" });
+    let left = 0;
+    for (const [k, r] of list) { if (r.exp < Date.now()) await this.dropInbox(k.slice(6)); else left++; }
+    if (left) await this.ctx.storage.setAlarm(Date.now() + 3600 * 1000);
+  }
+
   // ---- device records, cached in memory (every device signed in to an account) ----
   async loadDevs() {
     if (this.devs) return;
@@ -157,6 +242,7 @@ export class Hub extends DurableObject {
     ws.serializeAttachment(a);
     send(ws, { t: "welcome", id: a.id, ice: await this.turn(), user: { username: a.user, name: rec.name, admin: a.admin } });
     this.broadcast(a, null);
+    await this.deliverInbox(ws, a.id);
   }
 
   /** Disconnect every device matching `pred` (removed person or device). */
@@ -322,6 +408,7 @@ export class Hub extends DurableObject {
         user: null,
         // Newer apps also list this account's devices that are offline right now.
         offlineList: Array.isArray(m.caps) && m.caps.includes("offline"),
+        inbox: Array.isArray(m.caps) && m.caps.includes("inbox"), // can receive what's sent from iPhone
       };
       // A guest from a QR code: no account, and it can only see the device that made the code.
       if (typeof m.guest === "string" && m.guest) {
@@ -423,6 +510,26 @@ export class Hub extends DurableObject {
     }
 
     if (!a.user && !(a.guest && GUEST_OK.has(m.t))) return; // everything below needs a signed-in device
+
+    // The device got (or turned down) something sent from iPhone: delete it from storage.
+    if (m.t === "inbox-done") {
+      const id = String(m.id || "");
+      const r = await this.ctx.storage.get("inbox:" + id);
+      if (r && r.to === a.id) await this.dropInbox(id);
+      return;
+    }
+    // iPhone Shortcut key: a personal key the Shortcut uses to send to my devices.
+    if (m.t === "shortcut-key" || m.t === "shortcut-revoke") {
+      const listKey = "skeys:" + a.user;
+      for (const h of (await this.ctx.storage.get(listKey)) || []) await this.ctx.storage.delete("skey:" + h);
+      await this.ctx.storage.delete(listKey);
+      if (m.t === "shortcut-revoke") return send(ws, { t: "shortcut-key", key: null });
+      const token = b64u(crypto.getRandomValues(new Uint8Array(24)));
+      const h = hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
+      await this.ctx.storage.put("skey:" + h, { user: a.user, created: Date.now() });
+      await this.ctx.storage.put(listKey, [h]);
+      return send(ws, { t: "shortcut-key", key: token });
+    }
 
     // QR guest link: anyone who scans it can send files to this device (and only this one) for a day.
     if (m.t === "guest-link" || m.t === "guest-link-get" || m.t === "guest-revoke") {

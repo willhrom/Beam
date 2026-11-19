@@ -97,6 +97,8 @@ final class Transfer {
   private boolean curDone = true;
   private long got;
   private OutputStream out;
+  /** Sent from iPhone: where to download it (instead of a direct connection). */
+  String inboxId, inboxDl;
   private Uri pendingUri;
   private ByteArrayOutputStream textBuf;
 
@@ -190,10 +192,41 @@ final class Transfer {
 
   void accept() {
     if (!ASKING.equals(state)) return;
+    if (inboxId != null) { state = RECEIVING; ui(); new Thread(this::downloadInbox, "beam-inbox").start(); return; }
     if (offeredOn != null) { sendFromOver(offeredOn); return; }
     state = CONNECTING;
     ui();
     answerConn(offerSdp, gen);
+  }
+
+  /** Sent from iPhone: download the file from the server into the usual place, then have the server delete it. */
+  private void downloadInbox() {
+    Item it = items.get(0);
+    try {
+      okhttp3.Request req = new okhttp3.Request.Builder()
+          .url(Beam.SERVER + "/api/inbox/" + android.net.Uri.encode(inboxId) + "?t=" + android.net.Uri.encode(inboxDl)).build();
+      try (okhttp3.Response resp = beam.http.newCall(req).execute()) {
+        if (!resp.isSuccessful() || resp.body() == null) throw new IOException("gone");
+        openOutput(it);
+        try (InputStream in = resp.body().byteStream()) {
+          byte[] buf = new byte[256 * 1024];
+          int n;
+          while ((n = in.read(buf)) > 0) {
+            if (!active()) { discardPartial(); return; } // cancelled
+            out.write(buf, 0, n);
+            done += n;
+            progressUi();
+          }
+        }
+        if (done != it.size) throw new IOException("short");
+        closeOutput(it);
+      }
+      beam.inboxDone(inboxId);
+      beam.main.post(this::finish);
+    } catch (Exception e) {
+      discardPartial();
+      beam.main.post(() -> fail("Couldn't download it. Send it again"));
+    }
   }
 
   /** Receiver: a route is ready; tell the sender where to start (0, or wherever we got to). */
