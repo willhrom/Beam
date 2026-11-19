@@ -176,7 +176,7 @@ public class MainActivity extends Activity implements Beam.Listener {
 
     peersGrid = new GridLayout(this);
     peersGrid.setColumnCount(3);
-    LinearLayout.LayoutParams gp = Ui.margins(this, -2, -2, 0, 28, 0, 8);
+    LinearLayout.LayoutParams gp = Ui.margins(this, -1, -2, 0, 28, 0, 8); // full width: the three columns share it
     gp.gravity = Gravity.CENTER_HORIZONTAL;
     root.addView(peersGrid, gp);
 
