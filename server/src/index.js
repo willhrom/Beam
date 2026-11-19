@@ -136,7 +136,19 @@ export class Hub extends DurableObject {
   async hasUsers() { return !!(await this.ctx.storage.get("meta:hasUsers")); }
 
   /** Finish connecting a device that belongs to an account. */
+  // ---- device records, cached in memory (every device signed in to an account) ----
+  async loadDevs() {
+    if (this.devs) return;
+    const list = await this.ctx.storage.list({ prefix: "dev:" });
+    const devs = new Map();
+    for (const [k, d] of list) devs.set(k.slice(4), d);
+    this.devs = devs;
+  }
+  async putDev(id, d) { await this.loadDevs(); this.devs.set(id, d); await this.ctx.storage.put("dev:" + id, d); }
+  async delDev(id) { await this.loadDevs(); this.devs.delete(id); await this.ctx.storage.delete("dev:" + id); }
+
   async signedIn(ws, a, rec) {
+    await this.loadDevs();
     a.admin = !!rec.admin;
     ws.serializeAttachment(a);
     send(ws, { t: "welcome", id: a.id, ice: await this.turn(), user: { username: a.user, name: rec.name, admin: a.admin } });
@@ -185,9 +197,25 @@ export class Hub extends DurableObject {
   }
 
   peersFor(a, all) {
-    return all
+    const list = all
       .filter((p) => this.visible(a, p.a))
       .map((p) => ({ id: p.a.id, name: p.a.name, kind: p.a.kind, pub: p.a.pub, paired: a.watch.includes(p.a.id), local: p.a.net === a.net, mine: p.a.user === a.user }));
+    // My own devices that aren't connected right now, so Beam remembers them.
+    if (a.offlineList && a.user && this.devs) {
+      const online = new Set(all.map((p) => p.a.id));
+      for (const [id, d] of this.devs) {
+        if (d.user !== a.user || id === a.id || online.has(id)) continue;
+        list.push({ id, name: d.name, kind: d.kind, mine: true, offline: true, seen: d.seen || d.added || 0 });
+      }
+    }
+    return list;
+  }
+
+  /** Re-send device lists to everyone on an account (a device was added, removed or renamed). */
+  refreshAccount(user) {
+    if (!user) return;
+    const all = this.sockets();
+    for (const s of all) if (s.a.user === user) send(s.ws, { t: "peers", peers: this.peersFor(s.a, all) });
   }
 
   // Send fresh peer lists to everyone whose view of `changed` may have changed.
@@ -238,6 +266,7 @@ export class Hub extends DurableObject {
 
   async webSocketMessage(ws, raw) {
     try {
+      await this.loadDevs();
       await this.handle(ws, raw);
     } catch (e) {
       console.error("message failed", e && e.message);
@@ -284,18 +313,20 @@ export class Hub extends DurableObject {
         net: a.net,
         tries: 0,
         user: null,
+        // Newer apps also list this account's devices that are offline right now.
+        offlineList: Array.isArray(m.caps) && m.caps.includes("offline"),
       };
       // Is this device signed in to an account?
       const dev = await this.ctx.storage.get("dev:" + id);
       const rec = dev && (await this.ctx.storage.get("user:" + dev.user));
-      if (dev && !rec) await this.ctx.storage.delete("dev:" + id);
+      if (dev && !rec) await this.delDev(id);
       if (!rec) {
         ws.serializeAttachment(me);
         send(ws, { t: "welcome", id, login: true, setup: !(await this.hasUsers()) });
         return;
       }
       me.user = dev.user;
-      if (dev.name !== me.name || dev.kind !== me.kind) await this.ctx.storage.put("dev:" + id, { ...dev, name: me.name, kind: me.kind });
+      if (dev.name !== me.name || dev.kind !== me.kind || !dev.seen || Date.now() - dev.seen > 3600000) await this.putDev(id, { ...dev, name: me.name, kind: me.kind, seen: Date.now() });
       await this.signedIn(ws, me, rec);
       return;
     }
@@ -317,7 +348,7 @@ export class Hub extends DurableObject {
       const rec = { name, admin: true, ...(await hashPin(String(m.pin))), created: Date.now() };
       await this.ctx.storage.put("user:" + username, rec);
       await this.ctx.storage.put("meta:hasUsers", true);
-      await this.ctx.storage.put("dev:" + a.id, { user: username, name: a.name, kind: a.kind, added: Date.now() });
+      await this.putDev(a.id, { user: username, name: a.name, kind: a.kind, added: Date.now(), seen: Date.now() });
       a.user = username;
       return this.signedIn(ws, a, rec);
     }
@@ -360,7 +391,7 @@ export class Hub extends DurableObject {
       }
       delete rec.locks[a.net];
       await this.ctx.storage.put(key, rec);
-      await this.ctx.storage.put("dev:" + a.id, { user: username, name: a.name, kind: a.kind, added: Date.now() });
+      await this.putDev(a.id, { user: username, name: a.name, kind: a.kind, added: Date.now(), seen: Date.now() });
       a.user = username;
       for (const o of this.sockets())
         if (o.a.user === username && o.a.id !== a.id) send(o.ws, { t: "account-alert", device: a.name, kind: a.kind, at: Date.now() });
@@ -369,9 +400,21 @@ export class Hub extends DurableObject {
 
     if (!a.user) return; // everything below needs a signed-in device
 
+    // Remove one of my own devices that's gone for good (old laptop, reinstalled app…).
+    if (m.t === "forget-device") {
+      const id = String(m.id || "");
+      await this.loadDevs();
+      const d = this.devs.get(id);
+      if (!d || d.user !== a.user || id === a.id) return;
+      await this.delDev(id);
+      this.kick((x) => x.id === id, "This device was removed from your account.");
+      return this.refreshAccount(a.user);
+    }
+
     if (m.t === "logout") {
-      await this.ctx.storage.delete("dev:" + a.id);
-      return this.kick((x) => x.id === a.id, "You signed out on this device.");
+      await this.delDev(a.id);
+      this.kick((x) => x.id === a.id, "You signed out on this device.");
+      return this.refreshAccount(a.user);
     }
 
     if (m.t === "pin-change") {
@@ -410,14 +453,15 @@ export class Hub extends DurableObject {
         if (username === a.user) return send(ws, { t: "account-error", reason: "You can't remove yourself." });
         await this.ctx.storage.delete(key);
         const devs = await this.ctx.storage.list({ prefix: "dev:" });
-        for (const [dk, d] of devs) if (d.user === username) await this.ctx.storage.delete(dk);
+        for (const [dk, d] of devs) if (d.user === username) await this.delDev(dk.slice(4));
         this.kick((x) => x.user === username, "Your Beam account was removed.");
       } else if (m.t === "admin-remove-device") {
         const id = String(m.id || "");
         const d = await this.ctx.storage.get("dev:" + id);
         if (!d) return;
-        await this.ctx.storage.delete("dev:" + id);
+        await this.delDev(id);
         this.kick((x) => x.id === id, "This device was signed out by the admin.");
+        this.refreshAccount(d.user);
       } else if (m.t === "admin-set-admin") {
         const rec = await this.ctx.storage.get(key);
         if (!rec || username === a.user) return;
@@ -447,6 +491,7 @@ export class Hub extends DurableObject {
       if (Array.isArray(m.watch)) a.watch = m.watch.map(String).filter((x) => /^[0-9a-f]{32}$/.test(x)).slice(0, MAX_WATCH);
       ws.serializeAttachment(a);
       this.broadcast(a, before);
+      if (a.name !== before.name) { const d = this.devs.get(a.id); if (d) await this.putDev(a.id, { ...d, name: a.name }); }
       return;
     }
 
@@ -504,6 +549,10 @@ export class Hub extends DurableObject {
     const a = ws.deserializeAttachment();
     if (a && a.id) {
       ws.serializeAttachment({});
+      if (a.user) {
+        // Remember when it was last online ("Last seen 2 hours ago").
+        try { await this.loadDevs(); const d = this.devs.get(a.id); if (d) await this.putDev(a.id, { ...d, seen: Date.now() }); } catch {}
+      }
       this.broadcast({ ...a, id: a.id }, a);
     }
   }

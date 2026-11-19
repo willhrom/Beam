@@ -298,6 +298,23 @@ public class MainActivity extends Activity implements Beam.Listener {
       if (peersSeen.add(p.id)) Fx.popIn(b, fresh++);
       want.add(b);
     }
+    // My account's devices that are offline: dimmed, after the ones I can send to.
+    for (Beam.Peer p : beam.offline) {
+      if (ids.contains(p.id)) continue;
+      ids.add(p.id);
+      String k = "off|" + p.name + "|" + p.kind + "|" + beam.isFav(p.id);
+      LinearLayout b = bubbles.get(p.id);
+      if (b == null || !k.equals(bubbleKeys.get(p.id))) {
+        b = Ui.peerBubble(this, p, true, "Offline", false);
+        if (beam.isFav(p.id)) Ui.addStar(this, b);
+        b.setAlpha(0.5f);
+        b.setOnClickListener(v -> offlineDevice(p));
+        bubbles.put(p.id, b);
+        bubbleKeys.put(p.id, k);
+      }
+      if (peersSeen.add(p.id)) Fx.popIn(b, fresh++);
+      want.add(b);
+    }
     bubbles.keySet().retainAll(ids);
     bubbleKeys.keySet().retainAll(ids);
     peersSeen.retainAll(ids);
@@ -306,7 +323,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       for (View v : want) { Fx.detach(v); peersGrid.addView(v); }
     }
     empty.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
-    emptyBox.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
+    emptyBox.setVisibility(all.isEmpty() && beam.offline.isEmpty() ? View.VISIBLE : View.GONE);
     boolean looking = all.isEmpty() && (beam.online || beam.nearby.usable());
     radarBox.setVisibility(looking ? View.VISIBLE : View.GONE);
     for (android.animation.ValueAnimator ra : radarAnims) {
@@ -535,6 +552,29 @@ public class MainActivity extends Activity implements Beam.Listener {
   }
 
   // ---------- sending ----------
+  /** One of my devices that isn't connected right now. */
+  private void offlineDevice(Beam.Peer p) {
+    Ui.dialog(this).setCustomTitle(Ui.title(this, p.name + " is offline"))
+        .setMessage("Last seen " + ago(p.seen) + ". When Beam is open on it again, it'll be ready to send to here.\n\n"
+            + "Replaced this device, or don't use it any more? Forget it to remove it from your account. Signing in on it again brings it back.")
+        .setPositiveButton("OK", null)
+        .setNegativeButton("Forget device", (d, w) -> {
+          beam.forgetDevice(p.id);
+          Toast.makeText(this, p.name + " removed from your account", Toast.LENGTH_SHORT).show();
+        }).show();
+  }
+
+  static String ago(long ms) {
+    if (ms <= 0) return "a while ago";
+    long m = Math.round((System.currentTimeMillis() - ms) / 60000.0);
+    if (m < 2) return "just now";
+    if (m < 60) return m + " minutes ago";
+    long h = Math.round(m / 60.0);
+    if (h < 24) return h + (h == 1 ? " hour ago" : " hours ago");
+    long d = Math.round(h / 24.0);
+    return d + (d == 1 ? " day ago" : " days ago");
+  }
+
   private void chooseWhat(String peerId) {
     Beam.Peer p = beam.peer(peerId);
     if (p == null) return;

@@ -116,6 +116,7 @@ const S = {
   openLinks: store.get("openLinks", true),
   paired: store.get("paired", {}), // id -> {pub, name, kind}
   peers: [],
+  offline: [], // my account's devices that aren't connected right now
   ice: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }],
   online: false,
   tx: new Map(), // tid -> transfer
@@ -153,7 +154,7 @@ async function onServer(m) {
         if (S.serverVersion && m.v !== S.serverVersion) return reloadWhenIdle();
         S.serverVersion = m.v;
       }
-      wsSend({ t: "hello", pub: Id.pub, sig: await Id.sign("beam-hello:" + m.nonce), name: S.name, kind, nearby: S.nearby, watch: Object.keys(S.paired) });
+      wsSend({ t: "hello", pub: Id.pub, sig: await Id.sign("beam-hello:" + m.nonce), name: S.name, kind, nearby: S.nearby, watch: Object.keys(S.paired), caps: ["offline"] });
       break;
     case "welcome":
       if (m.id !== Id.id) console.warn("server id mismatch");
@@ -185,7 +186,9 @@ async function onServer(m) {
       if (S.pingWait && S.pingWait.n === m.n) { S.pingWait.res(m); S.pingWait = null; }
       break;
     case "peers":
-      S.peers = m.peers || [];
+      // Devices you can send to now, and (separately) your account's devices that are offline.
+      S.peers = (m.peers || []).filter((p) => !p.offline);
+      S.offline = rememberedDevices(S.peers, (m.peers || []).filter((p) => p.offline));
       autoPairMine();
       if (S.pickOpen && S.pickRefresh) S.pickRefresh();
       // keep paired names fresh
@@ -991,16 +994,17 @@ function render() {
   const chip = S.user ? `<span class="initial">${esc((S.user.name || "?").trim().charAt(0).toUpperCase())}</span><span class="who">${esc(S.user.name)}</span>${ICONS.gear}` : "";
   if (acct.dataset.html !== chip) { acct.innerHTML = chip; acct.dataset.html = chip; }
   const box = $("#peers");
-  const ids = new Set(S.peers.map((p) => p.id));
+  const ids = new Set(S.peers.concat(S.offline || []).map((p) => p.id));
   const fresh = [];
   for (const el of [...box.children]) if (!ids.has(el.dataset.id)) el.remove();
-  const ordered = byFavorite(S.peers);
+  const ordered = byFavorite(S.peers).concat(byFavorite(S.offline || []));
   for (const p of ordered) {
     let el = box.querySelector(`[data-id="${p.id}"]`);
     const paired = (!!S.paired[p.id] && S.paired[p.id].pub === p.pub) || p.mine;
     const fav = isFav(p.id);
+    const off = !!p.offline;
     const html = `<div class="avatar">${fav ? `<span class="star" title="Pinned to the top">${ICONS.star}</span>` : ""}${iconFor(p.kind)}<svg class="ring" viewBox="0 0 82 82"><circle class="track" cx="41" cy="41" r="38"/><circle class="arc" cx="41" cy="41" r="38" transform="rotate(-90 41 41)" stroke-dasharray="238.8" stroke-dashoffset="238.8"/></svg></div>
-      <div class="name">${esc(p.name)}</div><div class="tag ${paired ? "paired" : ""}">${paired ? "My device" : "Nearby"}</div>`;
+      <div class="name">${esc(p.name)}</div><div class="tag ${off ? "" : paired ? "paired" : ""}">${off ? "Offline" : paired ? "My device" : "Nearby"}</div>`;
     if (!el) {
       el = document.createElement("button");
       el.className = "peer";
@@ -1028,12 +1032,13 @@ function render() {
     if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; el.title = p.name; el.setAttribute("aria-label", "Send to " + p.name); }
     el.classList.toggle("mine", paired);
     el.classList.toggle("fav", fav);
+    el.classList.toggle("offline", off);
   }
   // Keep the on-screen order matching: pinned devices first.
   ordered.forEach((p, i) => { const el = box.querySelector(`[data-id="${p.id}"]`); if (el && box.children[i] !== el) box.insertBefore(el, box.children[i] || null); });
   // A new device pops in with a little ping from the beam.
   fresh.forEach((el, i) => setTimeout(() => { if (el.isConnected) { FX.pulse(el.querySelector(".avatar"), "ping", 1000); FX.spark(FX.you(), el.querySelector(".avatar"), { ms: 600 }); } }, 120 + i * 90));
-  $("#empty").style.display = S.peers.length ? "none" : "";
+  $("#empty").style.display = S.peers.length || (S.offline || []).length ? "none" : "";
   $("#empty").innerHTML = !S.user && !S.online && ws && ws.readyState === 1 ? "Sign in to use Beam" : S.online
     ? "Looking for devices<small>Open Beam on another device that's signed in as you, or on this WiFi.</small>"
     : "Connecting to Beam…";
@@ -1597,7 +1602,7 @@ function chooseWhatMany() {
 
 function chooseWhat(peerId) {
   const p = S.peers.find((x) => x.id === peerId);
-  if (!p) return;
+  if (!p) { const o = (S.offline || []).find((x) => x.id === peerId); if (o) offlineDevice(o); return; }
   if (S.pending) { const v = S.pending; S.pending = null; closeSheet(); render(); return sendItems(p, v.files || [], v.text || null); }
   openSheet(`<div class="send-head"><h2>Send to ${esc(p.name)}</h2><button class="btn ghost small pin ${isFav(p.id) ? "on" : ""}" id="pin">${ICONS.star}${isFav(p.id) ? "Pinned" : "Pin to top"}</button></div>
     <div class="big-choice">
@@ -1621,6 +1626,48 @@ function chooseWhat(peerId) {
     $("#txt").focus();
     $("#cx").onclick = closeSheet;
     $("#go").onclick = () => { const v = $("#txt").value; const peer = S.peers.find((x) => x.id === peerId); closeSheet(); if (peer && v.trim()) sendItems(peer, [], v); };
+  };
+}
+
+// Which offline devices of mine to show: one per name and type (the same machine signed in again
+// shows up as a new device), nothing unseen for 30 days unless pinned, and at most 8.
+function rememberedDevices(online, offline) {
+  const key = (p) => (p.name || "").trim().toLowerCase() + "|" + (p.kind || "");
+  const taken = new Set(online.filter((p) => p.mine).map(key));
+  taken.add(key({ name: S.name, kind })); // an old sign-in of this very device
+  const favs = favList(), month = Date.now() - 30 * 86400000;
+  const out = [];
+  for (const p of offline.slice().sort((a, b) => (b.seen || 0) - (a.seen || 0))) {
+    const pinned = favs.includes(p.id);
+    if (!pinned && ((p.seen || 0) < month || taken.has(key(p)))) continue;
+    taken.add(key(p));
+    out.push(p);
+  }
+  return out.filter((p) => favs.includes(p.id)).concat(out.filter((p) => !favs.includes(p.id)).slice(0, 8));
+}
+
+// One of my devices that isn't connected right now.
+function ago(ms) {
+  if (!ms) return "a while ago";
+  const m = Math.round((Date.now() - ms) / 60000);
+  if (m < 2) return "just now";
+  if (m < 60) return m + " minutes ago";
+  const h = Math.round(m / 60);
+  if (h < 24) return h + (h === 1 ? " hour ago" : " hours ago");
+  const d = Math.round(h / 24);
+  return d < 30 ? d + (d === 1 ? " day ago" : " days ago") : new Date(ms).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+}
+function offlineDevice(p) {
+  openSheet(`<h2>${esc(p.name)} is offline</h2>
+    <p>Last seen ${esc(ago(p.seen))}. When Beam is open on it again, it'll be ready to send to here.</p>
+    <p class="hint">Replaced this device, or don't use it any more? Forget it to remove it from your account. Signing in on it again brings it back.</p>
+    <div class="actions"><button class="btn danger" id="forget">Forget device</button><button class="btn primary" id="done">OK</button></div>`);
+  $("#done").onclick = closeSheet;
+  $("#forget").onclick = () => {
+    wsSend({ t: "forget-device", id: p.id });
+    const f = favList().filter((x) => x !== p.id); store.set("favs", f);
+    closeSheet();
+    toast(p.name + " removed from your account");
   };
 }
 

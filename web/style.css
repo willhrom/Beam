@@ -344,3 +344,8 @@ textarea { height: auto; min-height: 110px; padding: 10px 12px; resize: vertical
 .btn.pin svg { width: 15px; height: 15px; color: var(--dim); }
 .btn.pin.on { border-color: rgba(255, 209, 102, .5); color: #ffd166; }
 .btn.pin.on svg { color: #ffd166; }
+
+/* My devices that are offline: dimmed, still there to recognise (tap for "last seen" or to forget it). */
+.peer.offline { opacity: .5; animation-name: arrive; }
+.peer.offline .avatar { border-style: dashed; background: transparent; }
+.peer.offline:hover { opacity: .75; }

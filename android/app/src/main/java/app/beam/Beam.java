@@ -39,6 +39,7 @@ final class Beam {
     String endpointId; // set when found nearby over Bluetooth
     boolean mine;      // signed in to the same account
     boolean local;     // the server says it's on our network
+    long seen;         // offline devices: when it was last online
     Peer(String id, String name, String kind, String pub) { this.id = id; this.name = name; this.kind = kind; this.pub = pub; }
   }
 
@@ -65,6 +66,8 @@ final class Beam {
   final List<Listener> listeners = new CopyOnWriteArrayList<>();
   final Map<String, Transfer> tx = new LinkedHashMap<>();
   List<Peer> peers = new ArrayList<>();
+  /** My account's devices that aren't connected right now (shown dimmed, so Beam remembers them). */
+  List<Peer> offline = new ArrayList<>();
   JSONArray ice;
   long iceAt;
   boolean online, running;
@@ -186,7 +189,8 @@ final class Beam {
       case "challenge": {
         JSONObject hello = new JSONObject()
             .put("t", "hello").put("pub", me.pub).put("sig", me.sign("beam-hello:" + m.getString("nonce")))
-            .put("name", prefs.name).put("kind", "android").put("nearby", prefs.nearby).put("watch", new JSONArray(prefs.watch()));
+            .put("name", prefs.name).put("kind", "android").put("nearby", prefs.nearby).put("watch", new JSONArray(prefs.watch()))
+            .put("caps", new JSONArray().put("offline"));
         wsSend(hello);
         break;
       }
@@ -223,7 +227,7 @@ final class Beam {
         if (pongWait != null) { PongWait w = pongWait; pongWait = null; w.got(m); }
         break;
       case "peers": {
-        List<Peer> list = new ArrayList<>();
+        List<Peer> list = new ArrayList<>(), away = new ArrayList<>();
         JSONArray a = m.optJSONArray("peers");
         boolean save = false;
         for (int k = 0; a != null && k < a.length(); k++) {
@@ -231,6 +235,7 @@ final class Beam {
           Peer peer = new Peer(p.getString("id"), p.optString("name", "Device"), p.optString("kind", "web"), p.optString("pub"));
           peer.local = p.optBoolean("local");
           peer.mine = p.optBoolean("mine");
+          if (p.optBoolean("offline")) { peer.seen = p.optLong("seen"); away.add(peer); continue; }
           list.add(peer);
           Prefs.Paired pp = prefs.paired.get(peer.id);
           if (pp != null && pp.pub.equals(peer.pub) && !pp.name.equals(peer.name)) { pp.name = peer.name; save = true; }
@@ -245,6 +250,7 @@ final class Beam {
         }
         if (save) prefs.save();
         peers = list;
+        offline = remembered(list, away);
         if (linked) updateServer();
         changed();
         break;
@@ -475,6 +481,31 @@ final class Beam {
     Transfer t = tx.remove(tid);
     if (t != null && !t.incoming && !t.active()) t.cleanupTemp();
     changed();
+  }
+
+  /** Which offline devices of mine to show: one per name and type (the same device signed in again shows
+   *  up as a new one), not this phone's own old sign-ins, nothing unseen for 30 days unless pinned, at most 8. */
+  private List<Peer> remembered(List<Peer> online, List<Peer> away) {
+    java.util.Set<String> taken = new java.util.HashSet<>();
+    for (Peer p : online) if (p.mine) taken.add(p.name.trim().toLowerCase() + "|" + p.kind);
+    taken.add(prefs.name.trim().toLowerCase() + "|android");
+    java.util.Collections.sort(away, (x, y) -> Long.compare(y.seen, x.seen));
+    long month = System.currentTimeMillis() - 30L * 86400000L;
+    List<Peer> pinned = new ArrayList<>(), rest = new ArrayList<>();
+    for (Peer p : away) {
+      boolean fav = prefs.favs.contains(p.id);
+      String key = p.name.trim().toLowerCase() + "|" + p.kind;
+      if (!fav && (p.seen < month || taken.contains(key))) continue;
+      taken.add(key);
+      if (fav) pinned.add(p); else if (rest.size() < 8) rest.add(p);
+    }
+    pinned.addAll(rest);
+    return pinned;
+  }
+
+  void forgetDevice(String id) {
+    try { wsSend(new JSONObject().put("t", "forget-device").put("id", id)); } catch (Exception ignored) {}
+    if (prefs.favs.remove(id)) prefs.save();
   }
 
   /** Signed in to my own account. */
