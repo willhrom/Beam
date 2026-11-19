@@ -387,3 +387,22 @@ button.set-who > span:nth-child(2) { flex: 1; }
 .page-head .back svg { width: 18px; height: 18px; transform: scaleX(-1); }
 .page-head .back:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
 .card .group + .group { margin-top: 12px; }
+
+/* ----- drop folders ----- */
+.card .opt.drop-row { align-items: center; gap: 12px; }
+.card .opt.drop-row > span { flex: 1; min-width: 0; }
+.card .ico { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; flex: none; background: rgba(92, 200, 255, .1); color: var(--signal); font-style: normal; }
+.card .ico svg { width: 18px; height: 18px; }
+.card .ico.big { width: 46px; height: 46px; border-radius: 14px; }
+.card .ico.big svg { width: 26px; height: 26px; }
+.card .ico.dev svg { width: 19px; height: 19px; color: var(--paper); }
+.drop-to { display: flex !important; align-items: center; gap: 6px; }
+.drop-to .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); flex: none; }
+.drop-to .dot.on { background: var(--good); box-shadow: 0 0 0 3px rgba(74, 222, 154, .15); }
+.drop-path { opacity: .7; font-size: 11.5px !important; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.drop-empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 6px; padding: 22px 16px; margin-bottom: 12px;
+  border: 1px dashed var(--line); border-radius: 14px; }
+.drop-empty b { font-weight: 600; margin-top: 4px; }
+.drop-empty small { color: var(--dim); max-width: 34ch; }
+.drop-notes { margin: 0; padding-left: 18px; color: var(--dim); font-size: 13px; line-height: 1.5; }
+.drop-notes li { margin: 4px 0; }

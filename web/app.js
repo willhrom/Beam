@@ -938,28 +938,57 @@ function dropSummary() {
   const n = (S.dropFolders || []).length;
   return n ? n + (n === 1 ? " folder sends automatically" : " folders send automatically") : "Send new files from a folder automatically";
 }
+// "/Users/will/Desktop/Graphics" → "~/Desktop/Graphics"; "C:\\Users\\Will\\Desktop" → "~\\Desktop"
+function shortPath(p) {
+  return String(p || "").replace(/^\/Users\/[^/]+(?=\/|$)/, "~").replace(/^[A-Za-z]:\\Users\\[^\\]+(?=\\|$)/i, "~");
+}
 function dropFoldersSheet() {
   const list = S.dropFolders || [];
-  const rows = list.map((d, i) => `<div class="opt"><span>${esc(d.name)}<small>Sends new files to ${esc(d.toName)}</small></span><button class="btn danger small" data-drm="${i}">Remove</button></div>`).join("");
-  openSheet(`<h2>Drop folders</h2>
-    <p>Anything saved into a drop folder on this ${nativeKind === "windows" ? "PC" : "Mac"} is sent to its device automatically, as soon as the file has finished saving. Files already in the folder when you add it aren't sent.</p>
-    <div class="group">${rows || '<div class="opt"><span class="sub">No drop folders yet</span></div>'}</div>
-    <div class="actions"><button class="btn ghost" id="dback">Back</button><button class="btn primary" id="dadd">Add a drop folder…</button></div>`);
-  $("#dback").onclick = () => { sheetOnClose = null; showSettings(); };
-  document.querySelectorAll("[data-drm]").forEach((b) => (b.onclick = () => { native.postMessage({ op: "dropRemove", path: list[+b.dataset.drm].path }); }));
-  $("#dadd").onclick = () => {
-    const devs = byFavorite(S.peers).concat(S.offline || []);
-    if (!devs.length) return toast("No devices to send to yet");
-    openSheet(`<h2>Send new files to…</h2><p>Pick the device, then the folder to watch.</p>
-      <div class="list">${devs.map((p) => `<button class="item pick" data-dto="${p.id}"><span>${iconFor(p.kind)}<span>${esc(p.name)}<small class="sub">${p.offline ? "Offline now" : p.mine ? "My device" : "Nearby"}</small></span></span></button>`).join("")}</div>
-      <div class="actions"><button class="btn ghost" id="dcx">Cancel</button></div>`);
-    $("#dcx").onclick = dropFoldersSheet;
-    document.querySelectorAll("[data-dto]").forEach((b) => (b.onclick = () => {
-      const p = devs.find((x) => x.id === b.dataset.dto);
+  const device = (d) => S.peers.concat(S.offline || []).find((p) => p.id === d.to);
+  const rows = list.map((d, i) => {
+    const p = device(d), online = p && !p.offline;
+    return `<div class="opt drop-row">
+      <i class="ico">${SET_ICONS.drop}</i>
+      <span>${esc(d.name)}<small class="drop-to"><span class="dot ${online ? "on" : ""}"></span>Sends to ${esc(p ? p.name : d.toName)}${online ? "" : ", offline now"}</small><small class="drop-path" title="${esc(d.path)}">${esc(shortPath(d.path))}</small></span>
+      <button class="btn ghost small" data-drm="${i}">Remove</button>
+    </div>`;
+  }).join("");
+  settingsPage("Drop folders", `
+    <p>Anything saved into a drop folder on this ${nativeKind === "windows" ? "PC" : "Mac"} is sent to its device automatically, once the file has finished saving.</p>
+    ${list.length ? `<div class="group">${rows}</div>` : `<div class="drop-empty"><i class="ico big">${SET_ICONS.drop}</i><b>No drop folders yet</b><small>Add one for a folder people save graphics, slides or exports into.</small></div>`}
+    <div class="group">${navRow("dadd", "drop", "Add a drop folder", "Choose a device, then the folder to watch")}</div>
+    <h3>Good to know</h3>
+    <ul class="drop-notes">
+      <li>Files already in the folder when you add it aren't sent. Only new ones are.</li>
+      <li>Files stay where they are, and nothing is sent twice.</li>
+      <li>If the device is offline, Beam tries again every minute.</li>
+      <li>Files inside subfolders, and half-downloaded files, are skipped.</li>
+    </ul>`,
+  () => {
+    document.querySelectorAll("[data-drm]").forEach((btn) => (btn.onclick = () => {
+      const d = list[+btn.dataset.drm];
+      if (confirm(`Stop watching "${d.name}"? Nothing in the folder is deleted.`)) native.postMessage({ op: "dropRemove", path: d.path });
+    }));
+    $("#dadd").onclick = () => { sheetOnClose = null; dropPickDevice(); };
+  });
+}
+// Step 1 of adding: which device the folder sends to. Step 2 is the app's own folder picker.
+function dropPickDevice() {
+  const devs = byFavorite(S.peers).concat(S.offline || []);
+  settingsPage("Send new files to…", `
+    <p>Pick the device. Next, choose the folder on this ${nativeKind === "windows" ? "PC" : "Mac"} to watch.</p>
+    ${devs.length ? `<div class="group">${devs.map((p) => `<button class="nav dev-pick" data-dto="${p.id}"><i class="ico dev">${iconFor(p.kind)}</i><span>${esc(p.name)}<small>${p.offline ? "Offline now. Files wait until it's back" : p.mine ? "My device" : "Nearby"}</small></span>${CHEV}</button>`).join("")}</div>`
+      : `<div class="drop-empty"><b>No devices yet</b><small>Open Beam on the device you want files sent to, then try again.</small></div>`}`,
+  () => {
+    $("#pgBack").onclick = () => { sheetOnClose = null; dropFoldersSheet(); };
+    $("#pgBack span").textContent = "Drop folders";
+    document.querySelectorAll("[data-dto]").forEach((btn) => (btn.onclick = () => {
+      const p = devs.find((x) => x.id === btn.dataset.dto);
       native.postMessage({ op: "dropAdd", to: p.id, toName: p.name });
+      sheetOnClose = null;
       dropFoldersSheet();
     }));
-  };
+  });
 }
 
 // ----- links that open themselves -----
