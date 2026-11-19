@@ -25,8 +25,9 @@ final class Fx {
   /** A new device: grows in with a little overshoot, one after another. */
   static void popIn(View v, int order) {
     if (!on()) return;
+    float alpha = v.getAlpha(); // offline devices stay dimmed
     v.setScaleX(0.3f); v.setScaleY(0.3f); v.setAlpha(0f); v.setTranslationY(Ui.dp(v.getContext(), 20));
-    v.animate().scaleX(1f).scaleY(1f).alpha(1f).translationY(0).setStartDelay(order * 70L).setDuration(520)
+    v.animate().scaleX(1f).scaleY(1f).alpha(alpha).translationY(0).setStartDelay(order * 70L).setDuration(520)
         .setInterpolator(new OvershootInterpolator(2.2f)).start();
   }
 

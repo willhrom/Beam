@@ -130,6 +130,15 @@ final class Ui {
   }
 
   /** A round device bubble with a name underneath, used on the main screen and in the share sheet. */
+  /** One of my devices that's offline: no ring, a grey "Offline" label (dimmed by the caller). */
+  static LinearLayout offlineBubble(Context c, Beam.Peer p) {
+    LinearLayout box = peerBubble(c, p, true, null, false);
+    TextView tag = (TextView) box.getChildAt(box.getChildCount() - 1);
+    tag.setText("Offline");
+    tag.setTextColor(DIM);
+    return box;
+  }
+
   static LinearLayout peerBubble(Context c, Beam.Peer p, boolean paired, String note, boolean offline) {
     LinearLayout box = col(c);
     box.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -147,7 +156,7 @@ final class Ui {
     name.setMaxLines(3);
     name.setEllipsize(android.text.TextUtils.TruncateAt.END);
     name.setGravity(Gravity.CENTER);
-    box.addView(name, margins(c, dp(c, 108), -2, 0, 6, 0, 0));
+    box.addView(name, margins(c, -1, -2, 0, 6, 0, 0)); // as wide as its column
     box.setOnLongClickListener(v -> {
       android.widget.Toast.makeText(c, p.name, android.widget.Toast.LENGTH_LONG).show();
       return true;

@@ -305,7 +305,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       String k = "off|" + p.name + "|" + p.kind + "|" + beam.isFav(p.id);
       LinearLayout b = bubbles.get(p.id);
       if (b == null || !k.equals(bubbleKeys.get(p.id))) {
-        b = Ui.peerBubble(this, p, true, "Offline", false);
+        b = Ui.offlineBubble(this, p);
         if (beam.isFav(p.id)) Ui.addStar(this, b);
         b.setAlpha(0.5f);
         b.setOnClickListener(v -> offlineDevice(p));
@@ -320,7 +320,13 @@ public class MainActivity extends Activity implements Beam.Listener {
     peersSeen.retainAll(ids);
     if (!sameChildren(peersGrid, want)) {
       peersGrid.removeAllViews();
-      for (View v : want) { Fx.detach(v); peersGrid.addView(v); }
+      for (View v : want) {
+        Fx.detach(v);
+        // Three equal columns that always fit the screen.
+        GridLayout.LayoutParams glp = new GridLayout.LayoutParams(GridLayout.spec(GridLayout.UNDEFINED), GridLayout.spec(GridLayout.UNDEFINED, 1f));
+        glp.width = 0;
+        peersGrid.addView(v, glp);
+      }
     }
     empty.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
     emptyBox.setVisibility(all.isEmpty() && beam.offline.isEmpty() ? View.VISIBLE : View.GONE);
