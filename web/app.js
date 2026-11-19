@@ -869,7 +869,7 @@ function shortcutSetup(key) {
 function guestWelcome() {
   openSheet(`<h2>Send files to ${esc(S.guest.toName)}</h2>
     <p>${esc(S.guest.toName)} invited you to send them files with Beam. Nothing to install, and nothing is stored on a server: files go straight to their device.</p>
-    <label class="field"><span>Your name, so they know who's sending</span><input type="text" id="gname" maxlength="40" placeholder="e.g. Sarah" autocomplete="name"></label>
+    <label class="gfield"><span>Your name, so they know who's sending</span><input type="text" id="gname" maxlength="40" placeholder="e.g. Sarah" autocomplete="name"></label>
     <div class="actions"><button class="btn primary" id="go">Continue</button></div>`);
   $("#gname").focus();
   const go = () => {
@@ -1082,7 +1082,7 @@ window.beamNative = {
   saveDir(path, name, isDefault) {
     const before = S.saveDir;
     S.saveDir = { path, name, isDefault: !!isDefault };
-    if (!$("#sheet").hidden && $("#sdPick") && (!before || before.path !== path || before.isDefault !== !!isDefault)) { saveSettings(); sheetOnClose = null; showSettings(); }
+    if (!$("#sheet").hidden && $("#sdPick") && (!before || before.path !== path || before.isDefault !== !!isDefault)) { saveSettings(); sheetOnClose = null; receivingPage(); }
   },
   // Mac app: files from Finder (Services menu, Open With, or dropped on the menu bar icon)
   share(list) { shareFromDesktop((list || []).map(macFile)); },
@@ -1942,89 +1942,150 @@ function closePrompt(tid) {
 }
 
 // ----- settings & pairing -----
+// ---------- settings ----------
+// A short main page: who you are, this device, then one row per area. Details live on their own pages.
+const SI = (d) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${d}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const SET_ICONS = {
+  receive: SI("M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"),
+  pair: SI("M9.5 14.5 14.5 9.5M8 11l-2.2 2.2a3.5 3.5 0 0 0 5 5L13 16m-2-8 2.2-2.2a3.5 3.5 0 0 1 5 5L16 13"),
+  drop: SI("M3.5 7.5a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2zM12 10.5v5m0 0-2.2-2.2M12 15.5l2.2-2.2"),
+  qr: SI("M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2.5v2.5H14zM17.5 17.5H20V20h-2.5zM14 18.5h1.5M18.5 14H20"),
+  phone: SI("M8 3h8a1.5 1.5 0 0 1 1.5 1.5v15A1.5 1.5 0 0 1 16 21H8a1.5 1.5 0 0 1-1.5-1.5v-15A1.5 1.5 0 0 1 8 3zM10.5 18h3"),
+  history: SI("M4 12a8 8 0 1 0 2.4-5.7M4 4v4h4M12 8v4.5l3 1.8"),
+  test: SI("M3 12h4l2.5-6 5 12 2.5-6h4"),
+  update: SI("M20 11a8 8 0 0 0-14.3-4.9M4 4v4h4M4 13a8 8 0 0 0 14.3 4.9M20 20v-4h-4"),
+  people: SI("M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19M10 10.5a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM20 19v-1.5a3.5 3.5 0 0 0-2.5-3.3M15.5 4.6a3 3 0 0 1 0 5.8"),
+  pin: SI("M7 11V8a5 5 0 0 1 10 0v3M6 11h12v9H6zM12 15v2"),
+  out: SI("M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10"),
+};
+const CHEV = '<svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+function navRow(id, icon, label, sub, cls = "") {
+  return `<button class="nav ${cls}" id="${id}">${icon ? `<i class="ico">${SET_ICONS[icon]}</i>` : ""}<span>${label}${sub ? `<small>${sub}</small>` : ""}</span>${cls.includes("danger") ? "" : CHEV}</button>`;
+}
+// A page inside Settings, with a back button to the main page.
+function settingsPage(title, body, onOpen) {
+  openSheet(`<div class="page-head"><button class="back" id="pgBack" aria-label="Back to Settings">${CHEV}<span>Settings</span></button></div>
+    <h2>${title}</h2>${body}
+    <div class="actions sticky"><button class="btn primary" id="done">Done</button></div>`, saveSettings);
+  $("#pgBack").onclick = () => { saveSettings(); sheetOnClose = null; showSettings(); };
+  $("#done").onclick = closeSheet;
+  bindSettingInputs();
+  if (onOpen) onOpen();
+}
+// Switches and the name save as soon as they change.
+function bindSettingInputs() {
+  document.querySelectorAll("#sheet input.toggle, #nm").forEach((el) => el.addEventListener("change", saveSettings));
+}
+function receivingSummary() {
+  const where = native ? (S.saveDir ? S.saveDir.name : "Downloads") : store.get("saveDirName", null) || (canSaveToDisk ? "Downloads" : "Save as each arrives");
+  return `Saves to ${esc(where)}. Auto-accept ${S.autoAccept ? "on" : "off"}`;
+}
+
 function showSettings() {
-  const paired = Object.entries(S.paired);
-  const chev = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-  const nav = (id, label, sub, cls = "") => `<button class="nav ${cls}" id="${id}"><span>${label}${sub ? `<small>${sub}</small>` : ""}</span>${cls.includes("danger") ? "" : chev}</button>`;
+  const pairedN = Object.keys(S.paired).length;
   const initial = S.user ? esc((S.user.name || S.user.username || "?").trim().charAt(0).toUpperCase()) : "?";
-  const receiving = [
-    native ? `<div class="opt"><span>Save files to<small id="sdName">${esc(S.saveDir ? S.saveDir.name : "Downloads")}</small></span><span class="row-btns">${S.saveDir && !S.saveDir.isDefault ? '<button class="btn ghost small" id="sdReset">Use Downloads</button>' : ""}<button class="btn ghost small" id="sdPick">Choose…</button></span></div>` : "",
-    canSaveToDisk ? `<div class="opt"><span>Save files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Downloads. Big transfers ask where to save"}</small></span><button class="btn ghost small" id="sf">Choose…</button></div>` : "",
-    nativeKind === "windows" ? `<label class="opt"><span>Convert iPhone photos and videos<small>HEIC to JPG and HEVC to MP4, so every app opens them</small></span><input type="checkbox" class="toggle" id="cv" ${S.convert !== false ? "checked" : ""}></label>` : "",
-    `<label class="opt"><span>Auto-accept from my devices<small>What they send arrives without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>`,
-    `<label class="opt"><span>Open links from my devices<small>A link sent from one of your devices opens in your browser</small></span><input type="checkbox" class="toggle" id="ol" ${S.openLinks !== false ? "checked" : ""}></label>`,
-    !native && "Notification" in window && Notification.permission !== "granted" ? '<div class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></div>' : "",
-  ].join("");
   openSheet(`<div class="set-head"><h2>Settings</h2></div>
-    <div class="set-who"><span class="set-avatar">${initial}</span><span>${S.user ? esc(S.user.name) : "Not signed in"}<small>${S.user ? "Username " + esc(S.user.username) + (S.user.admin ? ". You manage this Beam" : "") : ""}</small></span></div>
+    <button class="set-who" id="acctPage"><span class="set-avatar">${initial}</span><span>${S.user ? esc(S.user.name) : "Not signed in"}<small>${S.user ? "Signed in as " + esc(S.user.username) : ""}</small></span>${CHEV}</button>
 
     <h3>This device</h3>
     <div class="group">
       <label class="opt field"><span>Name</span><input type="text" id="nm" maxlength="40" value="${esc(S.name)}" aria-label="Device name"></label>
-      <label class="opt"><span>Everyone nearby can see me<small>When off, only your own and paired devices can</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
+      <label class="opt"><span>Visible to everyone nearby<small>Off: only your own and paired devices see it</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
+      ${navRow("rxPage", "receive", "Receiving", receivingSummary())}
+      ${navRow("pairPage", "pair", "Paired devices", pairedN ? pairedN + " paired" : "Send with someone else's device")}
     </div>
 
-    <h3>Receiving</h3>
-    <div class="group">${receiving}</div>
-
-    <h3>Activity</h3>
+    <h3>Other ways to send</h3>
     <div class="group">
-      ${native ? nav("drops", "Drop folders", `<span id="dropsSub">${dropSummary()}</span>`) : ""}
-      ${nav("guestqr", "Guest QR code", "Let someone without Beam send files to this device")}
-      ${nav("iphone", "Send from iPhone", "Add Beam to the iPhone share sheet")}
-      ${nav("hist", "Transfer history", "What this device sent and received")}
-      ${nav("ctest", "Test connection", "Check the server, relay and your devices")}
+      ${native ? navRow("drops", "drop", "Drop folders", `<span id="dropsSub">${dropSummary()}</span>`) : ""}
+      ${navRow("guestqr", "qr", "Guest QR code", "Someone without Beam sends to this device")}
+      ${navRow("iphone", "phone", "Send from iPhone", "Beam in the iPhone share sheet")}
     </div>
 
-    <h3>Paired devices</h3>
+    <h3>Help</h3>
     <div class="group">
-      ${paired.map(([id, p]) => `<div class="opt"><span>${esc(p.name)}<small>${shortId(id)}</small></span><button class="btn danger small" data-unpair="${id}">Remove</button></div>`).join("")}
-      ${nav("pShow", "Show a pairing code", "On this device, for someone else to enter")}
-      ${nav("pJoin", "Enter a pairing code", "From someone else's device")}
+      ${navRow("hist", "history", "Transfer history", "What this device sent and received")}
+      ${navRow("ctest", "test", "Test connection", "Server, relay and your devices")}
+      ${native ? navRow("upd", "update", "Check for updates", `<span id="appVer">${S.appVersion ? "Version " + esc(S.appVersion) : "Beam for " + (nativeKind === "windows" ? "Windows" : "Mac")}</span>`) : ""}
     </div>
-    <p class="hint">Your own devices find each other automatically. Pair to send with someone else's device.</p>
-
-    <h3>Account</h3>
-    <div class="group">
-      ${S.user && S.user.admin ? nav("ppl", "Manage people", "Add people, reset PINs, sign out devices") : ""}
-      ${nav("cpin", "Change PIN", "")}
-      ${nav("sout", "Sign out of this device", "", "danger")}
-    </div>
-    ${native ? `<h3>About</h3>
-    <div class="group">
-      ${nav("upd", "Check for updates", `<span id="appVer">${S.appVersion ? "Version " + esc(S.appVersion) : "Beam for " + (nativeKind === "windows" ? "Windows" : "Mac")}</span>`)}
-    </div>` : ""}
     <p class="hint">Device code ${shortId(Id.id)}</p>
     <div class="actions sticky"><button class="btn primary" id="done">Done</button></div>`, saveSettings);
+  bindSettingInputs();
+  const go = (id, fn) => { const el = $("#" + id); if (el) el.onclick = () => { saveSettings(); sheetOnClose = null; fn(); }; };
   $("#done").onclick = closeSheet;
-  $("#ctest").onclick = () => { saveSettings(); sheetOnClose = null; connectionTest(); };
-  if ($("#drops")) $("#drops").onclick = () => { saveSettings(); sheetOnClose = null; dropFoldersSheet(); };
-  $("#guestqr").onclick = () => { saveSettings(); sheetOnClose = null; guestSheet(); };
-  $("#iphone").onclick = () => { saveSettings(); sheetOnClose = null; shortcutSheet(); };
-  if (native) native.postMessage({ op: "getDropFolders" });
+  go("acctPage", accountPage);
+  go("rxPage", receivingPage);
+  go("pairPage", pairedPage);
+  go("drops", dropFoldersSheet);
+  go("guestqr", guestSheet);
+  go("iphone", shortcutSheet);
+  go("hist", showHistory);
+  go("ctest", connectionTest);
   if ($("#upd")) $("#upd").onclick = () => { native.postMessage({ op: "checkUpdates" }); toast("Checking for updates…"); };
-  if (native) native.postMessage({ op: "getVersion" });
-  $("#hist").onclick = () => { saveSettings(); sheetOnClose = null; showHistory(); };
-  if ($("#ppl")) $("#ppl").onclick = () => { saveSettings(); sheetOnClose = null; S.adminOpen = true; showPeople(); wsSend({ t: "admin-list" }); };
-  $("#cpin").onclick = () => { saveSettings(); sheetOnClose = null; showChangePin(); };
-  $("#sout").onclick = () => { if (confirm("Sign out of Beam on this device?")) { sheetOnClose = null; closeSheet(); wsSend({ t: "logout" }); } };
-  $("#pShow").onclick = () => { saveSettings(); S.pairing = { mode: "show" }; wsSend({ t: "pair-code" }); showPairShow(); };
-  $("#pJoin").onclick = () => { saveSettings(); S.pairing = { mode: "join" }; showPairJoin(); };
-  if ($("#sdPick")) $("#sdPick").onclick = () => native.postMessage({ op: "pickSaveDir" });
-  if ($("#sdReset")) $("#sdReset").onclick = () => native.postMessage({ op: "resetSaveDir" });
-  if (native) native.postMessage({ op: "getSaveDir" });
-  const sf = $("#sf");
-  if (sf) sf.onclick = () => pickFolder().then(() => { saveSettings(); sheetOnClose = null; showSettings(); }).catch(() => {});
-  const nt = $("#nt");
-  if (nt) nt.onclick = () => Notification.requestPermission().then(() => showSettings());
-  document.querySelectorAll("[data-unpair]").forEach((b) => (b.onclick = () => {
-    delete S.paired[b.dataset.unpair];
-    savePaired();
-    updateServer();
-    sheetOnClose = null;
-    showSettings();
-  }));
+  if (native) { native.postMessage({ op: "getDropFolders" }); native.postMessage({ op: "getVersion" }); native.postMessage({ op: "getSaveDir" }); }
 }
+
+function receivingPage() {
+  const rows = [
+    native ? `<div class="opt"><span>Save files to<small id="sdName">${esc(S.saveDir ? S.saveDir.name : "Downloads")}</small></span><span class="row-btns">${S.saveDir && !S.saveDir.isDefault ? '<button class="btn ghost small" id="sdReset">Use Downloads</button>' : ""}<button class="btn ghost small" id="sdPick">Choose…</button></span></div>` : "",
+    canSaveToDisk ? `<div class="opt"><span>Save files to<small>${store.get("saveDirName", null) ? esc(store.get("saveDirName")) + " (any size)" : "Downloads. Big transfers ask where to save"}</small></span><button class="btn ghost small" id="sf">Choose…</button></div>` : "",
+    nativeKind === "windows" ? `<label class="opt"><span>Convert iPhone photos and videos<small>HEIC to JPG and HEVC to MP4, so every app opens them</small></span><input type="checkbox" class="toggle" id="cv" ${S.convert !== false ? "checked" : ""}></label>` : "",
+  ].join("");
+  settingsPage("Receiving", `
+    ${rows ? `<div class="group">${rows}</div>` : ""}
+    <h3>From my devices</h3>
+    <div class="group">
+      <label class="opt"><span>Auto-accept<small>What they send arrives without asking</small></span><input type="checkbox" class="toggle" id="aa" ${S.autoAccept ? "checked" : ""}></label>
+      <label class="opt"><span>Open links automatically<small>A link sent from one of your devices opens in your browser</small></span><input type="checkbox" class="toggle" id="ol" ${S.openLinks !== false ? "checked" : ""}></label>
+    </div>
+    ${!native && "Notification" in window && Notification.permission !== "granted" ? '<h3>Alerts</h3><div class="group"><div class="opt"><span>Notifications<small>Alerts when this tab is in the background</small></span><button class="btn ghost small" id="nt">Enable</button></div></div>' : ""}`,
+  () => {
+    if ($("#sdPick")) $("#sdPick").onclick = () => native.postMessage({ op: "pickSaveDir" });
+    if ($("#sdReset")) $("#sdReset").onclick = () => native.postMessage({ op: "resetSaveDir" });
+    if (native) native.postMessage({ op: "getSaveDir" });
+    if ($("#sf")) $("#sf").onclick = () => pickFolder().then(() => { sheetOnClose = null; receivingPage(); }).catch(() => {});
+    if ($("#nt")) $("#nt").onclick = () => Notification.requestPermission().then(() => { sheetOnClose = null; receivingPage(); });
+  });
+}
+
+function pairedPage() {
+  const paired = Object.entries(S.paired);
+  settingsPage("Paired devices", `
+    <p>Your own devices find each other automatically. Pair to send with someone else's device, even when it's not nearby.</p>
+    ${paired.length ? `<div class="group">${paired.map(([id, p]) => `<div class="opt"><span>${esc(p.name)}<small>${shortId(id)}</small></span><button class="btn danger small" data-unpair="${id}">Remove</button></div>`).join("")}</div>` : ""}
+    <h3>Pair a device</h3>
+    <div class="group">
+      ${navRow("pShow", "qr", "Show a pairing code", "On this device, for someone else to enter")}
+      ${navRow("pJoin", "pair", "Enter a pairing code", "From someone else's device")}
+    </div>`,
+  () => {
+    $("#pShow").onclick = () => { S.pairing = { mode: "show" }; wsSend({ t: "pair-code" }); sheetOnClose = null; showPairShow(); };
+    $("#pJoin").onclick = () => { S.pairing = { mode: "join" }; sheetOnClose = null; showPairJoin(); };
+    document.querySelectorAll("[data-unpair]").forEach((b) => (b.onclick = () => {
+      delete S.paired[b.dataset.unpair];
+      savePaired();
+      updateServer();
+      sheetOnClose = null;
+      pairedPage();
+    }));
+  });
+}
+
+function accountPage() {
+  settingsPage("Account", `
+    <div class="group">
+      <div class="opt"><span>${S.user ? esc(S.user.name) : "Not signed in"}<small>${S.user ? "Username " + esc(S.user.username) + (S.user.admin ? ". You manage this Beam" : "") : ""}</small></span></div>
+      ${S.user && S.user.admin ? navRow("ppl", "people", "Manage people", "Add people, reset PINs, sign out devices") : ""}
+      ${navRow("cpin", "pin", "Change PIN", "")}
+    </div>
+    <div class="group">${navRow("sout", "out", "Sign out of this device", "", "danger")}</div>`,
+  () => {
+    if ($("#ppl")) $("#ppl").onclick = () => { sheetOnClose = null; S.adminOpen = true; showPeople(); wsSend({ t: "admin-list" }); };
+    $("#cpin").onclick = () => { sheetOnClose = null; showChangePin(); };
+    $("#sout").onclick = () => { if (confirm("Sign out of Beam on this device?")) { sheetOnClose = null; closeSheet(); wsSend({ t: "logout" }); } };
+  });
+}
+
 // ----- connection test -----
 // Checks each way a transfer can travel: the server, a direct internet path, and the relay.
 async function candidatesWith(iceServers, relayOnly) {
@@ -2089,16 +2150,14 @@ async function connectionTest() {
 }
 
 function saveSettings() {
-  const nm = $("#nm"), nb = $("#nb"), aa = $("#aa");
-  if (!nm) return;
-  const name = nm.value.trim().slice(0, 40) || S.name;
-  const changed = name !== S.name || nb.checked !== S.nearby;
-  S.name = name; S.nearby = nb.checked; S.autoAccept = aa.checked;
-  const ol = $("#ol");
+  // Every field is optional: each Settings page has only some of them.
+  const nm = $("#nm"), nb = $("#nb"), aa = $("#aa"), ol = $("#ol"), cv = $("#cv");
+  let changed = false;
+  if (nm) { const name = nm.value.trim().slice(0, 40) || S.name; if (name !== S.name) { S.name = name; changed = true; store.set("name", S.name); } }
+  if (nb && nb.checked !== S.nearby) { S.nearby = nb.checked; changed = true; store.set("nearby", S.nearby); }
+  if (aa) { S.autoAccept = aa.checked; store.set("autoAccept", S.autoAccept); }
   if (ol) { S.openLinks = ol.checked; store.set("openLinks", S.openLinks); }
-  const cv = $("#cv");
   if (cv && cv.checked !== (S.convert !== false)) { S.convert = cv.checked; store.set("convert", S.convert); native.postMessage({ op: "setConvert", on: S.convert }); }
-  store.set("name", S.name); store.set("nearby", S.nearby); store.set("autoAccept", S.autoAccept);
   if (changed) updateServer();
   render();
 }
