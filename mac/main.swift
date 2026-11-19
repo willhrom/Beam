@@ -841,6 +841,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         let u = URL(fileURLWithPath: p).standardizedFileURL
         if savedPaths.contains(u.path) || u.path.hasPrefix(downloadsDir().path + "/") || u.path.hasPrefix(saveRoot().path + "/") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
       }
+    case "getVersion":
+      js("beamNative.appVersion('1.0.\(Updater.current)')")
+    case "checkUpdates":
+      updater.check(loud: true)
     case "getSaveDir":
       sendSaveDir()
     case "pickSaveDir":

@@ -587,6 +587,12 @@ namespace Beam
                 case "setConvert":
                     Converter.Enabled = d.TryGetProperty("on", out var cv) && cv.ValueKind == JsonValueKind.True;
                     break;
+                case "getVersion":
+                    Js($"beamNative.appVersion({Q("1.0." + Updater.Current)})");
+                    break;
+                case "checkUpdates":
+                    updater.CheckNow(true);
+                    break;
                 case "getSaveDir":
                     SendSaveDir();
                     break;

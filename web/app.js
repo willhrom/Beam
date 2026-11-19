@@ -836,6 +836,8 @@ function notify(tag, title, body, actions) {
   }
 }
 window.beamNative = {
+  // Mac and Windows apps report their version (shown in Settings → About).
+  appVersion(v) { S.appVersion = String(v || ""); const el = $("#appVer"); if (el) el.textContent = "Version " + S.appVersion; },
   // Mac and Windows apps: where received files go (the folder picker lives in the app).
   saveDir(path, name, isDefault) {
     const before = S.saveDir;
@@ -1698,10 +1700,16 @@ function showSettings() {
       ${nav("cpin", "Change PIN", "")}
       ${nav("sout", "Sign out of this device", "", "danger")}
     </div>
+    ${native ? `<h3>About</h3>
+    <div class="group">
+      ${nav("upd", "Check for updates", `<span id="appVer">${S.appVersion ? "Version " + esc(S.appVersion) : "Beam for " + (nativeKind === "windows" ? "Windows" : "Mac")}</span>`)}
+    </div>` : ""}
     <p class="hint">Device code ${shortId(Id.id)}</p>
     <div class="actions sticky"><button class="btn primary" id="done">Done</button></div>`, saveSettings);
   $("#done").onclick = closeSheet;
   $("#ctest").onclick = () => { saveSettings(); sheetOnClose = null; connectionTest(); };
+  if ($("#upd")) $("#upd").onclick = () => { native.postMessage({ op: "checkUpdates" }); toast("Checking for updates…"); };
+  if (native) native.postMessage({ op: "getVersion" });
   $("#hist").onclick = () => { saveSettings(); sheetOnClose = null; showHistory(); };
   if ($("#ppl")) $("#ppl").onclick = () => { saveSettings(); sheetOnClose = null; S.adminOpen = true; showPeople(); wsSend({ t: "admin-list" }); };
   $("#cpin").onclick = () => { saveSettings(); sheetOnClose = null; showChangePin(); };
