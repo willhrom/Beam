@@ -742,6 +742,43 @@ final class SyncFolders {
   }
 }
 
+/// The key WebKit uses to lock the page's saved keys. The first time, it's copied from WebKit's own
+/// keychain item (one last password prompt, so this Mac keeps its identity); after that it lives in
+/// Beam's own keychain item, which Beam can read without asking.
+enum MasterKey {
+  static var cached: Data?
+  static let service = "app.beam.mac.webcrypto"
+
+  static func get() -> Data? {
+    if let k = cached { return k }
+    if let k = read(service: service, base64: false) { cached = k; return k }
+    // Moving over from WebKit's own item (the one that kept asking for the password).
+    let old = read(service: "com.apple.WebKit.WebCrypto.master+" + (Bundle.main.bundleIdentifier ?? "app.beam.mac"), base64: true)
+    var key = old ?? Data()
+    if key.isEmpty {
+      key = Data(count: 16)
+      let ok = key.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) == errSecSuccess }
+      if !ok { return nil }
+    }
+    let add: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                              kSecAttrAccount as String: "Beam", kSecAttrLabel as String: "Beam saved keys",
+                              kSecValueData as String: key]
+    SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service] as CFDictionary)
+    SecItemAdd(add as CFDictionary, nil)
+    cached = key
+    return key
+  }
+
+  static func read(service: String, base64: Bool) -> Data? {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                            kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data, !d.isEmpty else { return nil }
+    if base64 { return Data(base64Encoded: d) ?? Data(base64Encoded: String(decoding: d, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) }
+    return d
+  }
+}
+
 /// A see-through strip over the top of the window: drag it to move the window, double-click to zoom
 /// (or minimize, following the "double-click a window's title bar" setting).
 final class DragStrip: NSView {
@@ -887,6 +924,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
       js("beamNative.share(\(json))")
     }
   }
+
+  // WebKit keeps the page's saved encryption keys locked with a "WebCrypto Master Key" in the
+  // keychain, and its own item asks for the Mac password every time Beam starts. Beam hands WebKit
+  // that key itself instead, from a keychain item Beam owns (which never prompts).
+  @objc(_webCryptoMasterKeyForWebView:)
+  func webCryptoMasterKey(_ webView: WKWebView) -> Data? { MasterKey.get() }
+  @objc(_webCryptoMasterKeyForWebView:completionHandler:)
+  func webCryptoMasterKey(_ webView: WKWebView, completionHandler: @escaping (Data?) -> Void) { completionHandler(MasterKey.get()) }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
     pageReady = true
