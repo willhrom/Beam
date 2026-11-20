@@ -149,6 +149,10 @@ const wsSend = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)
 setInterval(() => { if (ws && ws.readyState === 1) ws.send("ping"); }, 30000);
 // Relay credentials last a day; refresh them on devices that stay connected for days.
 setInterval(() => { if (S.online && Date.now() - (S.iceAt || 0) > 4 * 3600 * 1000) wsSend({ t: "ice" }); }, 10 * 60 * 1000);
+// Nothing to animate while the window can't be seen (the desktop apps spend most of their life hidden).
+const markAway = () => document.documentElement.classList.toggle("away", document.hidden);
+document.addEventListener("visibilitychange", markAway);
+markAway();
 document.addEventListener("visibilitychange", () => { if (!document.hidden && (!ws || ws.readyState > 1)) { backoff = 1000; connect(); } });
 window.addEventListener("online", () => { backoff = 1000; connect(); });
 
@@ -362,7 +366,7 @@ function closePc(t) {
 // ---------- sending ----------
 async function sendItems(peer, files, text, opts = {}) {
   if (files.length > MAX_ITEMS - 1) { toast(`Sending the first ${MAX_ITEMS - 1} files. Send the rest separately`); files = files.slice(0, MAX_ITEMS - 1); }
-  const items = files.map((f) => { const it = { name: cleanName(f.name), size: f.size, type: f.type || "application/octet-stream" }; const p = cleanPath(relPathOf(f)); if (p) it.path = p; if (f.beamMtime) it.mtime = f.beamMtime; return it; });
+  const items = files.map((f) => { const it = { name: cleanName(f.name), size: f.size, type: f.type || "application/octet-stream" }; const p = cleanPath(relPathOf(f)); if (p) it.path = p; if (f.beamMtime) it.mtime = f.beamMtime; if (f.beamCtime) it.ctime = f.beamCtime; return it; });
   const blobs = files.slice();
   if (text) {
     const b = new Blob([text], { type: "text/plain" });
@@ -499,7 +503,7 @@ function sendAgain(t) {
 // Big batches: the file list goes gzipped so the offer stays small (thousands of names fit).
 const MAX_ITEMS = 5000;
 async function packFiles(items) {
-  const files = items.map((it) => { const o = { name: it.name, size: it.size, type: it.type }; if (it.text) o.text = true; if (it.path) o.path = it.path; if (it.mtime) o.mtime = it.mtime; return o; });
+  const files = items.map((it) => { const o = { name: it.name, size: it.size, type: it.type }; if (it.text) o.text = true; if (it.path) o.path = it.path; if (it.mtime) o.mtime = it.mtime; if (it.ctime) o.ctime = it.ctime; return o; });
   const json = JSON.stringify(files);
   if (json.length < 40000 || typeof CompressionStream === "undefined") return { files };
   const z = await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer();
@@ -524,7 +528,7 @@ async function onOffer(from, d) {
   if (!(await verifySig(d.pub, d.sig, `beam-offer|${d.tid}|${Id.id}|${d.sdp}`))) return;
   const items = (await unpackFiles(d)).slice(0, MAX_ITEMS).map((f) => ({
     name: cleanName(f.name), size: Math.max(0, Number(f.size) || 0), type: String(f.type || "application/octet-stream").slice(0, 100), text: !!f.text,
-    path: cleanPath(f.path) || undefined, mtime: Number(f.mtime) > 0 ? Number(f.mtime) : undefined,
+    path: cleanPath(f.path) || undefined, mtime: Number(f.mtime) > 0 ? Number(f.mtime) : undefined, ctime: Number(f.ctime) > 0 ? Number(f.ctime) : undefined,
   }));
   if (!items.length) return;
   const paired = !!S.paired[from];
@@ -704,7 +708,7 @@ function makeWriter(t, it, index) {
   }
   if (t.sink === "native") {
     const nid = t.tid + ":" + index;
-    native.postMessage({ op: "saveBegin", id: nid, name: it.name, path: it.path || "", sync: t.sync || undefined, mtime: it.mtime || undefined });
+    native.postMessage({ op: "saveBegin", id: nid, name: it.name, path: it.path || "", sync: t.sync || undefined, mtime: it.mtime || undefined, ctime: it.ctime || undefined });
     // Batch chunks into ~1 MB messages: far fewer hops across the bridge.
     let pend = [], pendBytes = 0;
     const flush = () => {
@@ -945,7 +949,7 @@ async function syncSend(files, to, batch, sid) {
   // Ask the other computer which of these it actually needs: it may have the same file already
   // (both sides start with it), or a newer one of its own (which it sends this way instead).
   const n = randId();
-  const q = files.map((f) => ({ p: cleanPath(f.beamPath || f.name), s: f.size, m: f.beamMtime || 0 }));
+  const q = files.map((f) => ({ p: cleanPath(f.beamPath || f.name), s: f.size, m: f.beamMtime || 0, c: f.beamCtime || 0 }));
   const reply = await new Promise((res) => {
     S.syncWait = S.syncWait || {};
     S.syncWait[n] = { from: to, res };
@@ -1025,7 +1029,7 @@ function onSyncSignal(from, d) {
     const n = String(d.n || "").slice(0, 40);
     const x = (S.syncs || []).find((y) => y.id === sid && y.peer === from);
     if (!x || !Array.isArray(d.q)) return wsSend({ t: "signal", to: from, data: { k: "sync-need", sid, n, none: true } });
-    const q = d.q.slice(0, 1000).map((e) => ({ p: cleanPath(String(e && e.p || "")), s: Math.max(0, Number(e && e.s) || 0), m: Math.max(0, Number(e && e.m) || 0) }));
+    const q = d.q.slice(0, 1000).map((e) => ({ p: cleanPath(String(e && e.p || "")), s: Math.max(0, Number(e && e.s) || 0), m: Math.max(0, Number(e && e.m) || 0), c: Math.max(0, Number(e && e.c) || 0) }));
     return native.postMessage({ op: "syncCheck", sid, n, from, q });
   }
   if (d.k === "sync-need") {
@@ -1202,9 +1206,23 @@ function showHistory() {
   document.querySelectorAll("[data-hcopy]").forEach((b) => (b.onclick = () => navigator.clipboard.writeText(h[+b.dataset.hcopy].text).then(() => toast("Copied"), () => toast("Couldn't copy"))));
 }
 
+// Finished transfers stay listed (with Send again / Save) but only the latest 30: the desktop apps run
+// for weeks, and drop and synced folders would otherwise pile up thousands, files and all, in memory.
+function pruneFinished() {
+  const old = [...S.tx.values()].filter((x) => x.state === "done" || x.state === "failed");
+  for (const x of old.slice(0, Math.max(0, old.length - 30))) {
+    for (const r of x.received || []) if (r.url) try { URL.revokeObjectURL(r.url); } catch {}
+    clearInterval(x.tick); clearInterval(x.fxTimer);
+    try { if (x.pc) x.pc.close(); } catch {}
+    S.tx.delete(x.tid);
+    document.querySelector(`[data-tid="${x.tid}"]`)?.remove();
+  }
+}
+
 function finish(t) {
   if (t.state === "done" || t.state === "failed") return;
   t.state = "done";
+  setTimeout(pruneFinished, 0);
   recordHistory(t);
   if (!t.sync) openLinkIfMine(t);
   dropReport(t, "done");
@@ -1221,6 +1239,7 @@ function fail(t, why) {
   if (t.dc && t.dc.readyState === "open") try { t.dc.send(JSON.stringify({ t: "cancel" })); } catch {}
   t.state = "failed";
   t.reason = why;
+  setTimeout(pruneFinished, 0);
   if (t.dir === "out" || t.everOpen || t.got) recordHistory(t);
   dropReport(t, why === "Declined" ? "declined" : "failed");
   closePc(t);
@@ -1247,7 +1266,7 @@ window.beamNative = {
   dropSend(list, to, batch, folder) { dropSend((list || []).map(macFile), to, batch, folder); },
   // Synced folders: the app's list, new/changed files to send, and a folder it just made or picked.
   syncs(list) { S.syncs = Array.isArray(list) ? list : []; if (!$("#sheet").hidden && $("#sadd")) syncSheet(); const sm = $("#syncSub"); if (sm) sm.textContent = syncSummary(); },
-  syncSend(list, to, batch, sid) { syncSend((list || []).map((f) => { const x = macFile(f); x.beamMtime = f.mtime; return x; }), to, batch, sid); },
+  syncSend(list, to, batch, sid) { syncSend((list || []).map((f) => { const x = macFile(f); x.beamMtime = f.mtime; x.beamCtime = f.ctime; return x; }), to, batch, sid); },
   syncPicked(sid, name) { syncInvite(sid, name); },
   syncReady(sid, ok) { syncAccepted(sid, ok); },
   // Which of the offered files this computer needs (indices into the list it was asked about).
@@ -1310,7 +1329,7 @@ if (nativeKind === "windows") {
     }
     if (e.data.op === "syncSend") {
       // Same order as the handles: where each file sits inside the synced folder, and when it was changed.
-      (e.data.meta || []).forEach((m, i) => { const f = files[i]; if (!f) return; try { f.beamPath = (m.path ? m.path + "/" : "") + f.name; f.beamMtime = m.mtime; } catch {} });
+      (e.data.meta || []).forEach((m, i) => { const f = files[i]; if (!f) return; try { f.beamPath = (m.path ? m.path + "/" : "") + f.name; f.beamMtime = m.mtime; f.beamCtime = m.ctime; } catch {} });
       return syncSend(files, e.data.to, e.data.batch, e.data.sync);
     }
     if (e.data.op === "dropSend") return dropSend(files, e.data.to, e.data.batch, e.data.folder);

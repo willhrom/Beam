@@ -159,7 +159,11 @@ export class Hub extends DurableObject {
       if (!rec || rec.dl !== url.searchParams.get("t") || rec.exp < Date.now() || !this.env.INBOX) return new Response("Not found", { status: 404 });
       const obj = await this.env.INBOX.get("inbox/" + id);
       if (!obj) return new Response("Not found", { status: 404 });
-      return new Response(obj.body, { headers: { "Content-Type": rec.type || "application/octet-stream", "Content-Length": String(obj.size), "Cache-Control": "no-store" } });
+      // Served from Beam's own address, so never as something a browser would run (a page or script).
+      return new Response(obj.body, { headers: {
+        "Content-Type": "application/octet-stream", "Content-Length": String(obj.size), "Cache-Control": "no-store",
+        "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox; default-src 'none'",
+      } });
     }
     const key = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("key") || "";
     const k = /^[A-Za-z0-9_-]{20,64}$/.test(key) ? await this.ctx.storage.get("skey:" + hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key)))) : null;
@@ -195,6 +199,10 @@ export class Hub extends DurableObject {
       if (!this.env.INBOX) return Response.json({ error: "Sending files from iPhone isn't switched on yet (R2 storage is missing)." }, { status: 503 });
       if (!size) return Response.json({ error: "Empty file" }, { status: 400 });
       if (size > 100 * 1048576) return Response.json({ error: "That file is over 100 MB. Use the Beam web page in Safari for big files." }, { status: 413 });
+      // Waiting files per account: at most 50 and 2 GB, so a lost Shortcut key can't fill the storage.
+      const waiting = [...(await this.ctx.storage.list({ prefix: "inbox:" })).values()].filter((r) => r.user === user && r.exp > Date.now());
+      if (waiting.length >= 50 || waiting.reduce((n, r) => n + (r.size || 0), 0) + size > 2 * 1024 * 1048576)
+        return Response.json({ error: "Too many files are waiting to be picked up. Open Beam on your devices and try again." }, { status: 429 });
       const id = b64u(crypto.getRandomValues(new Uint8Array(15)));
       await this.env.INBOX.put("inbox/" + id, req.body, { httpMetadata: { contentType: type } });
       const rec = { to, user, name, size, type, dl: b64u(crypto.getRandomValues(new Uint8Array(18))), exp: Date.now() + 24 * 3600 * 1000 };

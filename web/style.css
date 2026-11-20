@@ -413,3 +413,6 @@ button.set-who > span:nth-child(2) { flex: 1; }
 .sync-folder .ico { flex: none; }
 .drop-row > span { min-width: 0; }
 .drop-row > span, .drop-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Window hidden: pause every looping animation (sonar, floating devices) so it costs nothing. */
+html.away *, html.away *::before, html.away *::after { animation-play-state: paused !important; }

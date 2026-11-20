@@ -118,7 +118,7 @@ namespace Beam
         readonly ProgressPopup popup = new ProgressPopup();
         readonly DropFolders drops = new DropFolders();
         readonly SyncFolders syncer = new SyncFolders();
-        readonly Dictionary<string, (string sid, string rel, string final, long mtime)> syncSaves = new();
+        readonly Dictionary<string, (string sid, string rel, string final, long mtime, long ctime)> syncSaves = new();
         readonly Updater updater;
         readonly ToolStripMenuItem updateItem = new ToolStripMenuItem("Check for updates");
         readonly ToolStripMenuItem shareItem = new ToolStripMenuItem("Add Beam to the Windows Share menu") { Visible = false };
@@ -173,7 +173,7 @@ namespace Beam
                 var meta = new List<object>();
                 foreach (var f in files)
                 {
-                    try { handles.Add(env.CreateWebFileSystemFileHandle(f.full, CoreWebView2FileSystemHandlePermission.ReadOnly)); meta.Add(new { path = f.dir, mtime = f.mtime }); } catch { }
+                    try { handles.Add(env.CreateWebFileSystemFileHandle(f.full, CoreWebView2FileSystemHandlePermission.ReadOnly)); meta.Add(new { path = f.dir, mtime = f.mtime, ctime = f.ctime }); } catch { }
                 }
                 var msg = JsonSerializer.Serialize(new { op = "syncSend", to, batch, sync = sid, meta });
                 if (handles.Count > 0) web.CoreWebView2.PostWebMessageAsJson(msg, handles);
@@ -581,7 +581,9 @@ namespace Beam
                     break;
                 case "saveBegin":
                     if (!string.IsNullOrEmpty(Str("sync")))
-                        StartSyncSave(id, Str("sync"), Str("name") ?? "file", Str("path") ?? "", d.TryGetProperty("mtime", out var mt) && mt.ValueKind == JsonValueKind.Number ? mt.GetInt64() : 0);
+                        StartSyncSave(id, Str("sync"), Str("name") ?? "file", Str("path") ?? "",
+                            d.TryGetProperty("mtime", out var mt) && mt.ValueKind == JsonValueKind.Number ? mt.GetInt64() : 0,
+                            d.TryGetProperty("ctime", out var ct) && ct.ValueKind == JsonValueKind.Number ? ct.GetInt64() : 0);
                     else
                         StartSave(id, Str("name") ?? "file", Str("path") ?? "");
                     break;
@@ -694,11 +696,16 @@ namespace Beam
                             var cfull = Path.Combine(new[] { croot }.Concat(cparts).ToArray());
                             long csize = ce.TryGetProperty("s", out var ps) && ps.ValueKind == JsonValueKind.Number ? ps.GetInt64() : -1;
                             double cinc = (ce.TryGetProperty("m", out var pm) && pm.ValueKind == JsonValueKind.Number ? pm.GetDouble() : 0) / 1000;
+                            double ctheirs = Math.Max(cinc, (ce.TryGetProperty("c", out var pc) && pc.ValueKind == JsonValueKind.Number ? pc.GetDouble() : 0) / 1000);
+                            if (!InsideSync(cfull, croot)) continue;
                             var cfi = new FileInfo(cfull);
                             if (!cfi.Exists) { need.Add(ci); continue; }
                             double cmine = new DateTimeOffset(cfi.LastWriteTimeUtc).ToUnixTimeMilliseconds() / 1000.0;
-                            if (cfi.Length == csize && Math.Abs(cmine - cinc) <= 2) { syncer.Received(csid, crel, cfull); continue; }
-                            if (cmine > cinc + 1) continue;
+                            if (cfi.Length == csize && Math.Abs(cmine - cinc) <= 2) { syncer.Received(csid, crel, cfull); continue; }   // already the same
+                            // Unchanged here since the last sync: take theirs (even if its date is older, like a replacement
+                            // copied in). Changed on both sides: whichever changed last wins.
+                            if (syncer.Unchanged(csid, crel, cfull)) { need.Add(ci); continue; }
+                            if (new DateTimeOffset(SyncFolders.Changed(cfi)).ToUnixTimeMilliseconds() / 1000.0 > ctheirs + 1) continue;
                             need.Add(ci);
                         }
                     }
@@ -875,7 +882,23 @@ namespace Beam
 
         /// A file for a synced folder: written next to its place as a hidden temp file, then put in place
         /// when it's complete (unless the copy here changed more recently).
-        void StartSyncSave(string id, string sid, string name, string relPath, long mtime)
+        /// The folder (after following any links) is still inside the synced folder.
+        static bool InsideSync(string full, string root)
+        {
+            try
+            {
+                var r = Path.GetFullPath(root).TrimEnd('\\');
+                var dir = Path.GetDirectoryName(Path.GetFullPath(full)).TrimEnd('\\');
+                if (!dir.Equals(r, StringComparison.OrdinalIgnoreCase) && !dir.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase)) return false;
+                // No folder between the synced folder and the file may be a link (junction or symlink) out of it.
+                for (var di = new DirectoryInfo(dir); di != null && di.FullName.TrimEnd('\\').Length > r.Length; di = di.Parent)
+                    if (di.Exists && di.LinkTarget != null) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        void StartSyncSave(string id, string sid, string name, string relPath, long mtime, long ctime)
         {
             var x = syncer.Get(sid);
             if (x == null) { Js($"beamNative.saveFailed({Q(id)})"); return; }
@@ -894,23 +917,26 @@ namespace Beam
             try
             {
                 Directory.CreateDirectory(dir);
+                if (!InsideSync(Path.Combine(dir, safe), root)) { Js($"beamNative.saveFailed({Q(id)})"); return; }
                 var temp = Path.Combine(dir, "." + safe + "." + id.Substring(0, Math.Min(8, id.Length)) + ".beam-part");
                 var fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.Read);
                 try { File.SetAttributes(temp, File.GetAttributes(temp) | FileAttributes.Hidden); } catch { }
                 saves[id] = (fs, temp);
-                syncSaves[id] = (sid, string.Join("/", parts), Path.Combine(dir, safe), mtime);
+                syncSaves[id] = (sid, string.Join("/", parts), Path.Combine(dir, safe), mtime, ctime);
             }
             catch { Js($"beamNative.saveFailed({Q(id)})"); }
         }
 
-        string FinishSyncSave(string temp, (string sid, string rel, string final, long mtime) ss)
+        string FinishSyncSave(string temp, (string sid, string rel, string final, long mtime, long ctime) ss)
         {
             var incoming = ss.mtime > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(ss.mtime).UtcDateTime : DateTime.UtcNow;
+            var theirs = ss.ctime > ss.mtime ? DateTimeOffset.FromUnixTimeMilliseconds(ss.ctime).UtcDateTime : incoming;
             try
             {
-                if (File.Exists(ss.final) && File.GetLastWriteTimeUtc(ss.final) > incoming.AddSeconds(1))
+                // Changed here too while this was on its way, and more recently: keep ours (it goes the other way next).
+                if (File.Exists(ss.final) && !syncer.Unchanged(ss.sid, ss.rel, ss.final) && SyncFolders.Changed(new FileInfo(ss.final)) > theirs.AddSeconds(1))
                 {
-                    File.Delete(temp);           // the copy here is newer: keep it (it goes the other way next)
+                    File.Delete(temp);
                     return ss.final;
                 }
                 try { File.SetAttributes(temp, File.GetAttributes(temp) & ~FileAttributes.Hidden); } catch { }
@@ -1445,7 +1471,41 @@ namespace Beam
             timer.Tick += (s, e) => Tick();
         }
 
-        public void Start() => timer.Start();
+        public void Start() { timer.Interval = 3000; timer.Start(); Watch(); }
+
+        void Watch()
+        {
+            foreach (var w in watchers.Values) { try { w.EnableRaisingEvents = false; w.Dispose(); } catch { } }
+            watchers.Clear();
+            foreach (var x in Syncs)
+            {
+                try
+                {
+                    var id = x.id;
+                    var w = new FileSystemWatcher(x.path) { IncludeSubdirectories = true, InternalBufferSize = 64 * 1024,
+                        NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite | NotifyFilters.CreationTime };
+                    FileSystemEventHandler on = (s, e) => { lock (dirty) dirty.Add(id); };
+                    w.Changed += on; w.Created += on; w.Renamed += (s, e) => { lock (dirty) dirty.Add(id); };
+                    w.Error += (s, e) => { lock (dirty) dirty.Add(id); };   // too many changes at once: look through everything
+                    w.EnableRaisingEvents = true;
+                    watchers[id] = w;
+                }
+                catch { }
+            }
+        }
+
+        /// Whether this file is just as it was when it last synced (so a newer copy from the other side can replace it).
+        public bool Unchanged(string sid, string rel, string full)
+        {
+            try
+            {
+                var f = new FileInfo(full);
+                return f.Exists && ledger.TryGetValue(sid, out var l) && l.TryGetValue(rel, out var k) && k == Key(f.Length, f.LastWriteTimeUtc);
+            }
+            catch { return false; }
+        }
+
+        public static DateTime Changed(FileInfo f) => f.CreationTimeUtc > f.LastWriteTimeUtc ? f.CreationTimeUtc : f.LastWriteTimeUtc;
 
         void Save()
         {
@@ -1549,7 +1609,11 @@ namespace Beam
         public Func<bool> Ready = () => false;
         public Action<string> Report = _ => { };
         /// to, batch, sync id, files (full path, folder inside the sync with "/", modified in ms)
-        public Action<string, string, string, List<(string full, string dir, long mtime)>> Send = (to, batch, sid, files) => { };
+        public Action<string, string, string, List<(string full, string dir, long mtime, long ctime)>> Send = (to, batch, sid, files) => { };
+        // Windows says when something inside a synced folder changes; only then is the folder looked through.
+        readonly Dictionary<string, FileSystemWatcher> watchers = new Dictionary<string, FileSystemWatcher>();
+        readonly HashSet<string> dirty = new HashSet<string>(), pending = new HashSet<string>();
+        readonly Dictionary<string, DateTime> lastFull = new Dictionary<string, DateTime>();
 
         public SyncFolders()
         {
@@ -1584,9 +1648,9 @@ namespace Beam
         static string Key(long size, DateTime utc) => $"{size}|{new DateTimeOffset(utc).ToUnixTimeSeconds()}";
 
         /// Every file in the folder and its subfolders (no hidden, temporary or half-written files), by relative path ("a/b.txt").
-        static List<(string rel, string full, string key, DateTime mtime)> Walk(string root)
+        static List<(string rel, string full, string key, DateTime mtime, DateTime changed)> Walk(string root)
         {
-            var o = new List<(string, string, string, DateTime)>();
+            var o = new List<(string, string, string, DateTime, DateTime)>();
             var stack = new Stack<(DirectoryInfo dir, string rel, int depth)>();
             try { stack.Push((new DirectoryInfo(root), "", 0)); } catch { return o; }
             while (stack.Count > 0 && o.Count < 50000)
@@ -1603,7 +1667,8 @@ namespace Beam
                             if (depth < 20 && (d.Attributes & FileAttributes.ReparsePoint) == 0) stack.Push((d, r, depth + 1));
                         }
                         else if (e is FileInfo f && !Skip.Contains(f.Extension))
-                            o.Add((r, f.FullName, Key(f.Length, f.LastWriteTimeUtc), f.LastWriteTimeUtc));
+                            // "changed": a copied-in replacement keeps its old modified date, but is created now.
+                            o.Add((r, f.FullName, Key(f.Length, f.LastWriteTimeUtc), f.LastWriteTimeUtc, f.CreationTimeUtc > f.LastWriteTimeUtc ? f.CreationTimeUtc : f.LastWriteTimeUtc));
                     }
                 }
                 catch { }
@@ -1619,15 +1684,20 @@ namespace Beam
                 if (retryAfter.TryGetValue(x.id, out var r) && r > DateTime.UtcNow) continue;
                 if (inFlight.Values.Any(b => b.sid == x.id)) continue;   // one batch at a time per folder
                 if (!Directory.Exists(x.path)) continue;
+                // Only when Windows said something changed (or files are settling, or a batch needs another go),
+                // plus a full check every 5 minutes just in case.
+                bool due = !lastFull.TryGetValue(x.id, out var lf) || (DateTime.UtcNow - lf).TotalSeconds > 300;
+                lock (dirty) { if (!dirty.Contains(x.id) && !pending.Contains(x.id) && !due) continue; dirty.Remove(x.id); pending.Remove(x.id); }
+                if (due) lastFull[x.id] = DateTime.UtcNow;
                 var known = ledger.TryGetValue(x.id, out var l) ? l : new Dictionary<string, string>();
-                var ready = new List<(string rel, string full, string key, DateTime mtime)>();
+                var ready = new List<(string rel, string full, string key, DateTime mtime, DateTime changed)>();
                 foreach (var f in Walk(x.path))
                 {
                     var look = x.id + "|" + f.rel;
                     if ((known.TryGetValue(f.rel, out var k) && k == f.key) || busy.Contains(look)) { lastLook.Remove(look); continue; }
                     if (lastLook.TryGetValue(look, out var prev) && prev == f.key) ready.Add(f); // unchanged twice in a row: done saving
-                    else lastLook[look] = f.key;
-                    if (ready.Count >= 500) break;
+                    else { lastLook[look] = f.key; lock (dirty) pending.Add(x.id); }
+                    if (ready.Count >= 500) { lock (dirty) pending.Add(x.id); break; }
                 }
                 if (ready.Count == 0) continue;
                 var batch = Guid.NewGuid().ToString("N");
@@ -1636,7 +1706,7 @@ namespace Beam
                 Send(x.peer, batch, x.id, ready.Select(f =>
                 {
                     var i = f.rel.LastIndexOf('/');
-                    return (f.full, i < 0 ? "" : f.rel.Substring(0, i), new DateTimeOffset(f.mtime).ToUnixTimeMilliseconds());
+                    return (f.full, i < 0 ? "" : f.rel.Substring(0, i), new DateTimeOffset(f.mtime).ToUnixTimeMilliseconds(), new DateTimeOffset(f.changed).ToUnixTimeMilliseconds());
                 }).ToList());
             }
         }
@@ -1651,7 +1721,7 @@ namespace Beam
                 for (int i = 0; i < b.rels.Count; i++) l[b.rels[i]] = b.keys[i];
                 Save(b.sid);
             }
-            else retryAfter[b.sid] = DateTime.UtcNow.AddSeconds(result == "offline" ? 20 : result == "declined" ? 600 : 60);
+            else { retryAfter[b.sid] = DateTime.UtcNow.AddSeconds(result == "offline" ? 20 : result == "declined" ? 600 : 60); lock (dirty) pending.Add(b.sid); }
         }
 
         public void Add(Sync x)
@@ -1661,6 +1731,8 @@ namespace Beam
             if (!ledger.ContainsKey(x.id)) ledger[x.id] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             Save(x.id);
             DoReport();
+            Watch();
+            lock (dirty) dirty.Add(x.id);
         }
 
         public void Activate(string id, string peer)
@@ -1670,6 +1742,7 @@ namespace Beam
             x.active = true;
             Save();
             DoReport();
+            lock (dirty) dirty.Add(id);
         }
 
         public void Remove(string id)
@@ -1679,6 +1752,7 @@ namespace Beam
             try { File.Delete(LedgerFile(id)); } catch { }
             Save();
             DoReport();
+            Watch();
         }
 
         /// A file arrived and was saved into the folder: remember it so it isn't sent straight back.

@@ -506,6 +506,9 @@ final class DropFolders {
   var inFlight: [String: (keys: [String], paths: [String], folder: String)] = [:]
   var busy = Set<String>()
   var retryAfter: [String: Date] = [:]
+  var dirty = Set<String>(), pending = Set<String>()
+  var lastFull: [String: Date] = [:]
+  var stream: FSEventStreamRef?
   var timer: Timer?
   weak var app: AppDelegate?
   static let skip: Set<String> = ["tmp", "part", "crdownload", "download", "partial", "icloud", "sb"]
@@ -630,7 +633,40 @@ final class SyncFolders {
 
   func start() {
     timer?.invalidate()
-    timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.tick() }
+    timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
+    watch()
+  }
+
+  /// Ask macOS to say when anything inside the synced folders changes.
+  func watch() {
+    if let st = stream { FSEventStreamStop(st); FSEventStreamInvalidate(st); FSEventStreamRelease(st); stream = nil }
+    let paths = syncs.map { $0.path }
+    guard !paths.isEmpty else { return }
+    var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
+    let cb: FSEventStreamCallback = { _, info, n, raw, _, _ in
+      guard let info = info else { return }
+      let me = Unmanaged<SyncFolders>.fromOpaque(info).takeUnretainedValue()
+      let changed = (unsafeBitCast(raw, to: NSArray.self) as? [String]) ?? []
+      me.touched(changed.isEmpty ? nil : changed)
+    }
+    guard let st = FSEventStreamCreate(nil, cb, &ctx, paths as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1.0,
+                                       FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)) else { return }
+    FSEventStreamSetDispatchQueue(st, .main)
+    FSEventStreamStart(st)
+    stream = st
+  }
+
+  func touched(_ paths: [String]?) {
+    for x in syncs {
+      if let paths = paths, !paths.contains(where: { $0 == x.path || $0.hasPrefix(x.path + "/") || x.path.hasPrefix($0) }) { continue }
+      dirty.insert(x.id)
+    }
+  }
+
+  /// Whether this file is just as it was when it last synced (so a newer copy from the other side can replace it).
+  func unchanged(sid: String, rel: String, url: URL) -> Bool {
+    guard let v = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]), let l = ledger[sid]?[rel] else { return false }
+    return l == Self.key(v.fileSize ?? 0, v.contentModificationDate ?? Date())
   }
 
   func report() {
@@ -642,11 +678,11 @@ final class SyncFolders {
   static func key(_ size: Int, _ mod: Date) -> String { "\(size)|\(Int(mod.timeIntervalSince1970))" }
 
   /// Every file in the folder and its subfolders (no hidden, temporary or half-written files), by relative path.
-  func walk(_ root: String) -> [(rel: String, url: URL, key: String, mtime: Date)] {
-    let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+  func walk(_ root: String) -> [(rel: String, url: URL, key: String, mtime: Date, changed: Date)] {
+    let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey]
     let base = URL(fileURLWithPath: root).standardizedFileURL
     guard let en = FileManager.default.enumerator(at: base, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
-    var out: [(String, URL, String, Date)] = []
+    var out: [(String, URL, String, Date, Date)] = []
     for case let f as URL in en {
       if en.level > 20 { en.skipDescendants(); continue }
       guard let v = try? f.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
@@ -654,7 +690,9 @@ final class SyncFolders {
       let full = f.standardizedFileURL.path
       guard full.hasPrefix(base.path + "/") else { continue }
       let mod = v.contentModificationDate ?? Date()
-      out.append((String(full.dropFirst(base.path.count + 1)), f, Self.key(v.fileSize ?? 0, mod), mod))
+      // "changed" is when the file last changed on this Mac: dragging in a replacement keeps the file's
+      // old modified date, but its status-change time is now.
+      out.append((String(full.dropFirst(base.path.count + 1)), f, Self.key(v.fileSize ?? 0, mod), mod, max(mod, v.attributeModificationDate ?? mod)))
       if out.count >= 50000 { break }
     }
     return out
@@ -665,15 +703,21 @@ final class SyncFolders {
     for x in syncs where x.active {
       if let r = retryAfter[x.id], r > Date() { continue }
       if inFlight.values.contains(where: { $0.sid == x.id }) { continue }   // one batch at a time per folder
+      // Only look through the folder when macOS says something in it changed (or files are still
+      // settling, or a batch needs another go), plus a full check every 5 minutes just in case.
+      let due = Date().timeIntervalSince(lastFull[x.id] ?? .distantPast) > 300
+      guard dirty.contains(x.id) || pending.contains(x.id) || due else { continue }
+      dirty.remove(x.id); pending.remove(x.id)
+      if due { lastFull[x.id] = Date() }
       var isDir: ObjCBool = false
       guard FileManager.default.fileExists(atPath: x.path, isDirectory: &isDir), isDir.boolValue else { continue }
       let known = ledger[x.id] ?? [:]
-      var ready: [(rel: String, url: URL, key: String, mtime: Date)] = []
+      var ready: [(rel: String, url: URL, key: String, mtime: Date, changed: Date)] = []
       for f in walk(x.path) {
         let look = x.id + "|" + f.rel
         if known[f.rel] == f.key || busy.contains(look) { lastLook.removeValue(forKey: look); continue }
-        if lastLook[look] == f.key { ready.append(f) } else { lastLook[look] = f.key }   // unchanged twice in a row: done saving
-        if ready.count >= 500 { break }
+        if lastLook[look] == f.key { ready.append(f) } else { lastLook[look] = f.key; pending.insert(x.id) }   // unchanged twice in a row: done saving
+        if ready.count >= 500 { pending.insert(x.id); break }
       }
       guard !ready.isEmpty else { continue }
       let batch = UUID().uuidString
@@ -686,7 +730,8 @@ final class SyncFolders {
         let size = (try? f.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let type = UTType(filenameExtension: f.url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
         let dir = (f.rel as NSString).deletingLastPathComponent
-        list.append(["fid": fid, "name": f.url.lastPathComponent, "size": size, "type": type, "path": dir, "mtime": Int(f.mtime.timeIntervalSince1970 * 1000)])
+        list.append(["fid": fid, "name": f.url.lastPathComponent, "size": size, "type": type, "path": dir,
+                     "mtime": Int(f.mtime.timeIntervalSince1970 * 1000), "ctime": Int(f.changed.timeIntervalSince1970 * 1000)])
       }
       if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
         app.js("beamNative.syncSend(\(json), \(app.q(x.peer)), \(app.q(batch)), \(app.q(x.id)))")
@@ -704,6 +749,7 @@ final class SyncFolders {
       save(ledgerOf: b.sid)
     } else {
       retryAfter[b.sid] = Date().addingTimeInterval(result == "offline" ? 20 : result == "declined" ? 600 : 60)
+      pending.insert(b.sid)
     }
   }
 
@@ -715,6 +761,8 @@ final class SyncFolders {
     ledger[x.id] = ledger[x.id] ?? [:]
     save(ledgerOf: x.id)
     report()
+    watch()
+    dirty.insert(x.id)
   }
 
   func activate(id: String, peer: String) {
@@ -722,6 +770,7 @@ final class SyncFolders {
     syncs[i].active = true
     save()
     report()
+    dirty.insert(id)
   }
 
   func remove(id: String) {
@@ -730,6 +779,7 @@ final class SyncFolders {
     UserDefaults.standard.removeObject(forKey: "syncLedger." + id)
     save()
     report()
+    watch()
   }
 
   /// A file arrived and was saved into the folder: remember it so it isn't sent straight back.
@@ -830,7 +880,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
   lazy var popup = ProgressPopup(onClick: { [weak self] in self?.showWindow() })
   let drops = DropFolders()
   let syncer = SyncFolders()
-  var syncSaves: [String: (sid: String, rel: String, final: URL, mtime: Double)] = [:]
+  var syncSaves: [String: (sid: String, rel: String, final: URL, mtime: Double, ctime: Double)] = [:]
   lazy var requests = RequestCards(
     onAnswer: { [weak self] tag, what in
       guard let self = self else { return }
@@ -1150,7 +1200,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
       showWindow()
     case "saveBegin":
       if let sid = d["sync"] as? String, !sid.isEmpty {
-        startSyncSave(id: id, sid: sid, name: d["name"] as? String ?? "file", path: d["path"] as? String ?? "", mtime: (d["mtime"] as? NSNumber)?.doubleValue ?? 0)
+        startSyncSave(id: id, sid: sid, name: d["name"] as? String ?? "file", path: d["path"] as? String ?? "",
+                      mtime: (d["mtime"] as? NSNumber)?.doubleValue ?? 0, ctime: (d["ctime"] as? NSNumber)?.doubleValue ?? 0)
       } else {
         startSave(id: id, name: d["name"] as? String ?? "file", path: d["path"] as? String ?? "")
       }
@@ -1231,10 +1282,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
           let rel = parts.joined(separator: "/")
           let url = root.appendingPathComponent(rel)
           let size = (e["s"] as? NSNumber)?.intValue ?? -1, incoming = ((e["m"] as? NSNumber)?.doubleValue ?? 0) / 1000
-          guard let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]), v.isRegularFile == true,
+          let theirChange = max(incoming, ((e["c"] as? NSNumber)?.doubleValue ?? 0) / 1000)
+          guard insideSync(url, root: root) else { continue }
+          guard let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey]), v.isRegularFile == true,
                 let mine = v.contentModificationDate?.timeIntervalSince1970 else { need.append(i); continue }
-          if v.fileSize == size && abs(mine - incoming) <= 2 { syncer.received(sid: sid, rel: rel, url: url); continue }
-          if mine > incoming + 1 { continue }
+          if v.fileSize == size && abs(mine - incoming) <= 2 { syncer.received(sid: sid, rel: rel, url: url); continue }   // already the same
+          // Unchanged here since the last sync: take theirs (even if its date is older, like a replacement
+          // dragged in). Changed on both sides: whichever changed last wins.
+          if syncer.unchanged(sid: sid, rel: rel, url: url) { need.append(i); continue }
+          let myChange = max(mine, v.attributeModificationDate?.timeIntervalSince1970 ?? mine)
+          if myChange > theirChange + 1 { continue }
           need.append(i)
         }
       }
@@ -1348,7 +1405,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
 
   /// A file for a synced folder: written next to its place as a hidden temp file, then put in place
   /// when it's complete (unless the copy here changed more recently).
-  func startSyncSave(id: String, sid: String, name: String, path: String, mtime: Double) {
+  /// The folder (after following any links) is still inside the synced folder.
+  func insideSync(_ url: URL, root: URL) -> Bool {
+    let r = root.resolvingSymlinksInPath().path
+    let p = url.deletingLastPathComponent().resolvingSymlinksInPath().path
+    return p == r || p.hasPrefix(r + "/")
+  }
+
+  func startSyncSave(id: String, sid: String, name: String, path: String, mtime: Double, ctime: Double) {
     guard let x = syncer.sync(sid) else { js("beamNative.saveFailed(\(q(id)))"); return }
     let root = URL(fileURLWithPath: x.path, isDirectory: true).standardizedFileURL
     var folder = root
@@ -1359,21 +1423,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     let safe = safeName(name)
     parts.append(safe)
     do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) } catch { js("beamNative.saveFailed(\(q(id)))"); return }
+    guard insideSync(folder.appendingPathComponent(safe), root: root) else { js("beamNative.saveFailed(\(q(id)))"); return }
     let temp = folder.appendingPathComponent(".\(safe).\(id.prefix(8)).beam-part")
     guard FileManager.default.createFile(atPath: temp.path, contents: nil), let h = try? FileHandle(forWritingTo: temp) else {
       js("beamNative.saveFailed(\(q(id)))")
       return
     }
     saves[id] = (h, temp)
-    syncSaves[id] = (sid, parts.joined(separator: "/"), folder.appendingPathComponent(safe), mtime)
+    syncSaves[id] = (sid, parts.joined(separator: "/"), folder.appendingPathComponent(safe), mtime, ctime)
   }
 
-  func finishSyncSave(temp: URL, _ ss: (sid: String, rel: String, final: URL, mtime: Double)) -> URL {
+  func finishSyncSave(temp: URL, _ ss: (sid: String, rel: String, final: URL, mtime: Double, ctime: Double)) -> URL {
     let fm = FileManager.default
     let incoming = ss.mtime > 0 ? Date(timeIntervalSince1970: ss.mtime / 1000) : Date()
-    if let mine = (try? ss.final.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-       mine.timeIntervalSince1970 > incoming.timeIntervalSince1970 + 1 {
-      try? fm.removeItem(at: temp)          // the copy here is newer: keep it (it goes the other way next)
+    let theirChange = max(incoming.timeIntervalSince1970, ss.ctime / 1000)
+    // Changed here too while this was on its way, and more recently: keep ours (it goes the other way next).
+    if fm.fileExists(atPath: ss.final.path), !syncer.unchanged(sid: ss.sid, rel: ss.rel, url: ss.final),
+       let v = try? ss.final.resourceValues(forKeys: [.contentModificationDateKey, .attributeModificationDateKey]),
+       let mine = v.contentModificationDate?.timeIntervalSince1970,
+       max(mine, v.attributeModificationDate?.timeIntervalSince1970 ?? mine) > theirChange + 1 {
+      try? fm.removeItem(at: temp)
       return ss.final
     }
     do {
