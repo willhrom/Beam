@@ -406,3 +406,10 @@ button.set-who > span:nth-child(2) { flex: 1; }
 .drop-empty small { color: var(--dim); max-width: 34ch; }
 .drop-notes { margin: 0; padding-left: 18px; color: var(--dim); font-size: 13px; line-height: 1.5; }
 .drop-notes li { margin: 4px 0; }
+
+/* Synced folder name in the invite: one line, cut short with … */
+.sync-folder { display: flex; align-items: center; gap: 10px; padding: 10px 12px; margin: 4px 0 10px; border-radius: 12px; background: var(--card2, rgba(255,255,255,.05)); border: 1px solid var(--line); min-width: 0; }
+.sync-folder span { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.sync-folder .ico { flex: none; }
+.drop-row > span { min-width: 0; }
+.drop-row > span, .drop-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -1186,7 +1186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
       panel.canChooseFiles = false
       panel.canCreateDirectories = true
       panel.prompt = "Sync This Folder"
-      panel.message = "Choose a folder to keep the same on \(peerName)"
+      panel.message = "Choose a folder to sync"
       NSApp.activate(ignoringOtherApps: true)
       panel.begin { r in
         guard r == .OK, let u = panel.url else { return }
@@ -1203,7 +1203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
       panel.canChooseFiles = false
       panel.canCreateDirectories = true
       panel.prompt = "Keep It Here"
-      panel.message = "Choose where to keep \"\(name)\". Beam makes a folder with that name here, or uses the one that's already there."
+      panel.message = "Choose where to keep the synced folder"
       panel.directoryURL = saveRoot()
       NSApp.activate(ignoringOtherApps: true)
       panel.begin { r in

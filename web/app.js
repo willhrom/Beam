@@ -986,7 +986,7 @@ function syncSheet() {
   () => {
     document.querySelectorAll("[data-srm]").forEach((b) => (b.onclick = () => {
       const x = list[+b.dataset.srm];
-      if (!confirm(`Stop syncing "${x.name}"? Both copies stay where they are.`)) return;
+      if (!confirm("Stop syncing this folder? Both copies stay.")) return;
       native.postMessage({ op: "syncRemove", id: x.id });
       wsSend({ t: "signal", to: x.peer, data: { k: "sync-stop", sid: x.id } });
     }));
@@ -1015,7 +1015,7 @@ function syncInvite(sid, name) {
   const x = (S.syncs || []).find((y) => y.id === sid);
   if (!x) return;
   wsSend({ t: "signal", to: x.peer, data: { k: "sync-invite", sid, name } });
-  toast(`Asked ${x.peerName} to sync "${name}"`);
+  toast("Sync request sent");
 }
 function onSyncSignal(from, d) {
   const peer = S.peers.find((p) => p.id === from);
@@ -1036,19 +1036,19 @@ function onSyncSignal(from, d) {
   }
   if (d.k === "sync-invite") {
     const name = cleanName(d.name || "Synced folder");
-    openSheet(`<h2>Sync "${esc(name)}" with ${esc(peer.name)}?</h2>
-      <p>${esc(peer.name)} wants to keep its folder "${esc(name)}" the same as one on this ${nativeKind === "windows" ? "PC" : "Mac"}. Choose where to keep it here: Beam makes a folder called "${esc(name)}" there (or uses the one already there).</p>
-      <p class="hint">New and changed files go both ways. Nothing is ever deleted.</p>
+    openSheet(`<h2>Sync a folder with ${esc(peer.name)}?</h2>
+      <div class="sync-folder" title="${esc(name)}"><i class="ico">${SET_ICONS.sync}</i><span>${esc(name)}</span></div>
+      <p class="hint">Pick where to keep it on this ${nativeKind === "windows" ? "PC" : "Mac"}.</p>
       <div class="actions"><button class="btn ghost" id="sno">Not now</button><button class="btn primary" id="syes">Choose where…</button></div>`);
     $("#sno").onclick = () => { wsSend({ t: "signal", to: from, data: { k: "sync-decline", sid } }); closeSheet(); };
     $("#syes").onclick = () => { native.postMessage({ op: "syncJoin", sid, name, peer: from, peerName: peer.name }); closeSheet(); };
     S.syncInvite = { sid, from };
-    notify("sync-" + sid, `${peer.name} wants to sync a folder`, `Open Beam to set up "${name}" on this computer`, false);
+    notify("sync-" + sid, "Sync request from " + peer.name, "Open Beam to set it up", false);
     return;
   }
   if (d.k === "sync-accept") return native.postMessage({ op: "syncActivate", id: sid, peer: from });
-  if (d.k === "sync-decline") { native.postMessage({ op: "syncRemove", id: sid }); return toast(peer.name + " didn't set up the synced folder"); }
-  if (d.k === "sync-stop") { native.postMessage({ op: "syncRemove", id: sid }); return toast(peer.name + " stopped syncing a folder. Your copy stays where it is"); }
+  if (d.k === "sync-decline") { native.postMessage({ op: "syncRemove", id: sid }); return toast("Sync not set up"); }
+  if (d.k === "sync-stop") { native.postMessage({ op: "syncRemove", id: sid }); return toast("Sync stopped"); }
 }
 // The other side made its folder (or gave up picking one).
 function syncAccepted(sid, ok) {
@@ -1056,7 +1056,7 @@ function syncAccepted(sid, ok) {
   const to = x ? x.peer : S.syncInvite && S.syncInvite.sid === sid ? S.syncInvite.from : null;
   if (!to) return;
   wsSend({ t: "signal", to, data: { k: ok ? "sync-accept" : "sync-decline", sid } });
-  if (ok) toast("Folder synced. Files will start arriving");
+  if (ok) toast("Folder synced");
 }
 
 // ----- drop folders (Mac and Windows apps) -----
@@ -1969,6 +1969,8 @@ async function makeZip(files) {
 }
 
 function toast(msg) {
+  // One bubble at a time: a new message replaces the one showing.
+  document.querySelectorAll(".toast").forEach((x) => x.remove());
   const d = document.createElement("div");
   d.className = "toast";
   d.textContent = msg;

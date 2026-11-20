@@ -635,7 +635,7 @@ namespace Beam
                 {
                     // This PC picks the folder; the page then asks the other computer to make its copy.
                     string sid = Str("sid") ?? Guid.NewGuid().ToString("N"), peer = Str("peer") ?? "", peerName = Str("peerName") ?? "your other computer";
-                    using var dlg = new FolderBrowserDialog { Description = "Choose a folder to keep the same on " + peerName, UseDescriptionForTitle = true, ShowNewFolderButton = true };
+                    using var dlg = new FolderBrowserDialog { Description = "Choose a folder to sync", UseDescriptionForTitle = true, ShowNewFolderButton = true };
                     if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
                     {
                         var pickedSync = NormDir(dlg.SelectedPath);
@@ -651,7 +651,7 @@ namespace Beam
                     // The other computer asked: choose where this copy lives. Beam makes (or reuses) a folder with the same name there.
                     string sid = Str("sid") ?? "", peer = Str("peer") ?? "", peerName = Str("peerName") ?? "your other computer";
                     var name = SafeName(Str("name") ?? "Synced folder");
-                    using var dlg = new FolderBrowserDialog { Description = $"Choose where to keep \"{name}\". Beam makes a folder with that name here, or uses the one already there.", UseDescriptionForTitle = true, ShowNewFolderButton = true, InitialDirectory = SaveRoot() };
+                    using var dlg = new FolderBrowserDialog { Description = "Choose where to keep the synced folder", UseDescriptionForTitle = true, ShowNewFolderButton = true, InitialDirectory = SaveRoot() };
                     if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrEmpty(dlg.SelectedPath))
                     {
                         var parent = NormDir(dlg.SelectedPath);
