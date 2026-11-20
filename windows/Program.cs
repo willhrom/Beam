@@ -673,6 +673,38 @@ namespace Beam
                 case "syncRemove":
                     syncer.Remove(id);
                     break;
+                case "syncCheck":
+                {
+                    // The other computer asks which of its files we need. Same file already here: no (and remember it,
+                    // so it isn't sent back). Ours is newer: no (ours goes the other way). Otherwise: yes.
+                    string csid = Str("sid") ?? "", cn = Str("n") ?? "", cfrom = Str("from") ?? "";
+                    var need = new List<int>();
+                    var cx = syncer.Get(csid);
+                    if (cx != null && cx.peer == cfrom && d.TryGetProperty("q", out var cq) && cq.ValueKind == JsonValueKind.Array)
+                    {
+                        var croot = NormDir(cx.path);
+                        int ci = -1;
+                        foreach (var ce in cq.EnumerateArray())
+                        {
+                            ci++;
+                            var cparts = (ce.TryGetProperty("p", out var pp) ? pp.GetString() ?? "" : "").Split('/', '\\')
+                                .Where(seg => seg.Length > 0 && seg != "." && seg != "..").Select(SafeName).ToList();
+                            if (cparts.Count == 0) continue;
+                            var crel = string.Join("/", cparts);
+                            var cfull = Path.Combine(new[] { croot }.Concat(cparts).ToArray());
+                            long csize = ce.TryGetProperty("s", out var ps) && ps.ValueKind == JsonValueKind.Number ? ps.GetInt64() : -1;
+                            double cinc = (ce.TryGetProperty("m", out var pm) && pm.ValueKind == JsonValueKind.Number ? pm.GetDouble() : 0) / 1000;
+                            var cfi = new FileInfo(cfull);
+                            if (!cfi.Exists) { need.Add(ci); continue; }
+                            double cmine = new DateTimeOffset(cfi.LastWriteTimeUtc).ToUnixTimeMilliseconds() / 1000.0;
+                            if (cfi.Length == csize && Math.Abs(cmine - cinc) <= 2) { syncer.Received(csid, crel, cfull); continue; }
+                            if (cmine > cinc + 1) continue;
+                            need.Add(ci);
+                        }
+                    }
+                    Js($"beamNative.syncNeed({Q(cn)}, {Q(cfrom)}, {Q(csid)}, {JsonSerializer.Serialize(need)})");
+                    break;
+                }
                 case "syncDone":
                     syncer.Done(Str("batch") ?? "", Str("result") ?? "failed");
                     break;

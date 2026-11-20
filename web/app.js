@@ -33,6 +33,8 @@ const cleanName = (n) => String(n || "file").replace(/[\/\\:\u0000-\u001f]/g, "_
 // A folder path inside a transfer, like "Trip/Day 1": each part cleaned, nothing that climbs out.
 const cleanPath = (p) => String(p || "").split(/[\/\\]+/).filter((x) => x && x !== "." && x !== "..").map((x) => cleanName(x)).slice(0, 20).join("/");
 // The relative path a browser gives a file picked or dropped as part of a folder.
+// How far a transfer really is: on the sending side, bytes still queued in the connection don't count yet.
+const shownDone = (t) => Math.max(0, t.done - (t.dir === "out" && t.dc && t.dc.readyState === "open" ? t.dc.bufferedAmount : 0));
 const relPathOf = (f) => (f.beamPath !== undefined ? f.beamPath : f.webkitRelativePath || "").split("/").slice(0, -1).join("/");
 const store = {
   get: (k, d) => { try { const v = localStorage.getItem("beam." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -313,7 +315,7 @@ async function onSignal(from, d) {
     if (t && t.dir === "in") closePrompt(t.tid);
     return;
   }
-  if (d.k === "sync-invite" || d.k === "sync-accept" || d.k === "sync-decline" || d.k === "sync-stop") return onSyncSignal(from, d);
+  if (["sync-invite", "sync-accept", "sync-decline", "sync-stop", "sync-check", "sync-need"].includes(d.k)) return onSyncSignal(from, d);
   if (d.k === "pair") {
     if ((await idFromPub(d.pub)) !== from) return;
     if (!S.pairing || S.pairing.mode !== "show") return wsSend({ t: "signal", to: from, data: { k: "pair-no" } });
@@ -422,6 +424,8 @@ async function pump(t, gen, i0, off0) {
   t.done = off0;
   for (let k = 0; k < i0; k++) t.done += t.items[k].size;
   renderTx(t);
+  clearInterval(t.tick);
+  t.tick = setInterval(() => { if (t.gen === gen && (t.state === "sending" || t.state === "finishing")) renderProgress(t); else clearInterval(t.tick); }, 250);
   const waitLow = () => new Promise((res) => { dc.onbufferedamountlow = () => { dc.onbufferedamountlow = null; res(); }; });
   for (let i = i0; i < t.items.length; i++) {
     const blob = t.blobs[i];
@@ -938,7 +942,22 @@ function syncSummary() {
 async function syncSend(files, to, batch, sid) {
   const peer = S.peers.find((p) => p.id === to);
   if (!peer || !files.length) return native.postMessage({ op: "syncDone", batch, result: peer ? "done" : "offline" });
-  const t = await sendItems(peer, files, null, { sync: sid });
+  // Ask the other computer which of these it actually needs: it may have the same file already
+  // (both sides start with it), or a newer one of its own (which it sends this way instead).
+  const n = randId();
+  const q = files.map((f) => ({ p: cleanPath(f.beamPath || f.name), s: f.size, m: f.beamMtime || 0 }));
+  const reply = await new Promise((res) => {
+    S.syncWait = S.syncWait || {};
+    S.syncWait[n] = { from: to, res };
+    wsSend({ t: "signal", to, data: { k: "sync-check", sid, n, q } });
+    setTimeout(() => { if (S.syncWait[n]) { delete S.syncWait[n]; res(null); } }, 20000);
+  });
+  if (!reply) return native.postMessage({ op: "syncDone", batch, result: "offline" });
+  if (reply.none) return native.postMessage({ op: "syncDone", batch, result: "declined" });
+  const need = new Set((Array.isArray(reply.need) ? reply.need : []).map(Number));
+  const send = files.filter((f, i) => need.has(i));
+  if (!send.length) return native.postMessage({ op: "syncDone", batch, result: "done" });
+  const t = await sendItems(peer, send, null, { sync: sid });
   if (t) t.syncBatch = batch; else native.postMessage({ op: "syncDone", batch, result: "failed" });
 }
 function syncSheet() {
@@ -1002,6 +1021,19 @@ function onSyncSignal(from, d) {
   const peer = S.peers.find((p) => p.id === from);
   if (!native || !peer || !peer.mine) return;
   const sid = String(d.sid || "").slice(0, 40);
+  if (d.k === "sync-check") {
+    const n = String(d.n || "").slice(0, 40);
+    const x = (S.syncs || []).find((y) => y.id === sid && y.peer === from);
+    if (!x || !Array.isArray(d.q)) return wsSend({ t: "signal", to: from, data: { k: "sync-need", sid, n, none: true } });
+    const q = d.q.slice(0, 1000).map((e) => ({ p: cleanPath(String(e && e.p || "")), s: Math.max(0, Number(e && e.s) || 0), m: Math.max(0, Number(e && e.m) || 0) }));
+    return native.postMessage({ op: "syncCheck", sid, n, from, q });
+  }
+  if (d.k === "sync-need") {
+    const w = S.syncWait && S.syncWait[d.n];
+    if (!w || w.from !== from) return;
+    delete S.syncWait[d.n];
+    return w.res({ need: d.need, none: !!d.none });
+  }
   if (d.k === "sync-invite") {
     const name = cleanName(d.name || "Synced folder");
     openSheet(`<h2>Sync "${esc(name)}" with ${esc(peer.name)}?</h2>
@@ -1218,6 +1250,8 @@ window.beamNative = {
   syncSend(list, to, batch, sid) { syncSend((list || []).map((f) => { const x = macFile(f); x.beamMtime = f.mtime; return x; }), to, batch, sid); },
   syncPicked(sid, name) { syncInvite(sid, name); },
   syncReady(sid, ok) { syncAccepted(sid, ok); },
+  // Which of the offered files this computer needs (indices into the list it was asked about).
+  syncNeed(n, from, sid, need) { wsSend({ t: "signal", to: from, data: { k: "sync-need", sid, n, need: Array.isArray(need) ? need : [] } }); },
   // Mac and Windows apps report their version (shown in Settings → About).
   appVersion(v) { S.appVersion = String(v || ""); const el = $("#appVer"); if (el) el.textContent = "Version " + S.appVersion; },
   // Mac and Windows apps: where received files go (the folder picker lives in the app).
@@ -1300,7 +1334,7 @@ function nativeProgressSoon() { if (!progTimer) progTimer = setTimeout(() => { p
 function nativeProgress() {
   const live = [...S.tx.values()].filter((t) => LIVE.includes(t.state));
   const t = live.find((x) => x.dir === "in") || live[0];
-  const frac = t && t.total ? Math.min(1, t.done / t.total) : 0;
+  const frac = t && t.total ? Math.min(1, shownDone(t) / t.total) : 0;
   if (!native) { document.title = t ? `Beam (${Math.floor(frac * 100)}%)` : "Beam"; return; }
   if (!t) {
     if (progShown) { progShown = false; native.postMessage({ op: "progress", show: false }); }
@@ -1324,7 +1358,7 @@ function progressFinal(t) {
   if (quiet) return native.postMessage({ op: "progress", show: false });
   const what = describeItems(t.items);
   native.postMessage({
-    op: "progress", show: true, state: done ? "done" : "failed", dir: t.dir, pct: done ? 1 : t.total ? Math.min(1, t.done / t.total) : 0,
+    op: "progress", show: true, state: done ? "done" : "failed", dir: t.dir, pct: done ? 1 : t.total ? Math.min(1, shownDone(t) / t.total) : 0,
     title: done ? (t.dir === "in" ? "Received " : "Sent ") + what : (t.dir === "in" ? "Didn't receive " : "Didn't send ") + what,
     detail: done ? (t.dir === "in" ? "From " : "To ") + t.peer.name : t.reason || "Something went wrong",
     // On Windows the "Received" notification appears in the same corner, so step aside for it.
@@ -1550,7 +1584,7 @@ function renderRing(t) {
   const el = document.querySelector(`.peer[data-id="${t.peer.id}"] .ring .arc`);
   if (!el) return;
   const active = ["waiting", "connecting", "sending", "finishing", "paused", "reconnecting"].includes(t.state);
-  const frac = active ? (t.total ? t.done / t.total : 0) : 0;
+  const frac = active ? (t.total ? shownDone(t) / t.total : 0) : 0;
   el.parentNode.classList.toggle("on", active);
   el.style.strokeDashoffset = String(238.8 * (1 - (t.state === "waiting" ? 0.04 : frac)));
 }
@@ -1609,9 +1643,9 @@ function renderTx(t) {
   }
   el.className = "tx " + t.state;
   const moving = ["sending", "receiving", "paused", "reconnecting"].includes(t.state);
-  const pct = t.total ? Math.floor((100 * t.done) / t.total) : 0;
+  const pct = t.total ? Math.floor((100 * shownDone(t)) / t.total) : 0;
   let body = "";
-  if (moving) body += `<div class="bar"><i style="width:${t.total ? (100 * t.done) / t.total : 0}%"></i></div>`;
+  if (moving) body += `<div class="bar"><i style="width:${t.total ? (100 * shownDone(t)) / t.total : 0}%"></i></div>`;
   const one = t.state === "done" && t.items.length === 1 && t.received && t.received.length === 1 && !t.received[0].text ? t.received[0] : null;
   const folderZip = t.state === "done" && t.sink === "memory" && t.received && t.received.length > 1 && (topFolder(t.items) || t.received.length > SHOW_FILES) && t.received.every((r) => r.url);
   let oneBtn = "";
@@ -1843,7 +1877,7 @@ const FX = {
     const prev = t.fxState;
     if (prev === t.state) return;
     t.fxState = t.state;
-    const moving = t.state === "sending" || t.state === "receiving";
+    const moving = t.state === "sending" || t.state === "receiving" || t.state === "finishing";
     if (moving) this.stream(t); else this.stop(t);
     if (!prev) this.pulse(el, "enter", 600);
     // You hit send: the file flies to the device.
@@ -1878,9 +1912,9 @@ function renderProgress(t) {
   progressRaf = requestAnimationFrame(() => {
     progressRaf = 0;
     const bar = document.querySelector(`[data-tid="${t.tid}"] .bar i`);
-    if (bar) bar.style.width = (t.total ? (100 * t.done) / t.total : 0) + "%";
+    if (bar) bar.style.width = (t.total ? (100 * shownDone(t)) / t.total : 0) + "%";
     const pct = document.querySelector(`[data-tid="${t.tid}"] .pct`);
-    if (pct) pct.textContent = (t.total ? Math.floor((100 * t.done) / t.total) : 0) + "%";
+    if (pct) pct.textContent = (t.total ? Math.floor((100 * shownDone(t)) / t.total) : 0) + "%";
     if (t.dir === "out") renderRing(t);
   });
 }

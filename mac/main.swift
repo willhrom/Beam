@@ -1214,6 +1214,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
       syncer.activate(id: d["id"] as? String ?? "", peer: d["peer"] as? String ?? "")
     case "syncRemove":
       syncer.remove(id: d["id"] as? String ?? "")
+    case "syncCheck":
+      // The other computer asks which of its files we need. Same file already here: no (and remember it,
+      // so it isn't sent back). Ours is newer: no (ours goes the other way). Otherwise: yes.
+      let sid = d["sid"] as? String ?? "", n = d["n"] as? String ?? "", from = d["from"] as? String ?? ""
+      var need: [Int] = []
+      if let x = syncer.sync(sid), x.peer == from {
+        let root = URL(fileURLWithPath: x.path, isDirectory: true).standardizedFileURL
+        for (i, e) in (d["q"] as? [[String: Any]] ?? []).enumerated() {
+          let parts = (e["p"] as? String ?? "").split(separator: "/").map(String.init).filter { !$0.isEmpty && $0 != "." && $0 != ".." }.map { safeName($0) }
+          guard !parts.isEmpty else { continue }
+          let rel = parts.joined(separator: "/")
+          let url = root.appendingPathComponent(rel)
+          let size = (e["s"] as? NSNumber)?.intValue ?? -1, incoming = ((e["m"] as? NSNumber)?.doubleValue ?? 0) / 1000
+          guard let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]), v.isRegularFile == true,
+                let mine = v.contentModificationDate?.timeIntervalSince1970 else { need.append(i); continue }
+          if v.fileSize == size && abs(mine - incoming) <= 2 { syncer.received(sid: sid, rel: rel, url: url); continue }
+          if mine > incoming + 1 { continue }
+          need.append(i)
+        }
+      }
+      js("beamNative.syncNeed(\(q(n)), \(q(from)), \(q(sid)), \(need))")
     case "syncDone":
       syncer.done(batch: d["batch"] as? String ?? "", result: d["result"] as? String ?? "failed")
     case "getDropFolders":
