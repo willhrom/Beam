@@ -742,39 +742,43 @@ final class SyncFolders {
   }
 }
 
-/// The key WebKit uses to lock the page's saved keys. The first time, it's copied from WebKit's own
-/// keychain item (one last password prompt, so this Mac keeps its identity); after that it lives in
-/// Beam's own keychain item, which Beam can read without asking.
+/// The key WebKit uses to lock the page's saved keys (this Mac's sign-in). Kept in a private file
+/// in Beam's Application Support folder, readable only by this Mac user, so nothing ever has to
+/// ask the keychain (and no password prompt can appear). Beam's earlier keychain copy, if it can
+/// be read without asking, is moved over so this Mac stays signed in.
 enum MasterKey {
   static var cached: Data?
-  static let service = "app.beam.mac.webcrypto"
+
+  static var file: URL {
+    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Beam", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    return dir.appendingPathComponent("webcrypto.key")
+  }
 
   static func get() -> Data? {
     if let k = cached { return k }
-    if let k = read(service: service, base64: false) { cached = k; return k }
-    // Moving over from WebKit's own item (the one that kept asking for the password).
-    let old = read(service: "com.apple.WebKit.WebCrypto.master+" + (Bundle.main.bundleIdentifier ?? "app.beam.mac"), base64: true)
-    var key = old ?? Data()
-    if key.isEmpty {
+    if let k = try? Data(contentsOf: file), k.count == 16 { cached = k; return k }
+    var key = quietKeychainRead() ?? Data()
+    if key.count != 16 {
       key = Data(count: 16)
-      let ok = key.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) == errSecSuccess }
-      if !ok { return nil }
+      guard key.withUnsafeMutableBytes({ SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }) == errSecSuccess else { return nil }
     }
-    let add: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                              kSecAttrAccount as String: "Beam", kSecAttrLabel as String: "Beam saved keys",
-                              kSecValueData as String: key]
-    SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service] as CFDictionary)
-    SecItemAdd(add as CFDictionary, nil)
+    do {
+      try key.write(to: file, options: .atomic)
+      try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    } catch { NSLog("Beam: couldn't save the WebCrypto key: \(error)") }
     cached = key
     return key
   }
 
-  static func read(service: String, base64: Bool) -> Data? {
-    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+  /// The copy the previous version kept in the keychain, only if it can be read without any prompt.
+  static func quietKeychainRead() -> Data? {
+    SecKeychainSetUserInteractionAllowed(false)
+    defer { SecKeychainSetUserInteractionAllowed(true) }
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "app.beam.mac.webcrypto",
                             kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
     var out: CFTypeRef?
-    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data, !d.isEmpty else { return nil }
-    if base64 { return Data(base64Encoded: d) ?? Data(base64Encoded: String(decoding: d, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) }
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data, d.count == 16 else { return nil }
     return d
   }
 }
