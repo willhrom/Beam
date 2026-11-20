@@ -1471,41 +1471,7 @@ namespace Beam
             timer.Tick += (s, e) => Tick();
         }
 
-        public void Start() { timer.Interval = 3000; timer.Start(); Watch(); }
-
-        void Watch()
-        {
-            foreach (var w in watchers.Values) { try { w.EnableRaisingEvents = false; w.Dispose(); } catch { } }
-            watchers.Clear();
-            foreach (var x in Syncs)
-            {
-                try
-                {
-                    var id = x.id;
-                    var w = new FileSystemWatcher(x.path) { IncludeSubdirectories = true, InternalBufferSize = 64 * 1024,
-                        NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite | NotifyFilters.CreationTime };
-                    FileSystemEventHandler on = (s, e) => { lock (dirty) dirty.Add(id); };
-                    w.Changed += on; w.Created += on; w.Renamed += (s, e) => { lock (dirty) dirty.Add(id); };
-                    w.Error += (s, e) => { lock (dirty) dirty.Add(id); };   // too many changes at once: look through everything
-                    w.EnableRaisingEvents = true;
-                    watchers[id] = w;
-                }
-                catch { }
-            }
-        }
-
-        /// Whether this file is just as it was when it last synced (so a newer copy from the other side can replace it).
-        public bool Unchanged(string sid, string rel, string full)
-        {
-            try
-            {
-                var f = new FileInfo(full);
-                return f.Exists && ledger.TryGetValue(sid, out var l) && l.TryGetValue(rel, out var k) && k == Key(f.Length, f.LastWriteTimeUtc);
-            }
-            catch { return false; }
-        }
-
-        public static DateTime Changed(FileInfo f) => f.CreationTimeUtc > f.LastWriteTimeUtc ? f.CreationTimeUtc : f.LastWriteTimeUtc;
+        public void Start() => timer.Start();
 
         void Save()
         {
@@ -1632,7 +1598,41 @@ namespace Beam
             timer.Tick += (s, e) => Tick();
         }
 
-        public void Start() => timer.Start();
+        public void Start() { timer.Interval = 3000; timer.Start(); Watch(); }
+
+        void Watch()
+        {
+            foreach (var w in watchers.Values) { try { w.EnableRaisingEvents = false; w.Dispose(); } catch { } }
+            watchers.Clear();
+            foreach (var x in Syncs)
+            {
+                try
+                {
+                    var id = x.id;
+                    var w = new FileSystemWatcher(x.path) { IncludeSubdirectories = true, InternalBufferSize = 64 * 1024,
+                        NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite | NotifyFilters.CreationTime };
+                    FileSystemEventHandler on = (s, e) => { lock (dirty) dirty.Add(id); };
+                    w.Changed += on; w.Created += on; w.Renamed += (s, e) => { lock (dirty) dirty.Add(id); };
+                    w.Error += (s, e) => { lock (dirty) dirty.Add(id); };   // too many changes at once: look through everything
+                    w.EnableRaisingEvents = true;
+                    watchers[id] = w;
+                }
+                catch { }
+            }
+        }
+
+        /// Whether this file is just as it was when it last synced (so a newer copy from the other side can replace it).
+        public bool Unchanged(string sid, string rel, string full)
+        {
+            try
+            {
+                var f = new FileInfo(full);
+                return f.Exists && ledger.TryGetValue(sid, out var l) && l.TryGetValue(rel, out var k) && k == Key(f.Length, f.LastWriteTimeUtc);
+            }
+            catch { return false; }
+        }
+
+        public static DateTime Changed(FileInfo f) => f.CreationTimeUtc > f.LastWriteTimeUtc ? f.CreationTimeUtc : f.LastWriteTimeUtc;
 
         void Save(string ledgerOf = null)
         {

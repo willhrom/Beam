@@ -506,9 +506,6 @@ final class DropFolders {
   var inFlight: [String: (keys: [String], paths: [String], folder: String)] = [:]
   var busy = Set<String>()
   var retryAfter: [String: Date] = [:]
-  var dirty = Set<String>(), pending = Set<String>()
-  var lastFull: [String: Date] = [:]
-  var stream: FSEventStreamRef?
   var timer: Timer?
   weak var app: AppDelegate?
   static let skip: Set<String> = ["tmp", "part", "crdownload", "download", "partial", "icloud", "sb"]
@@ -618,6 +615,9 @@ final class SyncFolders {
   var busy = Set<String>()
   var inFlight: [String: (sid: String, rels: [String], keys: [String])] = [:]
   var retryAfter: [String: Date] = [:]
+  var dirty = Set<String>(), pending = Set<String>()
+  var lastFull: [String: Date] = [:]
+  var stream: FSEventStreamRef?
   var timer: Timer?
   weak var app: AppDelegate?
 
