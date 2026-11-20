@@ -1741,24 +1741,33 @@ const FX = {
   },
   you() { return document.querySelector(".you-dot"); },
   peerAvatar(id) { const el = document.querySelector(`#peers [data-id="${id}"] .avatar`); return el; },
-  // A glowing spark that arcs from one element to another.
+  // Moves an element in a straight line from one element to another, following both live (the device
+  // circles float gently), so it always lands right in the circle. draw(el, x, y, k) styles each frame.
+  fly(el, fromEl, toEl, ms, draw, done) {
+    const start = performance.now();
+    const ease = (k) => (k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
+    const step = (now) => {
+      const a = this.center(fromEl), b = this.center(toEl);
+      const k = Math.min(1, (now - start) / ms);
+      if (!a || !b || !el.isConnected) { el.remove(); return; }
+      const e = ease(k);
+      draw(el, a.x + (b.x - a.x) * e, a.y + (b.y - a.y) * e, k);
+      if (k < 1) requestAnimationFrame(step); else { el.remove(); if (done) done(); }
+    };
+    requestAnimationFrame(step);
+  },
+  // A glowing spark that travels straight from one element into another.
   spark(fromEl, toEl, opts = {}) {
     if (this.calm() || document.hidden) return;
-    const a = this.center(fromEl), b = this.center(toEl);
-    if (!a || !b) return;
+    if (!this.center(fromEl) || !this.center(toEl)) return;
     const d = document.createElement("i");
     d.className = "spark" + (opts.big ? " big" : "") + (opts.good ? " good" : "");
+    d.style.opacity = "0";
     this.layer().appendChild(d);
-    const bend = (opts.bend ?? (Math.random() * 2 - 1)) * Math.min(120, Math.hypot(b.x - a.x, b.y - a.y) * 0.35);
-    const mx = (a.x + b.x) / 2 + bend, my = (a.y + b.y) / 2 - Math.abs(bend) * 0.4;
-    const frames = [];
-    for (let i = 0; i <= 16; i++) {
-      const t = i / 16, u = 1 - t;
-      const x = u * u * a.x + 2 * u * t * mx + t * t * b.x, y = u * u * a.y + 2 * u * t * my + t * t * b.y;
-      frames.push({ transform: `translate(${x}px, ${y}px) scale(${0.6 + Math.sin(t * Math.PI) * 0.7})`, opacity: t < 0.1 ? t * 10 : t > 0.85 ? (1 - t) / 0.15 : 1 });
-    }
-    const anim = d.animate(frames, { duration: opts.ms || 720, easing: "cubic-bezier(.45,.05,.35,1)" });
-    anim.onfinish = () => { d.remove(); if (opts.onland) opts.onland(); };
+    this.fly(d, fromEl, toEl, opts.ms || 720, (el, x, y, k) => {
+      el.style.transform = `translate(${x}px, ${y}px) scale(${0.7 + Math.sin(k * Math.PI) * 0.5})`;
+      el.style.opacity = String(k < 0.1 ? k * 10 : k > 0.92 ? (1 - k) / 0.08 : 1);
+    }, opts.onland);
   },
   // A ring of particles bursting out of an element.
   burst(el, opts = {}) {
@@ -1787,37 +1796,31 @@ const FX = {
     el.classList.add(cls);
     setTimeout(() => el.classList.remove(cls), ms);
   },
-  // Sending starts: a little file card arcs from you to the device, which catches it.
+  // Sending starts: a little file card flies straight from you to the device, which catches it.
   launch(t) {
     if (this.calm() || document.hidden) return;
     const from = this.you(), to = this.peerAvatar(t.peer.id);
-    const a = this.center(from), b = this.center(to);
-    if (!a || !b) return;
+    if (!this.center(from) || !this.center(to)) return;
     const card = document.createElement("div");
     card.className = "flycard";
     const files = t.items.filter((i) => !i.text);
     card.innerHTML = files.length > 1 ? `<span>${files.length}</span>` : t.items.some((i) => i.text) && !files.length ? "<span>Aa</span>" : "";
     this.layer().appendChild(card);
-    const bend = -Math.min(160, Math.hypot(b.x - a.x, b.y - a.y) * 0.5);
-    const frames = [];
-    for (let i = 0; i <= 20; i++) {
-      const k = i / 20, u = 1 - k;
-      const mx = (a.x + b.x) / 2 + bend * 0.6, my = (a.y + b.y) / 2;
-      const x = u * u * a.x + 2 * u * k * mx + k * k * b.x, y = u * u * a.y + 2 * u * k * my + k * k * b.y;
-      frames.push({ transform: `translate(${x}px, ${y}px) rotate(${-25 + k * 385}deg) scale(${0.5 + Math.sin(k * Math.PI) * 0.8 - k * 0.3})`, opacity: k > 0.92 ? (1 - k) / 0.08 : 1 });
-      if (i % 3 === 0 && i > 0 && i < 20) setTimeout(() => this.trail(x, y), 650 * k);
-    }
-    card.animate(frames, { duration: 650, easing: "cubic-bezier(.5,0,.4,1)" }).onfinish = () => {
-      card.remove();
+    let trails = 0;
+    this.fly(card, from, to, 650, (el, x, y, k) => {
+      el.style.transform = `translate(${x}px, ${y}px) rotate(${-12 + k * 24}deg) scale(${0.5 + Math.sin(k * Math.PI) * 0.6 - k * 0.2})`;
+      el.style.opacity = String(k > 0.92 ? (1 - k) / 0.08 : 1);
+      if (k > (trails + 1) * 0.15 && k < 0.95) { trails++; this.trail(x, y); }
+    }, () => {
       this.pulse(to, "caught", 600);
       this.burst(to, { n: 8, size: 34, colors: ["#5cc8ff", "#ffffff"] });
-    };
+    });
   },
   trail(x, y) {
     const d = document.createElement("i");
     d.className = "spark";
     this.layer().appendChild(d);
-    d.animate([{ transform: `translate(${x}px, ${y}px) scale(.9)`, opacity: .8 }, { transform: `translate(${x}px, ${y + 14}px) scale(.1)`, opacity: 0 }], { duration: 500, easing: "ease-out" }).onfinish = () => d.remove();
+    d.animate([{ transform: `translate(${x}px, ${y}px) scale(.9)`, opacity: .8 }, { transform: `translate(${x}px, ${y}px) scale(.1)`, opacity: 0 }], { duration: 500, easing: "ease-out" }).onfinish = () => d.remove();
   },
   // A glowing beam between you and the other device, flowing the way the data goes.
   beam(t) {
@@ -1839,8 +1842,7 @@ const FX = {
       svg.appendChild(path);
     }
     const [p, q] = t.dir === "out" ? [a, b] : [b, a];
-    const mx = (p.x + q.x) / 2 + (q.y - p.y) * 0.12, my = (p.y + q.y) / 2 - (q.x - p.x) * 0.12;
-    path.setAttribute("d", `M${p.x},${p.y} Q${mx},${my} ${q.x},${q.y}`);
+    path.setAttribute("d", `M${p.x},${p.y} L${q.x},${q.y}`);   // straight, like the sparks
   },
   unbeam(t) { const el = document.querySelector(`#fxBeam [data-tid="${t.tid}"]`); if (el) el.remove(); },
   // A big finish for things you receive: confetti falls from the top of the window.
@@ -1880,7 +1882,7 @@ const FX = {
   stream(t) {
     if (t.fxTimer || this.calm()) return;
     const tick = () => {
-      if (!S.tx.has(t.tid) || !["sending", "receiving"].includes(t.state)) return this.stop(t);
+      if (!S.tx.has(t.tid) || !["sending", "receiving", "finishing"].includes(t.state)) return this.stop(t);
       const peer = this.peerAvatar(t.peer.id), you = this.you();
       this.beam(t);
       if (!peer || !you) return;
