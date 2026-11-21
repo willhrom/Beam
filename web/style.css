@@ -435,3 +435,23 @@ html.away *, html.away *::before, html.away *::after { animation-play-state: pau
     .sheet .card.settings #sheetBody > .actions:last-child { margin-top: auto; }
   }
 }
+
+/* Rows fill their group edge to edge, so hover, press and keyboard focus light up the whole row
+   (corners matching the group) instead of a rectangle inside it. */
+.card .group { padding: 0; overflow: hidden; }
+.card .group > .opt, .card .group > .nav, .card .group > label.opt, .card .group > div.opt { padding-left: 14px; padding-right: 14px; }
+.card .nav { -webkit-tap-highlight-color: transparent; transition: background-color .12s; }
+.card .group > .nav:hover { background: rgba(92, 200, 255, .06); }
+.card .group > .nav:active { background: rgba(92, 200, 255, .12); }
+.card .group > .nav.danger:hover { background: rgba(255, 123, 123, .07); }
+.card .group > .nav.danger:active { background: rgba(255, 123, 123, .13); }
+.card .group > .nav:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; border-radius: 0; }
+.card .group > .nav:first-child:focus-visible { border-top-left-radius: 13px; border-top-right-radius: 13px; }
+.card .group > .nav:last-child:focus-visible { border-bottom-left-radius: 13px; border-bottom-right-radius: 13px; }
+.card .group > .nav:only-child:focus-visible { border-radius: 13px; }
+/* Same for the account row at the top of Settings. */
+button.set-who { -webkit-tap-highlight-color: transparent; transition: background-color .12s, border-color .12s; }
+button.set-who:active { background: rgba(92, 200, 255, .08); }
+button.set-who:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
+.card .group > .opt.field { padding: 8px 14px; }
+.card .group > *:not(.opt):not(.nav) { margin-left: 14px; margin-right: 14px; }
