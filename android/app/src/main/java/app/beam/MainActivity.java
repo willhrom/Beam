@@ -241,7 +241,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       float f = (float) a.getAnimatedValue();
       float phase = (android.os.SystemClock.uptimeMillis() % 1400) / 1400f;
       for (Transfer t : beam.tx.values()) {
-        if (!(Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state))) continue;
+        if (!(Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state) || Transfer.FINISHING.equals(t.state))) continue;
         LinearLayout b = bubbles.get(t.peerId);
         View circle = b != null && b.getChildCount() > 0 ? b.getChildAt(0) : null;
         if (circle != null) {
@@ -358,9 +358,9 @@ public class MainActivity extends Activity implements Beam.Listener {
         cardKeys.put(t.tid, k);
       }
       ProgressBar bar = bars.get(t.tid);
-      if (bar != null && bar.getParent() != null && t.total > 0) bar.setProgress((int) (1000 * t.done / t.total));
+      if (bar != null && bar.getParent() != null && t.total > 0) bar.setProgress((int) (1000 * t.shown() / t.total));
       wantCards.add(c);
-      if (Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state)) anyMoving = true;
+      if (Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state) || Transfer.FINISHING.equals(t.state)) anyMoving = true;
 
       // React to state changes.
       String prev = txSeen.put(t.tid, t.state);
@@ -382,7 +382,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       if (asking && kn == null) { kn = Fx.knock(circle); knocks.put(t.tid, kn); kn.start(); }
       else if (!asking && kn != null) { kn.cancel(); knocks.remove(t.tid); }
       if (prev != null && !prev.equals(t.state)) {
-        if (!(Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state))) {
+        if (!(Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state) || Transfer.FINISHING.equals(t.state))) {
           View[] dots = orbits.remove(t.tid);
           if (dots != null) for (View d : dots) overlay.removeView(d);
         }
@@ -437,7 +437,7 @@ public class MainActivity extends Activity implements Beam.Listener {
       if (Transfer.WAITING.equals(t.state)) return "Waiting…";
       if (Transfer.CONNECTING.equals(t.state)) return "Connecting…";
       if (Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state)) return "Reconnecting…";
-      if (Transfer.SENDING.equals(t.state)) return (t.total > 0 ? (int) (100 * t.done / t.total) : 0) + "%";
+      if (Transfer.SENDING.equals(t.state)) return (t.total > 0 ? (int) (100 * t.shown() / t.total) : 0) + "%";
     }
     return null;
   }
@@ -485,10 +485,10 @@ public class MainActivity extends Activity implements Beam.Listener {
     top.addView(btns);
     c.addView(top);
 
-    if (Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state) || Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state)) {
+    if (Transfer.SENDING.equals(t.state) || Transfer.RECEIVING.equals(t.state) || Transfer.FINISHING.equals(t.state) || Transfer.PAUSED.equals(t.state) || Transfer.RECONNECTING.equals(t.state)) {
       ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
       bar.setMax(1000);
-      bar.setProgress(t.total > 0 ? (int) (1000 * t.done / t.total) : 0);
+      bar.setProgress(t.total > 0 ? (int) (1000 * t.shown() / t.total) : 0);
       bar.setProgressTintList(android.content.res.ColorStateList.valueOf(Ui.ACCENT2));
       c.addView(bar, Ui.margins(this, -1, Ui.dp(this, 8), 0, 8, 0, 0));
       bars.put(t.tid, bar);
@@ -909,14 +909,33 @@ public class MainActivity extends Activity implements Beam.Listener {
     LinearLayout l = page();
     final AlertDialog[] self = new AlertDialog[1];
     l.addView(Ui.text(this, "Your own devices find each other automatically. Pair to send with someone else's device, even when it's not nearby.", 14, Ui.DIM, false), Ui.margins(this, -1, -2, 2, 4, 0, 0));
+    // Old copies left by sign-in trouble or re-pairing: one tap clears them.
+    java.util.List<java.util.List<String>> dup = beam.duplicates();
+    java.util.Set<String> dupAll = new java.util.HashSet<>(dup.get(0));
+    dupAll.addAll(dup.get(1));
+    final int n = dupAll.size();
+    if (n > 0) {
+      LinearLayout dg = group();
+      navRow(dg, "↻", "Remove " + n + " duplicate" + (n == 1 ? "" : "s"), "Old copies left by sign-in trouble or re-pairing", false, v ->
+        Ui.dialog(this).setMessage("Remove " + n + " old cop" + (n == 1 ? "y" : "ies") + "? The devices you use now stay paired and signed in.")
+          .setNegativeButton("Cancel", null)
+          .setPositiveButton("Remove", (dd, w) -> { beam.removeDuplicates(); Toast.makeText(this, "Duplicates removed", Toast.LENGTH_SHORT).show(); self[0].dismiss(); beam.main.postDelayed(this::pairedPage, 400); })
+          .show());
+      l.addView(dg, Ui.margins(this, -1, -2, 0, 12, 0, 0));
+    }
     if (!beam.prefs.paired.isEmpty()) {
       LinearLayout pg = group();
+      java.util.Set<String> on = Beam.onlineIds(beam.peers);
+      java.util.Set<String> mine = new java.util.HashSet<>();
+      for (Beam.Peer p : beam.peers) if (p.mine) mine.add(p.id);
+      for (Beam.Peer p : beam.offlineAll) mine.add(p.id);
       for (Prefs.Paired pd : new ArrayList<>(beam.prefs.paired.values())) {
         LinearLayout r = Ui.row(this);
         r.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout t = Ui.col(this);
         t.addView(Ui.text(this, pd.name, 15, Ui.TEXT, false));
-        t.addView(Ui.text(this, Crypto.shortId(pd.id), 12, Ui.DIM, false));
+        String st = dup.get(0).contains(pd.id) ? "Old copy" : on.contains(pd.id) ? (mine.contains(pd.id) ? "My device, online now" : "Online now") : mine.contains(pd.id) ? "My device" : "Not online now";
+        t.addView(Ui.text(this, st + ", " + Crypto.shortId(pd.id), 12, Ui.DIM, false));
         r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
         r.addView(Ui.button(this, "Remove", 0x22F87171, Ui.BAD, v -> { beam.unpair(pd.id); self[0].dismiss(); pairedPage(); }));
         addRow(pg, r);

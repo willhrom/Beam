@@ -68,6 +68,47 @@ final class Beam {
   List<Peer> peers = new ArrayList<>();
   /** My account's devices that aren't connected right now (shown dimmed, so Beam remembers them). */
   List<Peer> offline = new ArrayList<>();
+  List<Peer> offlineAll = new ArrayList<>();   // every offline device on my account, copies included
+
+  static java.util.Set<String> onlineIds(List<Peer> list) {
+    java.util.Set<String> s = new java.util.HashSet<>();
+    for (Peer p : list) s.add(p.id);
+    return s;
+  }
+
+  /** Leftovers from devices that came back with a new key: older pairings of the same device, and my
+   *  account's offline copies of a device I still have. [0] = pairings to remove, [1] = account copies to forget. */
+  List<List<String>> duplicates() {
+    java.util.Set<String> on = onlineIds(peers);
+    List<String> pairs = new ArrayList<>(), devs = new ArrayList<>();
+    List<Prefs.Paired> all = new ArrayList<>(prefs.paired.values());
+    for (int i = 0; i < all.size(); i++) {
+      Prefs.Paired p = all.get(i);
+      if (on.contains(p.id)) continue;
+      for (int j = 0; j < all.size(); j++) {
+        Prefs.Paired o = all.get(j);
+        if (j != i && Prefs.sameDevice(o.name, o.kind, p.name, p.kind) && (on.contains(o.id) || j > i)) { pairs.add(p.id); break; }
+      }
+    }
+    for (Peer d : offlineAll) {
+      if (prefs.favs.contains(d.id)) continue;
+      boolean dup = false;
+      for (Peer p : peers) if (p.mine && Prefs.sameDevice(p.name, p.kind, d.name, d.kind)) dup = true;
+      for (Peer o : offlineAll) if (o != d && Prefs.sameDevice(o.name, o.kind, d.name, d.kind) && o.seen > d.seen) dup = true;
+      if (dup) devs.add(d.id);
+    }
+    List<List<String>> r = new ArrayList<>();
+    r.add(pairs); r.add(devs);
+    return r;
+  }
+
+  void removeDuplicates() {
+    List<List<String>> d = duplicates();
+    for (String id : d.get(0)) prefs.paired.remove(id);
+    prefs.save();
+    updateServer();
+    for (String id : d.get(1)) forgetDevice(id);
+  }
   JSONArray ice;
   long iceAt;
   boolean online, running;
@@ -247,12 +288,13 @@ final class Beam {
         boolean linked = false;
         for (Peer p : list) {
           if (p.mine && !p.pub.isEmpty() && !prefs.paired.containsKey(p.id)) {
-            prefs.paired.put(p.id, new Prefs.Paired(p.id, p.pub, p.name, p.kind));
+            prefs.addPaired(new Prefs.Paired(p.id, p.pub, p.name, p.kind), onlineIds(list));
             linked = save = true;
           }
         }
         if (save) prefs.save();
         peers = list;
+        offlineAll = away;
         offline = remembered(list, away);
         if (linked) updateServer();
         changed();
@@ -352,7 +394,7 @@ final class Beam {
       }
       case "pair-ok":
         if (pairing == null || pairing.show || pairing.peer == null || !pairing.peer.id.equals(from) || !pairing.peer.pub.equals(d.optString("pub"))) return;
-        prefs.paired.put(from, new Prefs.Paired(from, pairing.peer.pub, trim(d.optString("name", pairing.peer.name)), d.optString("kind", pairing.peer.kind)));
+        prefs.addPaired(new Prefs.Paired(from, pairing.peer.pub, trim(d.optString("name", pairing.peer.name)), d.optString("kind", pairing.peer.kind)), onlineIds(peers));
         prefs.save();
         updateServer();
         pairDone(true, null);
@@ -635,7 +677,7 @@ final class Beam {
     if (p == null || p.peer == null || !p.show) return;
     try {
       if (yes) {
-        prefs.paired.put(p.peer.id, p.peer);
+        prefs.addPaired(p.peer, onlineIds(peers));
         prefs.save();
         signal(p.peer.id, new JSONObject().put("k", "pair-ok").put("pub", me.pub).put("name", prefs.name).put("kind", "android"));
         updateServer();

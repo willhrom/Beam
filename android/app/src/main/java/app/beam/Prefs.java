@@ -30,6 +30,22 @@ final class Prefs {
   String saveTree;       // folder picked for received files (a document tree Uri), or null = Downloads/Beam
   String saveTreeName;   // that folder, in words
   final Map<String, Paired> paired = new LinkedHashMap<>();
+
+  static boolean sameDevice(String n1, String k1, String n2, String k2) {
+    return n1 != null && n2 != null && n1.trim().equalsIgnoreCase(n2.trim()) && String.valueOf(k1).equals(String.valueOf(k2));
+  }
+
+  /** Pair (or re-pair) a device. One that comes back with a new key (reinstall, sign-in trouble) replaces its
+   *  old entry with the same name and kind, unless that one is online right now (two real devices). Newest last. */
+  void addPaired(Paired p, java.util.Set<String> online) {
+    java.util.Iterator<Map.Entry<String, Paired>> it = paired.entrySet().iterator();
+    while (it.hasNext()) {
+      Paired o = it.next().getValue();
+      if (!o.id.equals(p.id) && !online.contains(o.id) && sameDevice(o.name, o.kind, p.name, p.kind)) it.remove();
+    }
+    paired.remove(p.id);
+    paired.put(p.id, p);
+  }
   final List<String[]> recent = new ArrayList<>(); // {id, name, kind}, most recent first
 
   Prefs(Context c) {

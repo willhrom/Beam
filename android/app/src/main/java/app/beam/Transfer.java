@@ -294,6 +294,11 @@ final class Transfer {
         }
         r.sendText("{\"t\":\"done\"}");
         beam.main.post(() -> { if (route == r && SENDING.equals(state)) { state = FINISHING; ui(); } });
+        // Keep the bar moving while the last of it leaves the phone (it's queued, not yet sent).
+        for (int k = 0; k < 600 && route == r && (SENDING.equals(state) || FINISHING.equals(state)) && shown() < done; k++) {
+          try { Thread.sleep(250); } catch (InterruptedException ie) { break; }
+          beam.main.post(() -> beam.transferChanged(this));
+        }
       } catch (Stopped s) {
         // the route went away; routeDropped() takes it from here
       } catch (Exception e) {
@@ -306,6 +311,16 @@ final class Transfer {
   void addDone(long n) {
     done += n;
     progressUi();
+  }
+
+  /** How far it really is: when sending, bytes still queued in the connection haven't left the phone yet. */
+  long shown() {
+    long b = 0;
+    Route r = route;
+    if (!incoming && r instanceof Conn) {
+      try { DataChannel dc = ((Conn) r).dc; if (dc != null) b = dc.bufferedAmount(); } catch (Exception ignored) {}
+    }
+    return Math.max(0, done - b);
   }
 
   static InputStream openAt(ContentResolver cr, Item it, long off) throws IOException {

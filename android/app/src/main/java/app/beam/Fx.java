@@ -126,7 +126,7 @@ final class Fx {
                          at[1] - base[1] + v.getHeight() / 2f };
   }
 
-  /** Sending starts: a little file card arcs up from the bottom of the screen to the device, which catches it. */
+  /** Sending starts: a little file card flies straight up from the bottom of the screen into the device, which catches it. */
   static void launch(FrameLayout overlay, View target, int files, Runnable caught) {
     if (!on() || overlay == null || target == null || !target.isAttachedToWindow()) { if (caught != null) caught.run(); return; }
     Context c = overlay.getContext();
@@ -141,16 +141,17 @@ final class Fx {
     card.setElevation(Ui.dp(c, 8));
     int w = Ui.dp(c, 30), h = Ui.dp(c, 38);
     overlay.addView(card, new FrameLayout.LayoutParams(w, h));
-    float mx = (fx + to[0]) / 2f - Ui.dp(c, 70), my = (fy + to[1]) / 2f;
     ValueAnimator a = ValueAnimator.ofFloat(0, 1);
     a.setDuration(700);
     a.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
     a.addUpdateListener(x -> {
-      float k = (float) x.getAnimatedValue(), u = 1 - k;
-      float px = u * u * fx + 2 * u * k * mx + k * k * to[0], py = u * u * fy + 2 * u * k * my + k * k * to[1];
+      float k = (float) x.getAnimatedValue();
+      // Follow the device circle where it is now (the grid can shift while it flies).
+      float[] now = target.isAttachedToWindow() ? centerIn(overlay, target) : to;
+      float px = fx + (now[0] - fx) * k, py = fy + (now[1] - fy) * k;
       card.setX(px - w / 2f);
       card.setY(py - h / 2f);
-      card.setRotation(-25 + k * 385);
+      card.setRotation(-12 + k * 24);
       float sc = 0.6f + (float) Math.sin(k * Math.PI) * 0.6f - k * 0.3f;
       card.setScaleX(sc);
       card.setScaleY(sc);
