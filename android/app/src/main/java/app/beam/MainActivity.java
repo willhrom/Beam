@@ -791,7 +791,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     whoTxt.addView(Ui.text(this, beam.account == null ? "Not signed in" : beam.account.optString("name"), 15, Ui.TEXT, true));
     if (beam.account != null) whoTxt.addView(Ui.text(this, "Signed in as " + beam.account.optString("username"), 12, Ui.DIM, false));
     who.addView(whoTxt, new LinearLayout.LayoutParams(0, -2, 1));
-    who.addView(Ui.text(this, "›", 22, Ui.DIM, false));
+    who.addView(Ui.chevron(this));
     who.setOnClickListener(v -> { self[0].dismiss(); accountPage(); });
     l.addView(who, Ui.margins(this, -1, -2, 0, 4, 0, 0));
 
@@ -807,34 +807,35 @@ public class MainActivity extends Activity implements Beam.Listener {
     name.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
     LinearLayout nameRow = Ui.row(this);
     nameRow.setGravity(Gravity.CENTER_VERTICAL);
+    nameRow.addView(Ui.iconTile(this, "name", false), Ui.margins(this, Ui.dp(this, 34), Ui.dp(this, 34), 0, 0, 14, 0));
     nameRow.addView(Ui.text(this, "Name", 15, Ui.TEXT, false));
     nameRow.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
     addRow(dev, nameRow);
-    Switch nb = switchRow(dev, "Visible to everyone nearby", "Off: only your own and paired devices see it", beam.prefs.nearby);
+    Switch nb = switchRow(dev, "eye", "Visible to everyone nearby", "Off: only your own and paired devices see it", beam.prefs.nearby);
     nb.setOnCheckedChangeListener((v, on) -> { beam.prefs.nearby = on; beam.prefs.save(); beam.updateServer(); });
-    Switch on = switchRow(dev, "Stay reachable when Beam is closed", "Beam always works while it's open", beam.prefs.enabled);
+    Switch on = switchRow(dev, "radio", "Stay reachable when Beam is closed", "Beam always works while it's open", beam.prefs.enabled);
     on.setOnCheckedChangeListener((v, isOn) -> {
       beam.prefs.enabled = isOn;
       beam.prefs.save();
       if (isOn) BeamService.start(this); else BeamService.stop(this);
     });
-    navRow(dev, "↓", "Receiving", receivingSummary(), false, v -> { self[0].dismiss(); receivingPage(); });
+    navRow(dev, "receive", "Receiving", receivingSummary(), false, v -> { self[0].dismiss(); receivingPage(); });
     int pairedN = beam.prefs.paired.size();
-    navRow(dev, "↔", "Paired devices", pairedN > 0 ? pairedN + " paired" : "Send with someone else's device", false, v -> { self[0].dismiss(); pairedPage(); });
+    navRow(dev, "pair", "Paired devices", pairedN > 0 ? pairedN + " paired" : "Send with someone else's device", false, v -> { self[0].dismiss(); pairedPage(); });
     l.addView(dev);
 
     // Help
     l.addView(label("Help"));
     LinearLayout help = group();
-    navRow(help, "↺", "Transfer history", "What this phone sent and received", false, v -> { self[0].dismiss(); showHistory(); });
-    navRow(help, "≈", "Test connection", "Server, relay and your devices", false, v -> { self[0].dismiss(); new ConnTest(this, beam).show(); });
+    navRow(help, "history", "Transfer history", "What this phone sent and received", false, v -> { self[0].dismiss(); showHistory(); });
+    navRow(help, "test", "Test connection", "Server, relay and your devices", false, v -> { self[0].dismiss(); new ConnTest(this, beam).show(); });
     boolean newer = Updater.available != null && Updater.available.version > Updater.current();
-    navRow(help, "↻", newer ? "Install version 1.0." + Updater.available.version : "Check for updates", "Version 1.0." + Updater.current(), false, v -> {
+    navRow(help, "update", newer ? "Install version 1.0." + Updater.available.version : "Check for updates", "Version 1.0." + Updater.current(), false, v -> {
       if (Updater.available != null && Updater.available.version > Updater.current()) { self[0].dismiss(); startActivity(new Intent(this, UpdateActivity.class)); }
       else Updater.check(beam, true);
     });
     PowerManager pm = getSystemService(PowerManager.class);
-    if (!pm.isIgnoringBatteryOptimizations(getPackageName())) navRow(help, "◑", "Allow background use", "So Android doesn't put Beam to sleep", false, v -> openBatterySetting());
+    if (!pm.isIgnoringBatteryOptimizations(getPackageName())) navRow(help, "battery", "Allow background use", "So Android doesn't put Beam to sleep", false, v -> openBatterySetting());
     l.addView(help);
     l.addView(Ui.text(this, "Device code " + Crypto.shortId(beam.me.id), 12, Ui.DIM, false), Ui.margins(this, -1, -2, 2, 8, 0, 0));
 
@@ -916,7 +917,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     final int n = dupAll.size();
     if (n > 0) {
       LinearLayout dg = group();
-      navRow(dg, "↻", "Remove " + n + " duplicate" + (n == 1 ? "" : "s"), "Old copies left by sign-in trouble or re-pairing", false, v ->
+      navRow(dg, "sync", "Remove " + n + " duplicate" + (n == 1 ? "" : "s"), "Old copies left by sign-in trouble or re-pairing", false, v ->
         Ui.dialog(this).setMessage("Remove " + n + " old cop" + (n == 1 ? "y" : "ies") + "? The devices you use now stay paired and signed in.")
           .setNegativeButton("Cancel", null)
           .setPositiveButton("Remove", (dd, w) -> { beam.removeDuplicates(); Toast.makeText(this, "Duplicates removed", Toast.LENGTH_SHORT).show(); self[0].dismiss(); beam.main.postDelayed(this::pairedPage, 400); })
@@ -944,8 +945,8 @@ public class MainActivity extends Activity implements Beam.Listener {
     }
     l.addView(label("Pair a device"));
     LinearLayout how = group();
-    navRow(how, "#", "Show a pairing code", "On this phone, for someone else to enter", false, v -> { self[0].dismiss(); beam.pairShow(); });
-    navRow(how, "123", "Enter a pairing code", "From someone else's device", false, v -> { self[0].dismiss(); beam.pairJoin(); });
+    navRow(how, "qr", "Show a pairing code", "On this phone, for someone else to enter", false, v -> { self[0].dismiss(); beam.pairShow(); });
+    navRow(how, "keys", "Enter a pairing code", "From someone else's device", false, v -> { self[0].dismiss(); beam.pairJoin(); });
     l.addView(how);
     self[0] = showPage("Paired devices", l, this::showSettings);
   }
@@ -958,11 +959,11 @@ public class MainActivity extends Activity implements Beam.Listener {
     me.addView(Ui.text(this, beam.account == null ? "Not signed in" : beam.account.optString("name"), 15, Ui.TEXT, true));
     if (beam.account != null) me.addView(Ui.text(this, "Username " + beam.account.optString("username") + (beam.account.optBoolean("admin") ? ". You manage this Beam" : ""), 12, Ui.DIM, false));
     addRow(acc, me);
-    if (beam.account != null && beam.account.optBoolean("admin")) navRow(acc, "@", "Manage people", "Opens in your browser", false, v -> open(Uri.parse(Beam.SERVER), null));
-    navRow(acc, "•••", "Change PIN", null, false, v -> { self[0].dismiss(); showChangePin(); });
+    if (beam.account != null && beam.account.optBoolean("admin")) navRow(acc, "people", "Manage people", "Opens in your browser", false, v -> open(Uri.parse(Beam.SERVER), null));
+    navRow(acc, "pin", "Change PIN", null, false, v -> { self[0].dismiss(); showChangePin(); });
     l.addView(acc);
     LinearLayout out = group();
-    navRow(out, "→", "Sign out of this phone", null, true, v -> Ui.dialog(this).setMessage("Sign out of Beam on this phone?")
+    navRow(out, "out", "Sign out of this phone", null, true, v -> Ui.dialog(this).setMessage("Sign out of Beam on this phone?")
         .setPositiveButton("Sign out", (d, w) -> { self[0].dismiss(); beam.logout(); }).setNegativeButton("Cancel", null).show());
     l.addView(out, Ui.margins(this, -1, -2, 0, 12, 0, 0));
     self[0] = showPage("Account", l, this::showSettings);
@@ -1259,9 +1260,12 @@ public class MainActivity extends Activity implements Beam.Listener {
     g.addView(row, Ui.lp(-1, -2));
   }
 
-  private Switch switchRow(LinearLayout g, String title, String sub, boolean on) {
+  private Switch switchRow(LinearLayout g, String title, String sub, boolean on) { return switchRow(g, null, title, sub, on); }
+
+  private Switch switchRow(LinearLayout g, String icon, String title, String sub, boolean on) {
     LinearLayout r = Ui.row(this);
     r.setGravity(Gravity.CENTER_VERTICAL);
+    if (icon != null) r.addView(Ui.iconTile(this, icon, false), Ui.margins(this, Ui.dp(this, 34), Ui.dp(this, 34), 0, 0, 14, 0));
     LinearLayout t = Ui.col(this);
     t.addView(Ui.text(this, title, 15, Ui.TEXT, false));
     if (sub != null) t.addView(Ui.text(this, sub, 12, Ui.DIM, false));
@@ -1279,17 +1283,12 @@ public class MainActivity extends Activity implements Beam.Listener {
   private void navRow(LinearLayout g, String icon, String title, String sub, boolean danger, View.OnClickListener click) {
     LinearLayout r = Ui.row(this);
     r.setGravity(Gravity.CENTER_VERTICAL);
-    if (icon != null) {
-      TextView ic = Ui.text(this, icon, 15, danger ? Ui.BAD : Ui.ACCENT2, true);
-      ic.setGravity(Gravity.CENTER);
-      ic.setBackground(Ui.round(danger ? 0x1AFF7B7B : 0x1A5CC8FF, Ui.dp(this, 9)));
-      r.addView(ic, Ui.margins(this, Ui.dp(this, 30), Ui.dp(this, 30), 0, 0, 12, 0));
-    }
+    if (icon != null) r.addView(Ui.iconTile(this, icon, danger), Ui.margins(this, Ui.dp(this, 34), Ui.dp(this, 34), 0, 0, 14, 0));
     LinearLayout t = Ui.col(this);
     t.addView(Ui.text(this, title, 15, danger ? Ui.BAD : Ui.TEXT, false));
     if (sub != null) t.addView(Ui.text(this, sub, 12, Ui.DIM, false));
     r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
-    if (!danger) r.addView(Ui.text(this, "›", 22, Ui.DIM, false));
+    if (!danger) r.addView(Ui.chevron(this));
     android.util.TypedValue tv = new android.util.TypedValue();
     getTheme().resolveAttribute(android.R.attr.selectableItemBackground, tv, true);
     r.setForeground(getDrawable(tv.resourceId));

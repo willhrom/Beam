@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Beam's line icon "keys" (the same drawing as the Mac/Windows/web app). Tinted in code. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+  <path android:pathData="M6 5.5h0.01M12 5.5h0.01M18 5.5h0.01M6 11.5h0.01M12 11.5h0.01M18 11.5h0.01M6 17.5h0.01M12 17.5h0.01M18 17.5h0.01" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="2.8" android:strokeLineCap="round" android:strokeLineJoin="round"/>
+</vector>

@@ -75,6 +75,29 @@ final class Ui {
     s.setSwitchPadding(dp(c, 12));
   }
 
+  /** The ">" at the end of a row that opens a page. */
+  static View chevron(Context c) {
+    android.widget.ImageView iv = new android.widget.ImageView(c);
+    iv.setImageResource(c.getResources().getIdentifier("ic_chev", "drawable", c.getPackageName()));
+    iv.setImageTintList(android.content.res.ColorStateList.valueOf(DIM));
+    iv.setLayoutParams(new LinearLayout.LayoutParams(dp(c, 18), dp(c, 18)));
+    return iv;
+  }
+
+  /** A row icon: Beam's line drawing, centered in a softly tinted rounded tile. */
+  static View iconTile(Context c, String key, boolean danger) {
+    android.widget.FrameLayout tile = new android.widget.FrameLayout(c);
+    tile.setBackground(round(danger ? 0x1AFF7B7B : 0x1A5CC8FF, dp(c, 10)));
+    android.widget.ImageView iv = new android.widget.ImageView(c);
+    int res = c.getResources().getIdentifier("ic_" + key, "drawable", c.getPackageName());
+    if (res != 0) iv.setImageResource(res);
+    iv.setImageTintList(android.content.res.ColorStateList.valueOf(danger ? BAD : ACCENT2));
+    iv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+    android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(dp(c, 20), dp(c, 20), Gravity.CENTER);
+    tile.addView(iv, lp);
+    return tile;
+  }
+
   static GradientDrawable round(int color, float radiusPx) {
     GradientDrawable g = new GradientDrawable();
     g.setColor(color);
