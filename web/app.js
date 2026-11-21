@@ -183,6 +183,35 @@ const S = {
   pairing: null,
 };
 const savePaired = () => store.set("paired", S.paired);
+const sameDevice = (a, b) => a && b && String(a.name || "").trim().toLowerCase() === String(b.name || "").trim().toLowerCase() && (a.kind || "") === (b.kind || "");
+// Pair (or re-pair) a device. A re-pair after a reinstall or sign-in trouble comes with a new device
+// key, so the old entry with the same name and kind is replaced instead of piling up.
+function addPaired(id, entry) {
+  for (const [oid, o] of Object.entries(S.paired)) if (oid !== id && sameDevice(o, entry)) delete S.paired[oid];
+  S.paired[id] = { ...entry, at: Date.now() };
+}
+// Leftovers from devices that came back with a new key: older pairings of the same device, pairings
+// with my own devices (they don't need one), and my account's offline copies of a device I still have.
+function duplicates() {
+  const online = new Map(S.peers.map((p) => [p.id, p]));
+  const mine = new Set(S.peers.concat(S.offline || [], S.offlineAll || []).filter((p) => p.mine !== false && (p.mine || p.offline)).map((p) => p.id));
+  const pairs = [];
+  const entries = Object.entries(S.paired);
+  for (const [id, p] of entries) {
+    if (mine.has(id)) { pairs.push(id); continue; }
+    const twins = entries.filter(([oid, o]) => oid !== id && sameDevice(o, p));
+    if (!twins.length) continue;
+    const score = ([oid, o], i) => (online.has(oid) ? 1e15 : 0) + (o.at || 0) + i;   // online now, then newest
+    const ranked = entries.map((e, i) => [e, score(e, i)]).filter(([[oid, o]]) => oid === id || sameDevice(o, p)).sort((a, b) => b[1] - a[1]);
+    if (ranked[0][0][0] !== id) pairs.push(id);
+  }
+  const all = (S.offlineAll || []).filter((d) => d.id !== Id.id);
+  const devices = all.filter((d) => {
+    if (isFav(d.id)) return false;
+    return S.peers.some((p) => p.mine && sameDevice(p, d)) || all.some((o) => o.id !== d.id && sameDevice(o, d) && (o.seen || 0) > (d.seen || 0));
+  }).map((d) => d.id);
+  return { pairs: [...new Set(pairs)], devices };
+}
 
 // ---------- server connection ----------
 let ws, wsTimer, backoff = 1000;
@@ -285,7 +314,8 @@ async function onServer(m) {
     case "peers":
       // Devices you can send to now, and (separately) your account's devices that are offline.
       S.peers = (m.peers || []).filter((p) => !p.offline);
-      S.offline = rememberedDevices(S.peers, (m.peers || []).filter((p) => p.offline));
+      S.offlineAll = (m.peers || []).filter((p) => p.offline);
+      S.offline = rememberedDevices(S.peers, S.offlineAll);
       autoPairMine();
       if (S.pickOpen && S.pickRefresh) S.pickRefresh();
       // keep paired names fresh
@@ -397,7 +427,7 @@ async function onSignal(from, d) {
   if (d.k === "pair-ok") {
     const p = S.pairing && S.pairing.peer;
     if (!p || S.pairing.mode !== "join" || p.id !== from || d.pub !== p.pub) return;
-    S.paired[from] = { pub: p.pub, name: String(d.name || p.name).slice(0, 40), kind: d.kind || p.kind };
+    addPaired(from, { pub: p.pub, name: String(d.name || p.name).slice(0, 40), kind: d.kind || p.kind });
     savePaired();
     updateServer();
     return pairDone(true);
@@ -2324,9 +2354,13 @@ function receivingPage() {
 
 function pairedPage() {
   const paired = Object.entries(S.paired);
+  const dup = duplicates(), n = new Set([...dup.pairs, ...dup.devices]).size;
+  const mineIds = new Set(S.peers.filter((p) => p.mine).map((p) => p.id).concat((S.offlineAll || []).map((p) => p.id)));
+  const status = (id) => mineIds.has(id) ? "My device, doesn't need pairing" : S.peers.some((p) => p.id === id) ? "Online now" : dup.pairs.includes(id) ? "Old copy" : "Not online now";
   settingsPage("Paired devices", `
     <p>Your own devices find each other automatically. Pair to send with someone else's device, even when it's not nearby.</p>
-    ${paired.length ? `<div class="group">${paired.map(([id, p]) => `<div class="opt"><span>${esc(p.name)}<small>${shortId(id)}</small></span><button class="btn danger small" data-unpair="${id}">Remove</button></div>`).join("")}</div>` : ""}
+    ${n ? `<div class="group"><button class="nav" id="dedupe"><i class="ico">${SET_ICONS.sync}</i><span>Remove ${n} duplicate${n === 1 ? "" : "s"}<small>Old copies left by sign-in trouble or re-pairing</small></span>${CHEV}</button></div>` : ""}
+    ${paired.length ? `<div class="group">${paired.map(([id, p]) => `<div class="opt"><span>${esc(p.name)}<small>${status(id)}, ${shortId(id)}</small></span><button class="btn danger small" data-unpair="${id}">Remove</button></div>`).join("")}</div>` : ""}
     <h3>Pair a device</h3>
     <div class="group">
       ${navRow("pShow", "qr", "Show a pairing code", "On this device, for someone else to enter")}
@@ -2335,6 +2369,16 @@ function pairedPage() {
   () => {
     $("#pShow").onclick = () => { S.pairing = { mode: "show" }; wsSend({ t: "pair-code" }); sheetOnClose = null; showPairShow(); };
     $("#pJoin").onclick = () => { S.pairing = { mode: "join" }; sheetOnClose = null; showPairJoin(); };
+    if ($("#dedupe")) $("#dedupe").onclick = () => {
+      if (!confirm(`Remove ${n} old cop${n === 1 ? "y" : "ies"}? The devices you use now stay paired and signed in.`)) return;
+      for (const id of dup.pairs) delete S.paired[id];
+      savePaired();
+      updateServer();
+      for (const id of dup.devices) wsSend({ t: "forget-device", id });
+      toast("Duplicates removed");
+      sheetOnClose = null;
+      setTimeout(pairedPage, 400);
+    };
     document.querySelectorAll("[data-unpair]").forEach((b) => (b.onclick = () => {
       delete S.paired[b.dataset.unpair];
       savePaired();
@@ -2468,7 +2512,7 @@ function showPairConfirm() {
     <div class="actions"><button class="btn ghost" id="no">Doesn't match</button><button class="btn primary" id="yes">Pair</button></div>`, () => { S.pairing = null; });
   $("#no").onclick = () => { wsSend({ t: "signal", to: p.peer.id, data: { k: "pair-no" } }); closeSheet(); };
   $("#yes").onclick = () => {
-    S.paired[p.peer.id] = { pub: p.peer.pub, name: p.peer.name, kind: p.peer.kind };
+    addPaired(p.peer.id, { pub: p.peer.pub, name: p.peer.name, kind: p.peer.kind });
     savePaired();
     wsSend({ t: "signal", to: p.peer.id, data: { k: "pair-ok", pub: Id.pub, name: S.name, kind } });
     updateServer();
@@ -2490,7 +2534,7 @@ function autoPairMine() {
   for (const p of S.peers) {
     if (!p.mine || !p.pub) continue;
     if (S.paired[p.id]) continue; // never overwrite a key we already trust
-    S.paired[p.id] = { pub: p.pub, name: p.name, kind: p.kind };
+    addPaired(p.id, { pub: p.pub, name: p.name, kind: p.kind });
     changed = true;
   }
   if (changed) { savePaired(); updateServer(); }
