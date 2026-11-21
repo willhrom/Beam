@@ -576,6 +576,24 @@ export class Hub extends DurableObject {
       return this.refreshAccount(a.user);
     }
 
+    // The Mac and Windows apps move a device to a login key the app keeps on disk: the old key (this
+    // signed-in connection) vouches for the new one, which proves it's held by signing this request.
+    if (m.t === "rekey") {
+      if (typeof m.pub !== "string" || m.pub.length > 300 || typeof m.sig !== "string" || m.sig.length > 200) return;
+      const pub = b64d(m.pub);
+      if (!(await verify(pub, b64d(m.sig), "beam-rekey:" + a.id + ":" + m.pub))) return;
+      const nid = await idFromPub(pub);
+      if (nid === a.id) return send(ws, { t: "rekey-ok" });
+      const taken = await this.ctx.storage.get("dev:" + nid);
+      if (taken && taken.user !== a.user) return;
+      const dev = await this.ctx.storage.get("dev:" + a.id);
+      if (!dev) return;
+      await this.putDev(nid, { ...dev, seen: Date.now() });
+      await this.delDev(a.id);
+      send(ws, { t: "rekey-ok" });
+      return this.refreshAccount(a.user);
+    }
+
     if (m.t === "pin-change") {
       const key = "user:" + a.user;
       const rec = await this.ctx.storage.get(key);

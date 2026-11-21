@@ -799,10 +799,20 @@ final class SyncFolders {
 enum MasterKey {
   static var cached: Data?
 
-  static var file: URL {
+  static var dir: URL {
     let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Beam", isDirectory: true)
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-    return dir.appendingPathComponent("webcrypto.key")
+    return dir
+  }
+  static var file: URL { dir.appendingPathComponent("webcrypto.key") }
+
+  /// Writes a file in Beam's folder that only this Mac user can read.
+  static func writePrivate(_ data: Data, name: String) {
+    let url = dir.appendingPathComponent(name)
+    do {
+      try data.write(to: url, options: .atomic)
+      try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    } catch { NSLog("Beam: couldn't save \(name): \(error)") }
   }
 
   static func get() -> Data? {
@@ -1227,6 +1237,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         let u = URL(fileURLWithPath: p).standardizedFileURL
         if savedPaths.contains(u.path) || u.path.hasPrefix(downloadsDir().path + "/") || u.path.hasPrefix(saveRoot().path + "/") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
       }
+    case "getBoot":
+      // This Mac's login key and the page's settings copy, kept in Beam's own folder (only this Mac user can read them).
+      let idStr = (try? String(contentsOf: MasterKey.dir.appendingPathComponent("identity.jwk"), encoding: .utf8)) ?? ""
+      let kvStr = (try? String(contentsOf: MasterKey.dir.appendingPathComponent("settings.json"), encoding: .utf8)) ?? ""
+      let idJs = idStr.isEmpty ? "null" : q(idStr), kvJs = kvStr.isEmpty ? "null" : q(kvStr)
+      js("beamNative.boot({identity: \(idJs), kv: \(kvJs)})")
+    case "saveIdentity", "saveKv":
+      let isId = op == "saveIdentity"
+      let text = (isId ? d["jwk"] : d["kv"]) as? String ?? ""
+      guard !text.isEmpty, text.utf8.count < 512 * 1024, (try? JSONSerialization.jsonObject(with: Data(text.utf8))) != nil else { break }
+      MasterKey.writePrivate(Data(text.utf8), name: isId ? "identity.jwk" : "settings.json")
     case "getSyncs":
       syncer.report()
     case "syncStart":

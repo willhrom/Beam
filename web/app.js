@@ -38,8 +38,32 @@ const shownDone = (t) => Math.max(0, t.done - (t.dir === "out" && t.dc && t.dc.r
 const relPathOf = (f) => (f.beamPath !== undefined ? f.beamPath : f.webkitRelativePath || "").split("/").slice(0, -1).join("/");
 const store = {
   get: (k, d) => { try { const v = localStorage.getItem("beam." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
-  set: (k, v) => { try { localStorage.setItem("beam." + k, JSON.stringify(v)); } catch {} },
+  set: (k, v) => { try { localStorage.setItem("beam." + k, JSON.stringify(v)); backupSettings(); } catch {} },
 };
+// The Mac and Windows apps keep a copy of these settings (name, pairings, pinned devices…) in their
+// own folder, so a cleared web storage can't reset them. History stays here; it's only a log.
+let backupTimer = 0;
+function backupSettings() {
+  if (!native || GUEST) return;
+  clearTimeout(backupTimer);
+  backupTimer = setTimeout(() => {
+    const kv = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("beam.") && k !== "beam.history" && k !== "beam.guestName") kv[k] = localStorage.getItem(k);
+    }
+    native.postMessage({ op: "saveKv", kv: JSON.stringify(kv) });
+  }, 800);
+}
+// Ask the app for what it kept: this device's login key and the settings copy.
+function nativeBoot() {
+  return new Promise((res) => {
+    if (!native || GUEST) return res(null);
+    const timer = setTimeout(() => res(null), 3000);   // an older app that doesn't know: carry on as before
+    window.__beamBoot = (d) => { clearTimeout(timer); window.__beamBoot = null; res(d || {}); };
+    native.postMessage({ op: "getBoot" });
+  });
+}
 
 function guessKind() {
   if (nativeKind) return nativeKind;
@@ -74,9 +98,31 @@ async function idbSet(k, v) {
   return new Promise((res, rej) => { const t = db.transaction("kv", "readwrite"); t.objectStore("kv").put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); });
 }
 
+const EC = { name: "ECDSA", namedCurve: "P-256" };
 const Id = {
-  keys: null, pub: "", id: "",
-  async load() {
+  keys: null, pub: "", id: "", pending: null,
+  async use(k) { this.keys = k; this.pub = k.pub; this.id = await idFromPub(k.pub); },
+  async load(boot) {
+    // In the Mac and Windows apps the login key lives with the app (it survives restarts, updates and
+    // cleared web storage). The page only ever holds a copy it can sign with.
+    if (boot) {
+      if (boot.identity) {
+        try {
+          const j = JSON.parse(boot.identity);
+          const priv = await crypto.subtle.importKey("jwk", j, EC, false, ["sign"]);
+          const pubKey = await crypto.subtle.importKey("jwk", { kty: "EC", crv: "P-256", x: j.x, y: j.y, ext: true }, EC, true, ["verify"]);
+          return this.use({ priv, pub: b64(await crypto.subtle.exportKey("spki", pubKey)) });
+        } catch (e) { console.warn("saved login key unreadable", e); }
+      }
+      const kp = await crypto.subtle.generateKey(EC, true, ["sign", "verify"]);
+      const jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+      const fresh = { priv: await crypto.subtle.importKey("jwk", jwk, EC, false, ["sign"]), pub: b64(await crypto.subtle.exportKey("spki", kp.publicKey)), jwk };
+      const old = await idbGet("identity");
+      // Already set up here with the old kind of key: keep using it until the account has moved to the new one.
+      if (old && old.priv) { this.pending = fresh; return this.use(old); }
+      native.postMessage({ op: "saveIdentity", jwk: JSON.stringify(jwk) });
+      return this.use(fresh);
+    }
     let k = await idbGet("identity");
     if (!k) {
       const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
@@ -87,8 +133,17 @@ const Id = {
     this.pub = k.pub;
     this.id = await idFromPub(k.pub);
   },
-  async sign(text) {
-    return b64(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, this.keys.priv, enc.encode(text)));
+  async sign(text, keys = this.keys) {
+    return b64(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keys.priv, enc.encode(text)));
+  },
+  // Switch to the app-kept key (after the server moved this device's sign-in to it).
+  async adopt() {
+    const k = this.pending;
+    if (!k) return;
+    native.postMessage({ op: "saveIdentity", jwk: JSON.stringify(k.jwk) });
+    try { await idbSet("identity", null); } catch {}
+    this.pending = null;
+    await this.use({ priv: k.priv, pub: k.pub });
   },
 };
 async function idFromPub(pubB64) { return hex(await sha256(unb64(pubB64))).slice(0, 32); }
@@ -158,6 +213,12 @@ window.addEventListener("online", () => { backoff = 1000; connect(); });
 
 async function onServer(m) {
   switch (m.t) {
+    case "rekey-ok":
+      // The server moved this device's sign-in to the new key: reconnect with it.
+      await Id.adopt();
+      backoff = 1000;
+      try { ws.close(); } catch {}
+      break;
     case "challenge":
       // Beam was updated on the server: reload to pick up the new version (once nothing is moving).
       if (m.v) {
@@ -169,6 +230,11 @@ async function onServer(m) {
       break;
     case "welcome":
       if (m.id !== Id.id) console.warn("server id mismatch");
+      // Moving to the app-kept login key: signed in, so ask the server to move the sign-in over; otherwise just switch.
+      if (Id.pending && !m.guest) {
+        if (m.login) { await Id.adopt(); try { ws.close(); } catch {} return; }
+        wsSend({ t: "rekey", pub: Id.pending.pub, sig: await Id.sign("beam-rekey:" + Id.id + ":" + Id.pending.pub, Id.pending) });
+      }
       if (m.guest) {
         S.guest = m.guest;
         S.user = null;
@@ -1261,6 +1327,7 @@ function notify(tag, title, body, actions) {
   }
 }
 window.beamNative = {
+  boot(d) { if (window.__beamBoot) window.__beamBoot(d); },
   // Drop folders: the app's list changed, or it has new files to send (Mac passes file refs).
   dropFolders(list) { S.dropFolders = Array.isArray(list) ? list : []; if (!$("#sheet").hidden && $("#dadd")) dropFoldersSheet(); if (!$("#sheet").hidden && $("#drops")) { const sm = $("#dropsSub"); if (sm) sm.textContent = dropSummary(); } },
   dropSend(list, to, batch, folder) { dropSend((list || []).map(macFile), to, batch, folder); },
@@ -2580,7 +2647,15 @@ function showInvite(m) {
     $("#empty").textContent = "This browser can't run Beam (needs HTTPS and WebRTC).";
     return;
   }
-  await Id.load();
+  const boot = await nativeBoot();
+  if (boot && boot.kv) {
+    // Web storage was cleared: put back the settings the app kept, then start over with them.
+    let back = 0;
+    try { for (const [k, v] of Object.entries(JSON.parse(boot.kv))) if (k.startsWith("beam.") && localStorage.getItem(k) === null && typeof v === "string") { localStorage.setItem(k, v); back++; } } catch {}
+    if (back && !sessionStorage.getItem("beam.restored")) { sessionStorage.setItem("beam.restored", "1"); location.reload(); return; }
+  }
+  if (boot && !boot.kv) backupSettings();
+  await Id.load(boot);
   // Drop files anywhere on the main screen to choose who gets them.
   const stage = document.querySelector(".stage");
   stage.ondragover = (e) => { if (!e.target.closest(".peer")) { e.preventDefault(); stage.classList.add("drop"); } };

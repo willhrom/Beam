@@ -34,5 +34,9 @@
     </dict>
   </array>
   <key>NSDownloadsFolderUsageDescription</key><string>Beam saves files you receive to your Downloads folder.</string>
+  <key>NSDesktopFolderUsageDescription</key><string>Beam reads and saves files in folders you choose on your Desktop (drop folders, synced folders and where received files go).</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>Beam reads and saves files in folders you choose in Documents (drop folders, synced folders and where received files go).</string>
+  <key>NSRemovableVolumesUsageDescription</key><string>Beam reads and saves files in folders you choose on external drives.</string>
+  <key>NSNetworkVolumesUsageDescription</key><string>Beam reads and saves files in folders you choose on network drives.</string>
 </dict>
 </plist>

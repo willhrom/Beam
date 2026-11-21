@@ -630,6 +630,33 @@ namespace Beam
                 case "setConvert":
                     Converter.Enabled = d.TryGetProperty("on", out var cv) && cv.ValueKind == JsonValueKind.True;
                     break;
+                case "getBoot":
+                {
+                    // This PC's login key and the page's settings copy, kept in Beam's folder under the user's
+                    // profile. The key is also locked to this Windows user (DPAPI).
+                    string ReadBeamFile(string fileName) { try { var bf = Path.Combine(BeamDir, fileName); return File.Exists(bf) ? File.ReadAllText(bf) : ""; } catch { return ""; } }
+                    var idStr = Unprotect(ReadBeamFile("identity.dat"));
+                    var kvStr = ReadBeamFile("settings.json");
+                    Js($"beamNative.boot({{identity: {(idStr.Length == 0 ? "null" : Q(idStr))}, kv: {(kvStr.Length == 0 ? "null" : Q(kvStr))}}})");
+                    break;
+                }
+                case "saveIdentity":
+                case "saveKv":
+                {
+                    bool isId = Str("op") == "saveIdentity";
+                    var text = Str(isId ? "jwk" : "kv") ?? "";
+                    if (text.Length == 0 || text.Length > 512 * 1024) break;
+                    try { using var _ = JsonDocument.Parse(text); } catch { break; }
+                    try
+                    {
+                        Directory.CreateDirectory(BeamDir);
+                        var bfile = Path.Combine(BeamDir, isId ? "identity.dat" : "settings.json");
+                        File.WriteAllText(bfile + ".tmp", isId ? Protect(text) : text);
+                        File.Move(bfile + ".tmp", bfile, true);
+                    }
+                    catch { }
+                    break;
+                }
                 case "getSyncs":
                     syncer.DoReport();
                     break;
@@ -946,6 +973,40 @@ namespace Beam
             }
             catch { try { File.Delete(temp); } catch { } }
             return ss.final;
+        }
+
+        static string BeamDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Beam");
+
+        // DPAPI: only this Windows user on this PC can unlock it.
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct DataBlob { public int cbData; public IntPtr pbData; }
+        [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CryptProtectData(ref DataBlob dataIn, string desc, IntPtr entropy, IntPtr reserved, IntPtr prompt, int flags, ref DataBlob dataOut);
+        [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CryptUnprotectData(ref DataBlob dataIn, IntPtr desc, IntPtr entropy, IntPtr reserved, IntPtr prompt, int flags, ref DataBlob dataOut);
+        [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+
+        static byte[] Dpapi(byte[] input, bool protect)
+        {
+            var inB = new DataBlob { cbData = input.Length, pbData = Marshal.AllocHGlobal(Math.Max(1, input.Length)) };
+            var outB = new DataBlob();
+            try
+            {
+                Marshal.Copy(input, 0, inB.pbData, input.Length);
+                bool ok = protect ? CryptProtectData(ref inB, "Beam", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 1, ref outB)
+                                  : CryptUnprotectData(ref inB, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 1, ref outB);
+                if (!ok) return null;
+                var r = new byte[outB.cbData];
+                Marshal.Copy(outB.pbData, r, 0, outB.cbData);
+                return r;
+            }
+            finally { Marshal.FreeHGlobal(inB.pbData); if (outB.pbData != IntPtr.Zero) LocalFree(outB.pbData); }
+        }
+        static string Protect(string s) { var b = Dpapi(Encoding.UTF8.GetBytes(s), true); return b == null ? "" : Convert.ToBase64String(b); }
+        static string Unprotect(string s)
+        {
+            try { if (s.Length == 0) return ""; var b = Dpapi(Convert.FromBase64String(s.Trim()), false); return b == null ? "" : Encoding.UTF8.GetString(b); }
+            catch { return ""; }
         }
 
         void AbortSave(string id)
