@@ -455,3 +455,23 @@ button.set-who:active { background: rgba(92, 200, 255, .08); }
 button.set-who:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
 .card .group > .opt.field { padding: 8px 14px; }
 .card .group > *:not(.opt):not(.nav) { margin-left: 14px; margin-right: 14px; }
+
+/* ---------- switches ----------
+   A roomier pill: dark inset track when off; Beam's blue gradient when on, with a soft glow. The white
+   knob has a shadow, stretches a little while pressed and springs across. Keyboard focus gets a ring. */
+.toggle { appearance: none; -webkit-appearance: none; width: 48px; height: 28px; border-radius: 14px; flex: none; cursor: pointer; position: relative; margin: 0;
+  background: #26314a; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .07), inset 0 1px 3px rgba(0, 0, 0, .35);
+  transition: background .2s ease, box-shadow .2s ease; -webkit-tap-highlight-color: transparent; }
+.toggle:hover { background: #2d3a57; }
+.toggle::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 11px; background: #fff;
+  box-shadow: 0 1px 2px rgba(3, 6, 14, .35), 0 2px 6px rgba(3, 6, 14, .25);
+  transition: transform .3s cubic-bezier(.34, 1.5, .64, 1), width .16s ease, background .2s; transform: translateX(0); }
+.toggle:checked { background: linear-gradient(135deg, var(--beam), var(--signal));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .12), 0 2px 8px rgba(47, 107, 255, .28); }
+.toggle:checked:hover { filter: brightness(1.06); }
+.toggle:checked::after { transform: translateX(20px); }
+.toggle:active::after { width: 27px; }
+.toggle:checked:active::after { transform: translateX(15px); }
+.toggle:focus-visible { outline: 2px solid var(--signal); outline-offset: 3px; }
+.toggle:disabled { opacity: .45; cursor: default; }
+@media (prefers-reduced-motion: reduce) { .toggle, .toggle::after { transition: none; } }

@@ -1267,6 +1267,7 @@ public class MainActivity extends Activity implements Beam.Listener {
     if (sub != null) t.addView(Ui.text(this, sub, 12, Ui.DIM, false));
     r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
     Switch s = new Switch(this);
+    Ui.styleSwitch(s);
     s.setChecked(on);
     r.addView(s);
     r.setOnClickListener(v -> s.toggle());
@@ -1304,6 +1305,8 @@ public class MainActivity extends Activity implements Beam.Listener {
 
   private Switch sw(String label, boolean on) {
     Switch s = new Switch(this);
+    Ui.styleSwitch(s);
+    s.setTextColor(Ui.TEXT);
     s.setText(label);
     s.setChecked(on);
     s.setPadding(0, Ui.dp(this, 8), 0, Ui.dp(this, 8));

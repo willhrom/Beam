@@ -38,6 +38,43 @@ final class Ui {
     return t;
   }
 
+  /** Beam's switch, the same as on the web: a roomy pill (dark when off, Beam's blue gradient when on)
+   *  with a white knob that has a soft shadow. */
+  static void styleSwitch(android.widget.Switch s) {
+    Context c = s.getContext();
+    int h = dp(c, 28), w = dp(c, 48), knob = dp(c, 22), pad = dp(c, 3);
+    // Knob: a white circle, inset so it sits inside the track.
+    GradientDrawable k = new GradientDrawable();
+    k.setShape(GradientDrawable.OVAL);
+    k.setColor(0xFFFFFFFF);
+    k.setSize(knob, knob);
+    k.setStroke(dp(c, 0.5f), 0x33000000);
+    android.graphics.drawable.InsetDrawable thumb = new android.graphics.drawable.InsetDrawable(k, pad);
+    // Track: off and on.
+    GradientDrawable off = new GradientDrawable();
+    off.setCornerRadius(h / 2f);
+    off.setColor(0xFF26314A);
+    off.setStroke(dp(c, 1), 0x12FFFFFF);
+    off.setSize(w, h);
+    GradientDrawable on = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[] { ACCENT, ACCENT2 });
+    on.setCornerRadius(h / 2f);
+    on.setSize(w, h);
+    android.graphics.drawable.StateListDrawable track = new android.graphics.drawable.StateListDrawable();
+    track.addState(new int[] { android.R.attr.state_checked }, on);
+    track.addState(new int[] {}, off);
+    track.setEnterFadeDuration(180);
+    track.setExitFadeDuration(180);
+    s.setThumbDrawable(thumb);
+    s.setTrackDrawable(track);
+    s.setThumbTintList(null);
+    s.setTrackTintList(null);
+    s.setSwitchMinWidth(w);
+    s.setShowText(false);
+    s.setBackground(null);
+    s.setElevation(0);
+    s.setSwitchPadding(dp(c, 12));
+  }
+
   static GradientDrawable round(int color, float radiusPx) {
     GradientDrawable g = new GradientDrawable();
     g.setColor(color);
