@@ -937,8 +937,7 @@ function shortcutSheet() {
   openSheet(`<h2>Send from iPhone</h2>
     <p>Add Beam to the iPhone share sheet with a Shortcut. It sends photos, videos (up to 100 MB each), files, text and links to any of your devices that are online.</p>
     <p class="hint">iPhone Shortcuts can't make Beam's direct connection, so files from the Shortcut pass through the Beam server: they're stored briefly and deleted as soon as your device has them (or after a day). Text and links aren't stored.</p>
-    <div id="scBody"><div class="actions"><button class="btn ghost" id="scBack">Back</button><button class="btn primary" id="scMake">Set up the Shortcut</button></div></div>`, () => { S.scOpen = false; });
-  $("#scBack").onclick = () => { sheetOnClose = null; S.scOpen = false; showSettings(); };
+    <div id="scBody"><div class="actions"><button class="btn primary" id="scMake">Set up the Shortcut</button></div></div>`, () => { S.scOpen = false; });
   $("#scMake").onclick = () => wsSend({ t: "shortcut-key" });
 }
 async function renderShortcutKey(m) {
@@ -1011,9 +1010,8 @@ async function renderGuestLink(m) {
   if (!S.guestLinkOpen || !$("#glink")) return;
   if (!m.token) {
     $("#glink").innerHTML = `<p>Make a QR code that a guest speaker, volunteer or visitor can scan to send files to <b>${esc(S.name)}</b>, without an account or installing anything. It works for 24 hours, only sends to this device, and you still accept each transfer.</p>
-      <div class="actions"><button class="btn ghost" id="gback">Back</button><button class="btn primary" id="gmake">Make a QR code</button></div>`;
+      <div class="actions"><button class="btn primary" id="gmake">Make a QR code</button></div>`;
     $("#gmake").onclick = () => wsSend({ t: "guest-link" });
-    $("#gback").onclick = () => { sheetOnClose = null; S.guestLinkOpen = false; showSettings(); };
     return;
   }
   const url = location.origin + "/?g=" + m.token;
@@ -1136,6 +1134,7 @@ function onSyncSignal(from, d) {
   }
   if (d.k === "sync-invite") {
     const name = cleanName(d.name || "Synced folder");
+    S.inSettings = false;
     openSheet(`<h2>Sync a folder with ${esc(peer.name)}?</h2>
       <div class="sync-folder" title="${esc(name)}"><i class="ico">${SET_ICONS.sync}</i><span>${esc(name)}</span></div>
       <p class="hint">Pick where to keep it on this ${nativeKind === "windows" ? "PC" : "Mac"}.</p>
@@ -2100,9 +2099,17 @@ function toast(msg) {
 let sheetOnClose = null, sheetGen = 0;
 function openSheet(html, onClose) {
   sheetGen++;
-  $("#sheetBody").innerHTML = html;
+  // Pages reached from Settings share one layout: a "‹ Settings" link at the top, the panel stays put
+  // (no jumping as pages change height), and Done sits at the bottom.
+  const inSet = !!S.inSettings;
+  const head = inSet && !html.includes('id="pgBack"') && !html.includes("set-head")
+    ? `<div class="page-head"><button class="back" id="pgBack" aria-label="Back to Settings">${CHEV}<span>Settings</span></button></div>` : "";
+  $("#sheetBody").innerHTML = head + html;
+  $("#sheet").classList.toggle("settings-open", inSet);
+  $("#sheet .card").classList.toggle("settings", inSet);
   $("#sheet").hidden = false;
   sheetOnClose = onClose || null;
+  if (head) $("#pgBack").onclick = () => { const f = sheetOnClose; sheetOnClose = null; if (f) f(); showSettings(); };
 }
 function closeSheet() {
   // Run the close handler first: it may still need to read what's on the sheet (e.g. Settings).
@@ -2110,6 +2117,7 @@ function closeSheet() {
   sheetOnClose = null;
   if (f) f();
   if (sheetGen !== gen) return; // the handler opened another sheet
+  S.inSettings = false;
   $("#sheet").hidden = true;
   $("#sheetBody").innerHTML = "";
 }
@@ -2214,6 +2222,7 @@ function offlineDevice(p) {
 
 const prompts = new Set();
 function promptIncoming(t) {
+  S.inSettings = false;   // a request from another device isn't a Settings page
   prompts.add(t.tid);
   notify(t.tid, t.peer.name + " wants to send you " + describeItems(t.items), (t.total ? fmtSize(t.total) + " · " : "") + "Device " + shortId(t.peer.id), true);
   if (!$("#sheet").hidden) return; // the transfer card has Accept/Decline too
@@ -2256,6 +2265,8 @@ const SET_ICONS = {
   test: SI("M3 12h4l2.5-6 5 12 2.5-6h4"),
   update: SI("M20 11a8 8 0 0 0-14.3-4.9M4 4v4h4M4 13a8 8 0 0 0 14.3 4.9M20 20v-4h-4"),
   people: SI("M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19M10 10.5a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM20 19v-1.5a3.5 3.5 0 0 0-2.5-3.3M15.5 4.6a3 3 0 0 1 0 5.8"),
+  name: SI("M4 20h4L18.5 9.5a2.8 2.8 0 0 0-4-4L4 16v4zM13.5 6.5l4 4"),
+  eye: SI("M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"),
   sync: SI("M20 8a8 8 0 0 0-14.3-2.4L4 7.5M4 4v3.5h3.5M4 16a8 8 0 0 0 14.3 2.4L20 16.5M20 20v-3.5h-3.5M9 12h6"),
   pin: SI("M7 11V8a5 5 0 0 1 10 0v3M6 11h12v9H6zM12 15v2"),
   out: SI("M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10"),
@@ -2284,15 +2295,16 @@ function receivingSummary() {
 }
 
 function showSettings() {
+  S.inSettings = true;
   const pairedN = Object.keys(S.paired).length;
   const initial = S.user ? esc((S.user.name || S.user.username || "?").trim().charAt(0).toUpperCase()) : "?";
   openSheet(`<div class="set-head"><h2>Settings</h2></div>
-    <button class="set-who" id="acctPage"><span class="set-avatar">${initial}</span><span>${S.user ? esc(S.user.name) : "Not signed in"}<small>${S.user ? "Signed in as " + esc(S.user.username) : ""}</small></span>${CHEV}</button>
+    <button class="set-who" id="acctPage"><span class="set-avatar">${initial}</span><span>${S.user ? esc(S.user.name) : "Not signed in"}<small>${!S.user ? "" : String(S.user.name).toLowerCase() === String(S.user.username).toLowerCase() ? "Account, PIN and sign out" : "Signed in as " + esc(S.user.username)}</small></span>${CHEV}</button>
 
     <h3>This device</h3>
     <div class="group">
-      <label class="opt field"><span>Name</span><input type="text" id="nm" maxlength="40" value="${esc(S.name)}" aria-label="Device name"></label>
-      <label class="opt"><span>Visible to everyone nearby<small>Off: only your own and paired devices see it</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
+      <label class="opt field"><i class="ico">${SET_ICONS.name}</i><span>Name</span><input type="text" id="nm" maxlength="40" value="${esc(S.name)}" aria-label="Device name"></label>
+      <label class="opt"><i class="ico">${SET_ICONS.eye}</i><span>Visible to everyone nearby<small>Off: only your own and paired devices see it</small></span><input type="checkbox" class="toggle" id="nb" ${S.nearby ? "checked" : ""}></label>
       ${navRow("rxPage", "receive", "Receiving", receivingSummary())}
       ${navRow("pairPage", "pair", "Paired devices", pairedN ? pairedN + " paired" : "Send with someone else's device")}
     </div>
